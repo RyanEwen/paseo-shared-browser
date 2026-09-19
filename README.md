@@ -12,13 +12,17 @@ input.
 
 ## Screenshots
 
+Both PNGs show the same isolated Chromium session from a dedicated Paseo test daemon. They were
+captured at 2× pixel density after browser DevTools verified the rendered page contained no private
+organization names.
+
 ### Wide desktop
 
-![Shared Browser showing the same live Paseo page to two viewers on desktop](docs/images/shared-browser-wide.png)
+![Shared Browser showing the same live Paseo page to two viewers on desktop](https://raw.githubusercontent.com/omercnet/paseo-plugins/main/paseo-shared-browser/docs/images/shared-browser-wide.png)
 
 ### Compact client
 
-![Shared Browser controls and the same canonical browser viewport on a compact client](docs/images/shared-browser-compact.png)
+![Shared Browser controls and the same canonical browser viewport on a compact client](https://raw.githubusercontent.com/omercnet/paseo-plugins/main/paseo-shared-browser/docs/images/shared-browser-compact.png)
 
 ## Runtime model
 
