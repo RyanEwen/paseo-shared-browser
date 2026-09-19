@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/omercnet/paseo-plugins/compare/shared-browser-v0.4.0...shared-browser-v0.4.1) (2026-09-19)
+
+
+### Bug Fixes
+
+* **paseo-shared-browser:** support macOS and Windows runtimes ([#121](https://github.com/omercnet/paseo-plugins/issues/121)) ([ef26e5c](https://github.com/omercnet/paseo-plugins/commit/ef26e5c6c7021bace43f19f5304df342ec8867e1))
+
 ## [0.4.0](https://github.com/omercnet/paseo-plugins/compare/shared-browser-v0.3.1...shared-browser-v0.4.0) (2026-09-18)
 
 
