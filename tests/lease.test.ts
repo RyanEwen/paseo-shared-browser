@@ -221,6 +221,36 @@ describe("SessionManager control leases", () => {
     );
   });
 
+  it("expired viewing reattaches to the preserved page without taking another viewer's control or replaying input", async () => {
+    let now = 1_000;
+    const { manager, client } = createManager({ now: () => now });
+    const returning = await manager.attach("workspace-one", "Returning client");
+    const observer = await manager.attach("workspace-one", "Other client");
+    now += 10_001;
+    await expect(manager.capture(returning.viewerToken, "medium", null)).rejects.toThrow(
+      "Viewer token is invalid or expired",
+    );
+    const other = await manager.attach("workspace-one", "Other current client");
+    await manager.acquireControl(other.viewerToken, false);
+    const previousCalls = client.operations.length;
+    const recovered = await manager.attach("workspace-one", "Returning client");
+    expect(recovered.viewerToken).not.toBe(returning.viewerToken);
+    expect(recovered.state.sessionId).toBe(returning.state.sessionId);
+    expect(recovered.state.runtimeId).toBe(returning.state.runtimeId);
+    expect(recovered.state.url).toBe(returning.state.url);
+    expect(recovered.state.controller).toBe("other");
+    expect((await manager.status(other.viewerToken)).state.controller).toBe("self");
+    expect(client.workspaces.size).toBe(1);
+    expect(client.archiveCalls).toEqual([]);
+    expect(client.operations.slice(previousCalls).map((call) => call.operation)).not.toContain(
+      "navigate",
+    );
+    expect(client.operations.slice(previousCalls).map((call) => call.operation)).not.toContain(
+      "mouse.down",
+    );
+    expect(await manager.detach(observer.viewerToken)).toEqual({ detached: false });
+  });
+
   it("accepts a shared recent frame and rejects it after viewport invalidation", async () => {
     const { manager } = createManager({ frameCacheMs: 0 });
     const first = await manager.attach("workspace-one", "First client");
@@ -350,6 +380,81 @@ describe("SessionManager control leases", () => {
       width: 412,
       height: 839,
     });
+  });
+
+  it("switches mobile and desktop behavior while preserving the current custom display", async () => {
+    const { manager, client } = createManager();
+    const viewer = await manager.attach("workspace-mode", "Client");
+    const control = await manager.acquireControl(viewer.viewerToken, false);
+    const resized = await manager.resize({
+      viewerToken: viewer.viewerToken,
+      controlToken: control.controlToken,
+      expected: expected(control.state),
+      viewport: { width: 1920, height: 1200 },
+    });
+    const capture = await manager.capture(viewer.viewerToken, "high", null);
+    const mobile = await manager.applyDevicePreset({
+      viewerToken: viewer.viewerToken,
+      controlToken: control.controlToken,
+      expected: expected(resized.state),
+      presetId: "pixel-7-sharp",
+      preserveDisplay: true,
+    });
+    expect(mobile.state.viewport).toEqual({ width: 1920, height: 1200 });
+    expect(mobile.state.captureScale).toBe(1);
+    expect(mobile.state.viewportGeneration).toBeGreaterThan(resized.state.viewportGeneration);
+    expect(mobile.state.navigationGeneration).toBe(resized.state.navigationGeneration);
+    expect(
+      client.operations.filter((op) => op.operation === "emulate").at(-1)?.input,
+    ).toMatchObject({ width: 1920, height: 1200, captureScale: 1, mobile: true, touch: true });
+    await expect(
+      manager.sendInput({
+        viewerToken: viewer.viewerToken,
+        controlToken: control.controlToken,
+        expected: expected(capture.state),
+        target: capture.frame!,
+        event: { kind: "key", key: "Enter" },
+      }),
+    ).rejects.toThrow("viewport");
+    const desktop = await manager.applyDevicePreset({
+      viewerToken: viewer.viewerToken,
+      controlToken: control.controlToken,
+      expected: expected(mobile.state),
+      presetId: "desktop-chrome",
+      preserveDisplay: true,
+    });
+    expect(desktop.state.viewport).toEqual({ width: 1920, height: 1200 });
+    expect(desktop.state.captureScale).toBe(1);
+    expect(
+      client.operations.filter((op) => op.operation === "emulate").at(-1)?.input,
+    ).toMatchObject({ width: 1920, height: 1200, captureScale: 1, mobile: false, touch: false });
+    expect(client.operations.some((op) => ["reload", "navigate"].includes(op.operation))).toBe(
+      false,
+    );
+  });
+
+  it("preserves sharp capture density during a mode-only desktop switch", async () => {
+    const { manager, client } = createManager();
+    const viewer = await manager.attach("workspace-sharp-mode", "Client");
+    const control = await manager.acquireControl(viewer.viewerToken, false);
+    const mobile = await manager.applyDevicePreset({
+      viewerToken: viewer.viewerToken,
+      controlToken: control.controlToken,
+      expected: expected(control.state),
+      presetId: "pixel-7-sharp",
+    });
+    const desktop = await manager.applyDevicePreset({
+      viewerToken: viewer.viewerToken,
+      controlToken: control.controlToken,
+      expected: expected(mobile.state),
+      presetId: "desktop-chrome",
+      preserveDisplay: true,
+    });
+    expect(desktop.state.viewport).toEqual(mobile.state.viewport);
+    expect(desktop.state.captureScale).toBe(2);
+    expect(
+      client.operations.filter((op) => op.operation === "emulate").at(-1)?.input,
+    ).toMatchObject({ width: 412, height: 839, captureScale: 2, mobile: false, touch: false });
   });
 
   it("archives and tears down the workspace runtime", async () => {

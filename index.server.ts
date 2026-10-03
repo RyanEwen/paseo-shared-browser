@@ -15,6 +15,9 @@ import {
   handleReleaseControl,
   handleResizeBrowser,
   handleSendBrowserInput,
+  handleBeginBrowserGesture,
+  handleUpdateBrowserGesture,
+  handleEndBrowserGesture,
   handleWorkspaceArchived,
   issueAgentTicket,
   revokeAgentBrowserAccess,
@@ -31,7 +34,12 @@ import {
   releaseControlRpc,
   resizeBrowserRpc,
   sendBrowserInputRpc,
+  beginBrowserGestureRpc,
+  updateBrowserGestureRpc,
+  endBrowserGestureRpc,
 } from "./shared/browser";
+
+import { browserDisplayPreferences } from "./shared/browser-display-preferences";
 
 const TICKET_ENV = "PASEO_SHARED_BROWSER_TICKET";
 const MCP_SERVER_ID = "shared-browser";
@@ -67,12 +75,16 @@ function mcpBundlePath(): string {
 }
 
 export default function contribute(server: PluginServerContext) {
+  server.registerSettings(browserDisplayPreferences);
   server.handle(attachBrowserRpc, handleAttachBrowser);
   server.handle(detachBrowserRpc, handleDetachBrowser);
   server.handle(captureBrowserRpc, handleCaptureBrowser);
   server.handle(listOpenBrowserWorkspacesRpc, handleListOpenBrowserWorkspaces);
   server.handle(acquireControlRpc, handleAcquireControl);
   server.handle(releaseControlRpc, handleReleaseControl);
+  server.handle(beginBrowserGestureRpc, handleBeginBrowserGesture);
+  server.handle(updateBrowserGestureRpc, handleUpdateBrowserGesture);
+  server.handle(endBrowserGestureRpc, handleEndBrowserGesture);
   server.handle(navigateBrowserRpc, handleNavigateBrowser);
   server.handle(resizeBrowserRpc, handleResizeBrowser);
   server.handle(applyDevicePresetRpc, handleApplyDevicePreset);

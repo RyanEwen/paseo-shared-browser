@@ -3,8 +3,10 @@ import { chmod, mkdir, open, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer, type Socket } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import type { BrowserFrame, BrowserInputEvent, BrowserState, Viewport } from "../shared/browser";
+import type { BrowserFrame, BrowserInputEvent, BrowserState, Viewport, DevicePresetId } from "../shared/browser";
+import { beginBrowserGestureRpc, updateBrowserGestureRpc, endBrowserGestureRpc } from "../shared/browser";
 import { SessionManager } from "./browser-policy";
+import { DEFAULT_CAPTURE_QUALITY } from "../shared/capture-settings";
 import { CdpUnknownOutcomeError } from "./cdp";
 import {
   type BridgeLease,
@@ -297,7 +299,7 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
       case "capture":
         result = await this.browserPolicy.capture(
           requireText(data, "viewerToken"),
-          data.quality === "low" || data.quality === "high" ? data.quality : "medium",
+          data.quality === "low" || data.quality === "medium" ? data.quality : DEFAULT_CAPTURE_QUALITY,
           typeof data.knownFrameId === "string" ? data.knownFrameId : null,
         );
         break;
@@ -330,6 +332,17 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
         break;
       case "input":
         result = await this.browserPolicy.sendInput(data as never);
+        this.invalidateAgentObservations(stateFromPolicyResult(result).workspaceId);
+        break;
+      case "gesture.begin":
+        result = await this.browserPolicy.beginGesture(beginBrowserGestureRpc.input.parse(data));
+        break;
+      case "gesture.update":
+        result = await this.browserPolicy.updateGesture(updateBrowserGestureRpc.input.parse(data));
+        this.invalidateAgentObservations(stateFromPolicyResult(result).workspaceId);
+        break;
+      case "gesture.end":
+        result = await this.browserPolicy.endGesture(endBrowserGestureRpc.input.parse(data));
         this.invalidateAgentObservations(stateFromPolicyResult(result).workspaceId);
         break;
       case "list":
@@ -472,6 +485,13 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
           expected,
           viewport: data.viewport as Viewport,
         });
+      } else if (operation === "device") {
+        result = await this.browserPolicy.applyDevicePreset({
+          viewerToken,
+          controlToken,
+          expected,
+          presetId: data.presetId as DevicePresetId,
+        });
       } else if (operation === "input") {
         if (!binding.lastFrame)
           throw new RuntimeProtocolError("INVALID_REQUEST", "Capture a frame before sending input");
@@ -505,7 +525,7 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
         ? await this.browserPolicy.status(viewerToken)
         : await this.browserPolicy.capture(
             viewerToken,
-            input.quality === "low" || input.quality === "high" ? input.quality : "medium",
+            input.quality === "low" || input.quality === "medium" ? input.quality : DEFAULT_CAPTURE_QUALITY,
             null,
           );
     let result: { state: BrowserState; frame?: BrowserFrame | null };

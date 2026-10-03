@@ -3,13 +3,14 @@ import { join } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import { MIN_VIEWPORT, MAX_VIEWPORT } from "../shared/viewport-limits";
+import { DEFAULT_CAPTURE_QUALITY } from "../shared/capture-settings";
+import { DEVICE_PRESET_IDS } from "../shared/device-presets";
 import type { JsonValue } from "./runtime-protocol";
 import { resolveSupervisorPaths } from "./supervisor";
 import { AgentSupervisorClient } from "./supervisor-client";
 
 const TICKET_ENV = "PASEO_SHARED_BROWSER_TICKET";
-const MIN_VIEWPORT = { width: 320, height: 480 } as const;
-const MAX_VIEWPORT = { width: 1600, height: 1200 } as const;
 
 const pointSchema = z.object({
   x: z.number().finite().nonnegative(),
@@ -106,7 +107,7 @@ async function main(): Promise<void> {
       description:
         "Capture the current shared browser frame and state. Capture before sending input.",
       inputSchema: z.object({
-        quality: z.enum(["low", "medium", "high"]).default("medium"),
+        quality: z.enum(["low", "medium", "high"]).default(DEFAULT_CAPTURE_QUALITY),
       }),
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
@@ -223,6 +224,17 @@ async function main(): Promise<void> {
           viewport: viewport as unknown as JsonValue,
         }),
       ),
+  );
+
+  server.registerTool(
+    "shared_browser_device",
+    {
+      description:
+        "Apply the same device or display preset as the human picker, including sharper Pixel capture. Requires control and reloads the current page.",
+      inputSchema: z.object({ presetId: z.enum(DEVICE_PRESET_IDS) }),
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
+    },
+    async ({ presetId }) => textResult(await client.request("device", { presetId })),
   );
 
   const transport = new StdioServerTransport();
