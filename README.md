@@ -138,7 +138,8 @@ User-supplied `AGENT_BROWSER_*` variables are deliberately ignored.
 ## Controls
 
 - Toolbar: back, forward, reload, address bar, a combined monitor menu, mobile emulation toggle
-  and a vertical-dots browser actions menu.
+  and a vertical-dots browser actions menu. Icon controls expose their action name
+  as a hover tooltip on desktop/web and retain native accessibility labels.
 - Custom viewports support 320 to 2560 pixels wide and 480 to 2560 pixels high. Invalid sizes
   show their error inside the device dialog; a successful Apply closes it.
 - Desktop presets also include 1280 × 800 (16:10) and 1280 × 1280 (1:1).

@@ -47,6 +47,7 @@ import { groupResolutionPresets } from "../shared/resolution-menu";
 import { type BrowserCanvasDisplayMode, getBrowserCanvasLayout } from "./browser-canvas-layout";
 import { BrowserCanvasViewport } from "./browser-canvas-viewport";
 import { browserCaptureInterval } from "./browser-capture-cadence";
+import { setBrowserControlTooltip } from "./browser-control-tooltip-web";
 import { type EmulationSelection, matchingResolutionPresetId } from "./browser-emulation-mode";
 import type { FrameCandidate } from "./browser-frame-buffer";
 import { BrowserFrameImage } from "./browser-frame-image";
@@ -588,8 +589,10 @@ function ChromeIconButton({
   onPress(): void;
 }) {
   const [hovered, setHovered] = useState(false);
+  const tooltipRef = useCallback((node: unknown) => setBrowserControlTooltip(node, label), [label]);
   return (
     <Pressable
+      ref={tooltipRef}
       accessibilityRole="button"
       accessibilityLabel={label}
       accessibilityState={{ disabled, selected, ...(expanded === undefined ? {} : { expanded }) }}
