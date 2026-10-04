@@ -1,6 +1,6 @@
 /**
  * Recover viewing after its short-lived viewer token expires during background
- * suspension. Only a capture error can use this policy; mutation failure must
+ * suspension. Only a viewing capture/video error can use this policy; mutation failure must
  * never trigger action replay, control acquisition or lease takeover.
  */
 const VIEWER_EXPIRED_MESSAGE = "Viewer token is invalid or expired";
@@ -27,7 +27,7 @@ export interface BrowserViewerRecoveryObservation {
   /** Host/workspace scope of the mounted panel, never a printer or page identity. */
   identity: string;
   viewerToken: string | null;
-  /** Exact token of the failed capture query; an old viewer cannot recover its replacement. */
+  /** Exact token of the failed capture query or video reader; an old viewer cannot recover its replacement. */
   failedViewerToken: string | null;
   captureError: unknown;
   pending: boolean;

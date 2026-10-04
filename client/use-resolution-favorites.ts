@@ -12,6 +12,7 @@ import {
 import { DEFAULT_CAPTURE_QUALITY } from "../shared/capture-settings";
 import type { DevicePresetId } from "../shared/device-presets";
 import { normalizeResolutionFavorites, toggleResolutionFavorite } from "../shared/resolution-menu";
+import { DEFAULT_VIDEO_BITRATE, DEFAULT_VIDEO_FPS } from "../shared/video-settings";
 
 /** Call with the surface's host.id; persistence itself is scoped by Paseo. */
 export function useResolutionFavorites(hostId: string) {
@@ -59,6 +60,9 @@ export function useResolutionFavorites(hostId: string) {
     favoritePresetIds,
     captureQuality:
       settings.status === "ready" ? settings.values.captureQuality : DEFAULT_CAPTURE_QUALITY,
+    videoBitrate:
+      settings.status === "ready" ? settings.values.videoBitrate : DEFAULT_VIDEO_BITRATE,
+    videoFps: settings.status === "ready" ? settings.values.videoFps : DEFAULT_VIDEO_FPS,
     loading: settings.status === "loading",
     saving,
     disabled,
@@ -72,6 +76,10 @@ export function useResolutionFavorites(hostId: string) {
     },
     changeQuality: (captureQuality: BrowserDisplayPreferences["captureQuality"]) =>
       savePreferences((values) => ({ ...values, captureQuality })),
+    changeVideoBitrate: (videoBitrate: BrowserDisplayPreferences["videoBitrate"]) =>
+      savePreferences((values) => ({ ...values, videoBitrate })),
+    changeVideoFps: (videoFps: BrowserDisplayPreferences["videoFps"]) =>
+      savePreferences((values) => ({ ...values, videoFps })),
     reload: settings.reload,
     resetPreferences: settings.reset,
   };

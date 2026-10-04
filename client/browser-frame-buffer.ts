@@ -13,6 +13,8 @@ export type FrameCandidate = {
   viewport?: { width: number; height: number };
   viewerToken: string;
   mutationEpoch: number;
+  /** Held-video handoff request captured when this image RPC began. */
+  fallbackRevision?: number;
 };
 export type FrameLayer = {
   ticket: number;

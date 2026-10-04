@@ -3,8 +3,10 @@ import type { PluginHostProps } from "@getpaseo/plugin/client";
 import { Icon } from "@getpaseo/plugin/client/react-native";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 import type { BrowserDisplayPreferences } from "../shared/browser-display-preferences";
+import type { CaptureDensity } from "../shared/capture-density";
 import type { DevicePresetId } from "../shared/device-presets";
 import type { ResolutionGroup } from "../shared/resolution-menu";
+import { BrowserQualityControls } from "./browser-quality-controls";
 import { FavoriteStar } from "./favorite-star";
 
 export interface BrowserResolutionPickerProps {
@@ -14,7 +16,14 @@ export interface BrowserResolutionPickerProps {
   favoritePresetIds: readonly DevicePresetId[];
   selectDisabled: boolean;
   favoriteDisabled: boolean;
+  density: number;
+  viewport: { width: number; height: number } | null;
+  onDensityChange(value: CaptureDensity): void;
   captureQuality: BrowserDisplayPreferences["captureQuality"];
+  videoBitrate: BrowserDisplayPreferences["videoBitrate"];
+  videoFps: BrowserDisplayPreferences["videoFps"];
+  onVideoBitrateChange(value: BrowserDisplayPreferences["videoBitrate"]): void;
+  onVideoFpsChange(value: BrowserDisplayPreferences["videoFps"]): void;
   onSelect(id: DevicePresetId): void;
   onToggleFavorite(id: DevicePresetId): void;
   onQualityChange(quality: BrowserDisplayPreferences["captureQuality"]): void;
@@ -55,12 +64,6 @@ const STYLES = StyleSheet.create({
     gap: 8,
   },
 });
-const QUALITY_OPTIONS = [
-  { id: "low", label: "Low", detail: "Smaller images, less detail" },
-  { id: "medium", label: "Medium", detail: "Balanced detail and image size" },
-  { id: "high", label: "High", detail: "Sharper images, more data" },
-] as const;
-
 /** Keeps star presses outside the resolution button; favoriting never resizes the browser. */
 export function BrowserResolutionPicker(props: BrowserResolutionPickerProps) {
   const { theme } = props;
@@ -139,36 +142,20 @@ export function BrowserResolutionPicker(props: BrowserResolutionPickerProps) {
           })}
         </View>
       ))}
-      <View style={STYLES.group}>
-        <Text style={[STYLES.header, { color: colors.foregroundMuted }]}>Image quality</Text>
-        {QUALITY_OPTIONS.map((option) => {
-          const selected = option.id === props.captureQuality;
-          return (
-            <Pressable
-              key={option.id}
-              accessibilityRole="button"
-              accessibilityLabel={`${option.label} image quality`}
-              accessibilityState={{
-                selected,
-                disabled: props.favoriteDisabled,
-              }}
-              disabled={props.favoriteDisabled}
-              onPress={() => props.onQualityChange(option.id)}
-              style={({ pressed }) => [
-                STYLES.quality,
-                baseStyle,
-                selected ? selectedStyle : null,
-                { opacity: props.favoriteDisabled ? 0.45 : pressed ? 0.72 : 1 },
-              ]}
-            >
-              <Text style={[STYLES.title, { color: colors.foreground }]}>{option.label}</Text>
-              <Text style={[STYLES.detail, { color: colors.foregroundMuted }]}>
-                {option.detail}
-              </Text>
-            </Pressable>
-          );
-        })}
-      </View>
+      <BrowserQualityControls
+        theme={theme}
+        density={props.density}
+        viewport={props.viewport}
+        densityDisabled={props.selectDisabled}
+        onDensityChange={props.onDensityChange}
+        disabled={props.favoriteDisabled}
+        captureQuality={props.captureQuality}
+        videoBitrate={props.videoBitrate}
+        videoFps={props.videoFps}
+        onQualityChange={props.onQualityChange}
+        onVideoBitrateChange={props.onVideoBitrateChange}
+        onVideoFpsChange={props.onVideoFpsChange}
+      />
     </View>
   );
 }

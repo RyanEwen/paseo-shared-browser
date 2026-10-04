@@ -94,3 +94,20 @@ describe("natural canvas input", () => {
     expect(f.ended()).toBe(1);
   });
 });
+
+it("preserves genuine pointer modifier snapshots without fabricating held keys", () => {
+  const f = fixture();
+  f.input.mouseDown(point, "left", 1, 10);
+  f.input.mouseMove(point, 2);
+  f.input.mouseUp(point, "left", 1, 0);
+  f.input.wheel(point, 0, 5000, 4);
+  expect(
+    f.events.slice(0, 3).map((event) => ("modifiers" in event ? event.modifiers : undefined)),
+  ).toEqual([10, 2, 0]);
+  expect(f.events.slice(3).every((event) => event.kind === "scroll" && event.modifiers === 4)).toBe(
+    true,
+  );
+  expect(f.events.some((event) => event.kind === "key")).toBe(false);
+  f.input.mouseMove(point); // Native callers preserve existing held-key inference.
+  expect(f.events.at(-1)).not.toHaveProperty("modifiers");
+});

@@ -1,4 +1,4 @@
-/** Attach viewing only after the current capture token expires; never replay control or input. */
+/** Attach viewing only after the current viewing token expires; never replay control or input. */
 import { useEffect, useState } from "react";
 import {
   type BrowserViewerRecoveryObservation,

@@ -1,7 +1,9 @@
 /**
  * One live input queue per mounted canvas, shared by native responders and real
  * web listeners. Ownership changes cancel old channels; decode-only frame updates
- * do not. Cursor replies are consumed only by the queue incarnation that sent
+ * do not. Empty channels close after four seconds; their acknowledged geometry
+ * can reopen only within the same control/document/layout. Cursor replies are
+ * consumed only by the queue incarnation that sent
  * them. The existing capture polling keeps playback running during a drag.
  */
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
@@ -28,9 +30,11 @@ import { type BrowserCanvasNode, bindBrowserCanvasWeb, setBrowserCanvasCursor } 
 
 interface CanvasOptions {
   authority(): BrowserGestureAuthority | null;
+  controlAuthority?(): import("./browser-input-queue").BrowserGestureControl | null;
   transport: BrowserGestureTransport;
   /** Control/session/generations/viewport/display rectangle, excluding frameId. */
   ownershipKey: string;
+  /** Actual input-admitted paint publication, separate from the visually displayed frame. */
   decodedFrameId: string | null;
   enabled: boolean;
   displaySize: { width: number; height: number } | null;
@@ -97,6 +101,11 @@ export function useBrowserCanvasInput(options: CanvasOptions) {
         end: (input) => current.current.transport.end(input),
       },
       authority: () => (alive.current ? current.current.authority() : null),
+      controlAuthority: () => {
+        if (!alive.current) return null;
+        if (current.current.controlAuthority) return current.current.controlAuthority();
+        return current.current.authority();
+      },
       onState: (state) => {
         if (alive.current) current.current.onState(state);
       },
@@ -171,9 +180,16 @@ export function useBrowserCanvasInput(options: CanvasOptions) {
         clearIdle();
         if (event.kind === "down" || (event.kind === "touch" && event.type === "start")) {
           nativeRelay.current?.reset();
+        }
+        // Queue snapshots the actual decoded admission before a local epoch bump.
+        // Already admitted edges continue on their opaque channel independently.
+        const accepted = queue.enqueue(event);
+        if (
+          accepted &&
+          (event.kind === "down" || (event.kind === "touch" && event.type === "start"))
+        ) {
           current.current.onInputBoundary();
         }
-        const accepted = queue.enqueue(event);
         if (event.kind === "move" || event.kind === "scroll") {
           idleTimer.current = setTimeout(() => {
             // Never end a slow held drag just because the user stopped moving.
@@ -181,13 +197,15 @@ export function useBrowserCanvasInput(options: CanvasOptions) {
               current.current.onActivity(false);
               queue.finish();
             }
-          }, 1_000);
+          }, 4_000);
         }
         return accepted;
       },
       finish: () => {
         clearIdle();
-        queue.finish();
+        // Release was enqueued immediately. Keep the empty exact channel for
+        // ordinary repeat input, closing before the server's five-second idle bound.
+        idleTimer.current = setTimeout(() => queue.finish(), 4_000);
       },
       cancel: () => {
         clearIdle();
@@ -226,7 +244,7 @@ export function useBrowserCanvasInput(options: CanvasOptions) {
     // Keep one channel through ordinary inter-key gaps. New typing clears this
     // timer, while blur/control loss cancels immediately through the input model.
     clearIdle();
-    idleTimer.current = setTimeout(() => queue.finish(), 1_000);
+    idleTimer.current = setTimeout(() => queue.finish(), 4_000);
   }, [queue]);
   const nativeKeyboard = useBrowserNativeKeyboard({
     enabled: () => alive.current && current.current.enabled,
@@ -248,8 +266,14 @@ export function useBrowserCanvasInput(options: CanvasOptions) {
   }, [input, options.ownershipKey]);
   useLayoutEffect(() => {
     for (const waiter of frameWaiters.current) {
-      if (options.decodedFrameId && options.decodedFrameId !== waiter.afterFrameId)
+      const admitted = current.current.authority();
+      if (
+        options.decodedFrameId &&
+        admitted?.target.frameId === options.decodedFrameId &&
+        options.decodedFrameId !== waiter.afterFrameId
+      ) {
         waiter.resolve();
+      }
     }
   }, [options.decodedFrameId]);
   useEffect(() => {
