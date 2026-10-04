@@ -3,10 +3,20 @@ import { chmod, mkdir, open, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer, type Socket } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import type { BrowserFrame, BrowserInputEvent, BrowserState, Viewport, DevicePresetId } from "../shared/browser";
-import { beginBrowserGestureRpc, updateBrowserGestureRpc, endBrowserGestureRpc } from "../shared/browser";
-import { SessionManager } from "./browser-policy";
+import type {
+  BrowserFrame,
+  BrowserInputEvent,
+  BrowserState,
+  DevicePresetId,
+  Viewport,
+} from "../shared/browser";
+import {
+  beginBrowserGestureRpc,
+  endBrowserGestureRpc,
+  updateBrowserGestureRpc,
+} from "../shared/browser";
 import { DEFAULT_CAPTURE_QUALITY } from "../shared/capture-settings";
+import { SessionManager } from "./browser-policy";
 import { CdpUnknownOutcomeError } from "./cdp";
 import {
   type BridgeLease,
@@ -299,7 +309,9 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
       case "capture":
         result = await this.browserPolicy.capture(
           requireText(data, "viewerToken"),
-          data.quality === "low" || data.quality === "medium" ? data.quality : DEFAULT_CAPTURE_QUALITY,
+          data.quality === "low" || data.quality === "medium"
+            ? data.quality
+            : DEFAULT_CAPTURE_QUALITY,
           typeof data.knownFrameId === "string" ? data.knownFrameId : null,
         );
         break;
@@ -525,7 +537,9 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
         ? await this.browserPolicy.status(viewerToken)
         : await this.browserPolicy.capture(
             viewerToken,
-            input.quality === "low" || input.quality === "medium" ? input.quality : DEFAULT_CAPTURE_QUALITY,
+            input.quality === "low" || input.quality === "medium"
+              ? input.quality
+              : DEFAULT_CAPTURE_QUALITY,
             null,
           );
     let result: { state: BrowserState; frame?: BrowserFrame | null };

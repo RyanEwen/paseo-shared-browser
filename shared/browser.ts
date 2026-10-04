@@ -1,13 +1,23 @@
 import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
-import { MIN_VIEWPORT, MAX_VIEWPORT } from "./viewport-limits";
+import {
+  DEFAULT_CAPTURE_QUALITY,
+  FRAME_MAX_BASE64_CHARS,
+  FRAME_MAX_BYTES,
+} from "./capture-settings";
 import { DEVICE_PRESET_IDS } from "./device-presets";
-import { DEFAULT_CAPTURE_QUALITY, FRAME_MAX_BYTES, FRAME_MAX_BASE64_CHARS } from "./capture-settings";
-export { DEFAULT_CAPTURE_QUALITY, FRAME_MAX_BYTES, FRAME_MAX_BASE64_CHARS } from "./capture-settings";
-export { DEVICE_PRESETS, DEVICE_PRESET_IDS, type DevicePresetId } from "./device-presets";
+import { MAX_VIEWPORT, MIN_VIEWPORT } from "./viewport-limits";
+
+export {
+  DEFAULT_CAPTURE_QUALITY,
+  FRAME_MAX_BASE64_CHARS,
+  FRAME_MAX_BYTES,
+} from "./capture-settings";
+export { DEVICE_PRESET_IDS, DEVICE_PRESETS, type DevicePresetId } from "./device-presets";
 
 export const DEFAULT_VIEWPORT = { width: 1280, height: 800 } as const;
-export { MIN_VIEWPORT, MAX_VIEWPORT } from "./viewport-limits";
+export { MAX_VIEWPORT, MIN_VIEWPORT } from "./viewport-limits";
+
 const devicePresetIdSchema = z.enum(DEVICE_PRESET_IDS);
 
 const workspaceIdSchema = z
@@ -259,33 +269,70 @@ export const sendBrowserInputRpc = defineRpc({
 
 /** Safe CSS cursor names only. Custom cursor URLs never reach the local client. */
 export const browserCursorSchema = z.enum([
-  "default", "none", "pointer", "text", "vertical-text", "crosshair", "move",
-  "grab", "grabbing", "wait", "progress", "help", "not-allowed", "no-drop",
-  "copy", "alias", "context-menu", "cell", "all-scroll", "col-resize", "row-resize",
-  "n-resize", "s-resize", "e-resize", "w-resize", "ne-resize", "nw-resize",
-  "se-resize", "sw-resize", "ew-resize", "ns-resize", "nesw-resize", "nwse-resize",
-  "zoom-in", "zoom-out",
+  "default",
+  "none",
+  "pointer",
+  "text",
+  "vertical-text",
+  "crosshair",
+  "move",
+  "grab",
+  "grabbing",
+  "wait",
+  "progress",
+  "help",
+  "not-allowed",
+  "no-drop",
+  "copy",
+  "alias",
+  "context-menu",
+  "cell",
+  "all-scroll",
+  "col-resize",
+  "row-resize",
+  "n-resize",
+  "s-resize",
+  "e-resize",
+  "w-resize",
+  "ne-resize",
+  "nw-resize",
+  "se-resize",
+  "sw-resize",
+  "ew-resize",
+  "ns-resize",
+  "nesw-resize",
+  "nwse-resize",
+  "zoom-in",
+  "zoom-out",
 ]);
 export type BrowserCursor = z.output<typeof browserCursorSchema>;
 
-const touchPointSchema = displayedPointSchema.extend({ id: z.number().int().min(0).max(2_147_483_647) });
-/** Native keyboard modifiers use CDP's bits: Alt 1, Control 2, Meta 4, Shift 8. */
-export const browserGestureKeySchema = z.object({
-  kind: z.literal("key"),
-  type: z.enum(["down", "up"]),
-  key: z.string().min(1).max(64),
-  code: z.string().min(1).max(64).regex(/^[A-Za-z][A-Za-z0-9]*$/),
-  modifiers: z.number().int().min(0).max(15),
-  repeat: z.boolean().default(false),
-  text: z.string().min(1).max(32).optional(),
-}).superRefine((event, context) => {
-  if (event.type === "up" && (event.repeat || event.text !== undefined)) {
-    context.addIssue({ code: "custom", message: "Key release cannot repeat or insert text" });
-  }
-  if (event.text !== undefined && (event.modifiers & 7) !== 0) {
-    context.addIssue({ code: "custom", message: "Shortcut keys cannot insert printable text" });
-  }
+const touchPointSchema = displayedPointSchema.extend({
+  id: z.number().int().min(0).max(2_147_483_647),
 });
+/** Native keyboard modifiers use CDP's bits: Alt 1, Control 2, Meta 4, Shift 8. */
+export const browserGestureKeySchema = z
+  .object({
+    kind: z.literal("key"),
+    type: z.enum(["down", "up"]),
+    key: z.string().min(1).max(64),
+    code: z
+      .string()
+      .min(1)
+      .max(64)
+      .regex(/^[A-Za-z][A-Za-z0-9]*$/),
+    modifiers: z.number().int().min(0).max(15),
+    repeat: z.boolean().default(false),
+    text: z.string().min(1).max(32).optional(),
+  })
+  .superRefine((event, context) => {
+    if (event.type === "up" && (event.repeat || event.text !== undefined)) {
+      context.addIssue({ code: "custom", message: "Key release cannot repeat or insert text" });
+    }
+    if (event.text !== undefined && (event.modifiers & 7) !== 0) {
+      context.addIssue({ code: "custom", message: "Shortcut keys cannot insert printable text" });
+    }
+  });
 export type BrowserGestureKeyEvent = z.output<typeof browserGestureKeySchema>;
 
 /**
@@ -298,35 +345,66 @@ export const browserGestureEventSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("text"), text: z.string().min(1).max(16_000) }),
   z.object({ kind: z.literal("leave") }),
   z.object({ kind: z.literal("move"), point: displayedPointSchema }),
-  z.object({ kind: z.literal("down"), point: displayedPointSchema,
-    button: z.enum(["left", "right", "middle"]).default("left"), clickCount: z.union([z.literal(1), z.literal(2)]).default(1) }),
-  z.object({ kind: z.literal("up"), point: displayedPointSchema,
-    button: z.enum(["left", "right", "middle"]).default("left"), clickCount: z.union([z.literal(1), z.literal(2)]).default(1) }),
-  z.object({ kind: z.literal("scroll"), point: displayedPointSchema,
-    deltaX: z.number().finite().min(-4_000).max(4_000), deltaY: z.number().finite().min(-4_000).max(4_000) }),
-  z.object({ kind: z.literal("touch"), type: z.enum(["start", "move", "end", "cancel"]),
-    points: z.array(touchPointSchema).max(5) }).superRefine((event, context) => {
+  z.object({
+    kind: z.literal("down"),
+    point: displayedPointSchema,
+    button: z.enum(["left", "right", "middle"]).default("left"),
+    clickCount: z.union([z.literal(1), z.literal(2)]).default(1),
+  }),
+  z.object({
+    kind: z.literal("up"),
+    point: displayedPointSchema,
+    button: z.enum(["left", "right", "middle"]).default("left"),
+    clickCount: z.union([z.literal(1), z.literal(2)]).default(1),
+  }),
+  z.object({
+    kind: z.literal("scroll"),
+    point: displayedPointSchema,
+    deltaX: z.number().finite().min(-4_000).max(4_000),
+    deltaY: z.number().finite().min(-4_000).max(4_000),
+  }),
+  z
+    .object({
+      kind: z.literal("touch"),
+      type: z.enum(["start", "move", "end", "cancel"]),
+      points: z.array(touchPointSchema).max(5),
+    })
+    .superRefine((event, context) => {
       if ((event.type === "end" || event.type === "cancel") !== (event.points.length === 0)) {
-        context.addIssue({ code: "custom", message: "Touch start/move require points; end/cancel require none" });
+        context.addIssue({
+          code: "custom",
+          message: "Touch start/move require points; end/cancel require none",
+        });
       }
-      if (new Set(event.points.map(point => point.id)).size !== event.points.length) {
+      if (new Set(event.points.map((point) => point.id)).size !== event.points.length) {
         context.addIssue({ code: "custom", message: "Touch identifiers must be unique" });
       }
     }),
 ]);
 export type BrowserGestureEvent = z.output<typeof browserGestureEventSchema>;
 
-const gestureContextSchema = z.object({ viewerToken: opaqueTokenSchema, controlToken: opaqueTokenSchema,
-  expected: expectedStateSchema.extend({ runtimeId: runtimeIdSchema, bridgeEpoch: epochSchema }) });
+const gestureContextSchema = z.object({
+  viewerToken: opaqueTokenSchema,
+  controlToken: opaqueTokenSchema,
+  expected: expectedStateSchema.extend({ runtimeId: runtimeIdSchema, bridgeEpoch: epochSchema }),
+});
 const gestureContinuationSchema = gestureContextSchema.extend({
-  gestureId: opaqueTokenSchema, sequence: z.number().int().positive().max(100_000),
+  gestureId: opaqueTokenSchema,
+  sequence: z.number().int().positive().max(100_000),
 });
 /** Begin pins a decoded recent frame but sends no physical input. One live channel per controller. Keyboard events may share either pointer channel. */
 export const beginBrowserGestureRpc = defineRpc({
   name: "shared-browser.gesture.begin",
-  input: gestureContextSchema.extend({ target: targetFrameSchema, pointerKind: z.enum(["mouse", "touch"]) }),
+  input: gestureContextSchema.extend({
+    target: targetFrameSchema,
+    pointerKind: z.enum(["mouse", "touch"]),
+  }),
   output: z.union([
-    z.object({ state: browserStateSchema, gestureId: opaqueTokenSchema, nextSequence: z.number().int().positive() }),
+    z.object({
+      state: browserStateSchema,
+      gestureId: opaqueTokenSchema,
+      nextSequence: z.number().int().positive(),
+    }),
     // This receipt exists only before input.begin, so no physical action or channel is replayed.
     z.object({ state: browserStateSchema, admission: z.literal("stale-frame") }),
   ]),
@@ -338,10 +416,19 @@ export const beginBrowserGestureRpc = defineRpc({
  */
 export const updateBrowserGestureRpc = defineRpc({
   name: "shared-browser.gesture.update",
-  input: gestureContinuationSchema.extend({ event: browserGestureEventSchema, target: targetFrameSchema.optional() }),
+  input: gestureContinuationSchema.extend({
+    event: browserGestureEventSchema,
+    target: targetFrameSchema.optional(),
+  }),
   // The native input was acknowledged and navigated on its original attachment.
   // This closes the old channel; it never authorizes a continuation or a replay.
-  output: z.object({ state: browserStateSchema, gestureId: opaqueTokenSchema, nextSequence: z.number().int().positive(), cursor: browserCursorSchema.nullable(), completion: z.literal("navigation").optional() }),
+  output: z.object({
+    state: browserStateSchema,
+    gestureId: opaqueTokenSchema,
+    nextSequence: z.number().int().positive(),
+    cursor: browserCursorSchema.nullable(),
+    completion: z.literal("navigation").optional(),
+  }),
 });
 /**
  * End/cancel releases the original held input without retrying an uncertain action.

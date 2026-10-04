@@ -1,7 +1,8 @@
 /** Per-instance display context reaches native CLI children without changing host or session authority. */
-import { afterEach, describe, expect, it } from "vitest";
+
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
 import { AgentBrowserRuntime } from "./agent-browser-runtime";
 
 const temporary: string[] = [];
@@ -30,9 +31,7 @@ async function fixture(launchEnvironment?: Readonly<Record<string, string>>) {
   });
   const native = runtime as unknown as {
     assertVersion(): Promise<void>;
-    invoke(
-      args: string[],
-    ): Promise<{
+    invoke(args: string[]): Promise<{
       display: string | null;
       authority: string | null;
       wayland: string | null;

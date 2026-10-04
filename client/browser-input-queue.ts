@@ -6,32 +6,25 @@
  */
 import type { RpcInput, RpcOutput } from "@getpaseo/plugin";
 import type {
-  beginBrowserGestureRpc,
-  updateBrowserGestureRpc,
-  endBrowserGestureRpc,
-  BrowserGestureEvent,
   BrowserCursor,
+  BrowserGestureEvent,
   BrowserState,
+  beginBrowserGestureRpc,
+  endBrowserGestureRpc,
+  updateBrowserGestureRpc,
 } from "../shared/browser";
 
-export type BrowserGestureAuthority = Omit<
-  RpcInput<typeof beginBrowserGestureRpc>,
-  "pointerKind"
->;
-export type BrowserGesturePoint = Extract<
-  BrowserGestureEvent,
-  { kind: "move" }
->["point"];
-export type BrowserTouchPoint = Extract<
-  BrowserGestureEvent,
-  { kind: "touch" }
->["points"][number];
+export type BrowserGestureAuthority = Omit<RpcInput<typeof beginBrowserGestureRpc>, "pointerKind">;
+export type BrowserGesturePoint = Extract<BrowserGestureEvent, { kind: "move" }>["point"];
+export type BrowserTouchPoint = Extract<BrowserGestureEvent, { kind: "touch" }>["points"][number];
 /** Preserve the admission union while using schema-normalized state defaults. */
-type NormalizedAdmission<T> = T extends unknown ? Omit<T, "state"> & { state: BrowserState } : never;
+type NormalizedAdmission<T> = T extends unknown
+  ? Omit<T, "state"> & { state: BrowserState }
+  : never;
 export interface BrowserGestureTransport {
-  begin(input: RpcInput<typeof beginBrowserGestureRpc>): Promise<
-    NormalizedAdmission<RpcOutput<typeof beginBrowserGestureRpc>>
-  >;
+  begin(
+    input: RpcInput<typeof beginBrowserGestureRpc>,
+  ): Promise<NormalizedAdmission<RpcOutput<typeof beginBrowserGestureRpc>>>;
   update(input: RpcInput<typeof updateBrowserGestureRpc>): Promise<
     Omit<RpcOutput<typeof updateBrowserGestureRpc>, "state"> & {
       state: BrowserState;
@@ -71,10 +64,7 @@ const MAX_FRAME_ADMISSION_ATTEMPTS = 3;
 const FRAME_ADMISSION_WAIT_MS = 4_000;
 
 /** Compare control/route incarnation, never the changing decoded frame identity. */
-function sameAuthority(
-  a: BrowserGestureAuthority,
-  b: BrowserGestureAuthority | null,
-): boolean {
+function sameAuthority(a: BrowserGestureAuthority, b: BrowserGestureAuthority | null): boolean {
   return Boolean(
     b &&
       a.viewerToken === b.viewerToken &&
@@ -93,29 +83,24 @@ function transportContext(authority: BrowserGestureAuthority) {
     expected: authority.expected,
   };
 }
-function needsFreshPress(
-  event: BrowserGestureEvent,
-  channel: Channel,
-): boolean {
+function needsFreshPress(event: BrowserGestureEvent, channel: Channel): boolean {
   return (
     event.kind === "down" ||
-    (event.kind === "touch" &&
-      event.type === "start" &&
-      channel.touchCount === 0)
+    (event.kind === "touch" && event.type === "start" && channel.touchCount === 0)
   );
 }
 
 /** A qualified reply completes old input; it never authorizes input on the new page. */
-function isAcknowledgedNavigation(
-  original: BrowserGestureAuthority,
-  state: BrowserState,
-): boolean {
-  return state.status === "ready" && state.controller === "self" &&
+function isAcknowledgedNavigation(original: BrowserGestureAuthority, state: BrowserState): boolean {
+  return (
+    state.status === "ready" &&
+    state.controller === "self" &&
     state.sessionId === original.expected.sessionId &&
     state.runtimeId === original.expected.runtimeId &&
     state.bridgeEpoch === original.expected.bridgeEpoch &&
     state.viewportGeneration === original.expected.viewportGeneration &&
-    state.navigationGeneration > original.expected.navigationGeneration;
+    state.navigationGeneration > original.expected.navigationGeneration
+  );
 }
 
 /** One in-flight RPC, with fail-closed cancellation on pressure or authority loss. */
@@ -171,16 +156,11 @@ export function createBrowserInputQueue(options: QueueOptions) {
           });
           owned = null;
           channel = null;
-          if (
-            currentEpoch !== epoch ||
-            !sameAuthority(ending.authority, options.authority())
-          )
+          if (currentEpoch !== epoch || !sameAuthority(ending.authority, options.authority()))
             break;
           options.onState(result.state);
           if (!sameAuthority(ending.authority, options.authority())) {
-            throw new Error(
-              "Browser input context changed. Release the gesture and try again.",
-            );
+            throw new Error("Browser input context changed. Release the gesture and try again.");
           }
           // Normal channel completion keeps the last qualified hover cursor.
           // A null end receipt denotes cleanup, not a new pointer location.
@@ -190,17 +170,15 @@ export function createBrowserInputQueue(options: QueueOptions) {
         }
 
         let current = options.authority();
-        if (!current)
-          throw new Error(
-            "A decoded frame and active browser control are required.",
-          );
-        const pointerKind = command.event.kind === "touch" ? "touch"
-          : command.event.kind === "key" || command.event.kind === "text"
-            ? owned?.pointerKind ?? "mouse" : "mouse";
+        if (!current) throw new Error("A decoded frame and active browser control are required.");
+        const pointerKind =
+          command.event.kind === "touch"
+            ? "touch"
+            : command.event.kind === "key" || command.event.kind === "text"
+              ? (owned?.pointerKind ?? "mouse")
+              : "mouse";
         if (owned && !sameAuthority(owned.authority, current)) {
-          throw new Error(
-            "Browser input context changed. Release the gesture and try again.",
-          );
+          throw new Error("Browser input context changed. Release the gesture and try again.");
         }
         if (owned && owned.pointerKind !== pointerKind) {
           // Changing input devices is ordinary on touch laptops. Close only this
@@ -210,17 +188,12 @@ export function createBrowserInputQueue(options: QueueOptions) {
           channel = null;
           if (currentEpoch !== epoch) break;
           if (!sameAuthority(current, options.authority())) {
-            throw new Error(
-              "Browser input context changed. Release the gesture and try again.",
-            );
+            throw new Error("Browser input context changed. Release the gesture and try again.");
           }
         }
         if (!owned) {
           const admissionDeadline = Date.now() + FRAME_ADMISSION_WAIT_MS;
-          if (
-            invalidatedFrameId === current.target.frameId &&
-            options.waitForFrame
-          ) {
+          if (invalidatedFrameId === current.target.frameId && options.waitForFrame) {
             const waitingAuthority = current;
             await options.waitForFrame(current.target.frameId, FRAME_ADMISSION_WAIT_MS);
             if (currentEpoch !== epoch) break;
@@ -269,7 +242,10 @@ export function createBrowserInputQueue(options: QueueOptions) {
             }
           }
           if (currentEpoch !== epoch || !sameAuthority(current, options.authority())) break;
-          if (!owned) throw new Error("Waiting for a current decoded frame. Release the gesture and try again.");
+          if (!owned)
+            throw new Error(
+              "Waiting for a current decoded frame. Release the gesture and try again.",
+            );
         }
 
         let fresh = options.authority();
@@ -284,9 +260,7 @@ export function createBrowserInputQueue(options: QueueOptions) {
           fresh = options.authority();
         }
         if (!sameAuthority(owned.authority, fresh)) {
-          throw new Error(
-            "Browser input context changed. Release the gesture and try again.",
-          );
+          throw new Error("Browser input context changed. Release the gesture and try again.");
         }
         if (
           (command.event.kind !== "move" && command.event.kind !== "leave") ||
@@ -295,14 +269,13 @@ export function createBrowserInputQueue(options: QueueOptions) {
           invalidatedFrameId = fresh?.target.frameId ?? null;
         }
         const requiresTarget = needsFreshPress(command.event, owned);
-        if (command.event.kind === "key" && command.event.type === "down") owned.heldKeys.add(command.event.code);
-        if (command.event.kind === "key" && command.event.type === "up") owned.heldKeys.delete(command.event.code);
-        if (command.event.kind === "touch")
-          owned.touchCount = command.event.points.length;
-        if (command.event.kind === "down")
-          owned.heldButtons.add(command.event.button);
-        if (command.event.kind === "up")
-          owned.heldButtons.delete(command.event.button);
+        if (command.event.kind === "key" && command.event.type === "down")
+          owned.heldKeys.add(command.event.code);
+        if (command.event.kind === "key" && command.event.type === "up")
+          owned.heldKeys.delete(command.event.code);
+        if (command.event.kind === "touch") owned.touchCount = command.event.points.length;
+        if (command.event.kind === "down") owned.heldButtons.add(command.event.button);
+        if (command.event.kind === "up") owned.heldButtons.delete(command.event.button);
         const expectedNextSequence = owned.sequence + 1;
         const result = await options.transport.update({
           ...transportContext(owned.authority),
@@ -312,16 +285,14 @@ export function createBrowserInputQueue(options: QueueOptions) {
           ...(requiresTarget && fresh ? { target: fresh.target } : {}),
         });
         owned.sequence = result.nextSequence;
-        if (
-          currentEpoch !== epoch ||
-          !sameAuthority(owned.authority, options.authority())
-        )
-          break;
+        if (currentEpoch !== epoch || !sameAuthority(owned.authority, options.authority())) break;
         if (result.gestureId !== owned.gestureId)
           throw new Error("Browser gesture identity changed.");
         if (result.completion === "navigation") {
-          if (!isAcknowledgedNavigation(owned.authority, result.state) ||
-            result.nextSequence !== expectedNextSequence) {
+          if (
+            !isAcknowledgedNavigation(owned.authority, result.state) ||
+            result.nextSequence !== expectedNextSequence
+          ) {
             throw new Error("Browser navigation completion identity changed.");
           }
           // Native publication and cleanup are already acknowledged. Discard
@@ -340,9 +311,7 @@ export function createBrowserInputQueue(options: QueueOptions) {
         }
         options.onState(result.state);
         if (!sameAuthority(owned.authority, options.authority())) {
-          throw new Error(
-            "Browser input context changed. Release the gesture and try again.",
-          );
+          throw new Error("Browser input context changed. Release the gesture and try again.");
         }
         options.onCursor(result.cursor);
       }
@@ -357,8 +326,7 @@ export function createBrowserInputQueue(options: QueueOptions) {
     } finally {
       if (
         owned &&
-        (currentEpoch !== epoch ||
-          !sameAuthority(owned.authority, options.authority()))
+        (currentEpoch !== epoch || !sameAuthority(owned.authority, options.authority()))
       ) {
         if (currentEpoch === epoch) {
           epoch += 1;
@@ -402,10 +370,7 @@ export function createBrowserInputQueue(options: QueueOptions) {
       if (event.kind === "scroll" && previous.event.kind === "scroll") {
         const deltaX = previous.event.deltaX + event.deltaX;
         const deltaY = previous.event.deltaY + event.deltaY;
-        if (
-          Math.abs(deltaX) <= MAX_WHEEL_DELTA &&
-          Math.abs(deltaY) <= MAX_WHEEL_DELTA
-        ) {
+        if (Math.abs(deltaX) <= MAX_WHEEL_DELTA && Math.abs(deltaY) <= MAX_WHEEL_DELTA) {
           previous.event = { ...event, deltaX, deltaY };
           return true;
         }
@@ -414,9 +379,7 @@ export function createBrowserInputQueue(options: QueueOptions) {
     if (commands.length >= MAX_QUEUED_COMMANDS) {
       cancel();
       options.onError(
-        new Error(
-          "Browser input cannot keep up. Release the gesture and try again.",
-        ),
+        new Error("Browser input cannot keep up. Release the gesture and try again."),
       );
       return false;
     }

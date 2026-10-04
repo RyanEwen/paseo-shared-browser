@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { createBrowserNativeKeyboard } from "./browser-native-keyboard";
 import type { CanvasKeyboardEvent } from "./browser-canvas-keyboard";
+import { createBrowserNativeKeyboard } from "./browser-native-keyboard";
 
 function fixture() {
   const events: CanvasKeyboardEvent[] = [];

@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { createBrowserFrameBuffer, type BrowserFrameBuffer, type FrameCandidate } from "./browser-frame-buffer";
+import {
+  type BrowserFrameBuffer,
+  createBrowserFrameBuffer,
+  type FrameCandidate,
+} from "./browser-frame-buffer";
 
 function candidate(id: string, pixels = id, generation = 0): FrameCandidate {
   return {

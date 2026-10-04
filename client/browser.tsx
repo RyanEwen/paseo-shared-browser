@@ -46,10 +46,10 @@ import {
 import { groupResolutionPresets } from "../shared/resolution-menu";
 import { type BrowserCanvasDisplayMode, getBrowserCanvasLayout } from "./browser-canvas-layout";
 import { BrowserCanvasViewport } from "./browser-canvas-viewport";
-import { BrowserFrameImage } from "./browser-frame-image";
 import { browserCaptureInterval } from "./browser-capture-cadence";
-import { matchingResolutionPresetId, type EmulationSelection } from "./browser-emulation-mode";
+import { type EmulationSelection, matchingResolutionPresetId } from "./browser-emulation-mode";
 import type { FrameCandidate } from "./browser-frame-buffer";
+import { BrowserFrameImage } from "./browser-frame-image";
 import { BrowserResolutionPicker } from "./browser-resolution-picker";
 import {
   BrowserMenuHeading,
@@ -1711,7 +1711,7 @@ export function SharedBrowserPanel({
     : null;
   const selectedResolutionPresetId = matchingResolutionPresetId(state);
   const deviceLabel = selectedResolutionPresetId
-    ? activeDevicePreset?.label ?? "Custom display"
+    ? (activeDevicePreset?.label ?? "Custom display")
     : `${emulation.mode === "mobile" ? "Mobile" : "Desktop"} · custom display`;
   const transportLabel = currentFrame?.transport === "cdp-screencast" ? "CDP" : "fallback";
   const frameSummary = currentFrame
@@ -1911,9 +1911,7 @@ export function SharedBrowserPanel({
                 key={layer.ticket}
                 ticket={layer.ticket}
                 visible={visible}
-                label={
-                  state?.title ? `Shared browser: ${state.title}` : "Shared browser frame"
-                }
+                label={state?.title ? `Shared browser: ${state.title}` : "Shared browser frame"}
                 settled={settled}
                 retry={retryFrameCapture}
                 source={layer.source}
@@ -2093,21 +2091,32 @@ export function SharedBrowserPanel({
           }
           onClose={() => closeToolbarMenu()}
           shouldRestoreFocus={() => menuRestoreFocus.current}
-          onSubmenuOpen={() => { if (canSendInput) setKeysSubmenuOpen(true); }}
-          submenu={toolbarMenu === "actions" && keysSubmenuOpen ? {
-            title: "Send keys",
-            anchorRef: keysAnchorRef,
-            preferredHeight: 40 + SPECIAL_KEYS.length * (layout.compact ? 44 : 36),
-            onBack: () => setKeysSubmenuOpen(false),
-            children: SPECIAL_KEYS.map(({ key, label }) => (
-              <BrowserMenuItem key={key} theme={theme} compact={layout.compact}
-                label={label} disabled={!canSendInput}
-                onPress={() => {
-                  canvasInput.nativeKeyboard.reset();
-                  sendEvent({ kind: "key", key });
-                }} />
-            )),
-          } : undefined}
+          onSubmenuOpen={() => {
+            if (canSendInput) setKeysSubmenuOpen(true);
+          }}
+          submenu={
+            toolbarMenu === "actions" && keysSubmenuOpen
+              ? {
+                  title: "Send keys",
+                  anchorRef: keysAnchorRef,
+                  preferredHeight: 40 + SPECIAL_KEYS.length * (layout.compact ? 44 : 36),
+                  onBack: () => setKeysSubmenuOpen(false),
+                  children: SPECIAL_KEYS.map(({ key, label }) => (
+                    <BrowserMenuItem
+                      key={key}
+                      theme={theme}
+                      compact={layout.compact}
+                      label={label}
+                      disabled={!canSendInput}
+                      onPress={() => {
+                        canvasInput.nativeKeyboard.reset();
+                        sendEvent({ kind: "key", key });
+                      }}
+                    />
+                  )),
+                }
+              : undefined
+          }
         >
           {toolbarMenu === "display" ? (
             <>

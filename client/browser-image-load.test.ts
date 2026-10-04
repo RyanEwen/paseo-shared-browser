@@ -4,7 +4,9 @@ import { createBrowserImageLoadHandler } from "./browser-image-load";
 describe("cross-platform browser image decode", () => {
   it("accepts the desktop DOM load envelope without inventing a reported URI", () => {
     const delivered: unknown[] = [];
-    const handler = createBrowserImageLoadHandler(1, "data:image/jpeg;base64,frame", (...args) => delivered.push(args));
+    const handler = createBrowserImageLoadHandler(1, "data:image/jpeg;base64,frame", (...args) =>
+      delivered.push(args),
+    );
     expect(() => handler({ nativeEvent: new Event("load") })).not.toThrow();
     expect(delivered).toEqual([[1, true]]);
   });

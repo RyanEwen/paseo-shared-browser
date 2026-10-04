@@ -5,22 +5,15 @@
  */
 import { defineSettings } from "@getpaseo/plugin";
 import { z } from "zod";
-import { DEVICE_PRESETS } from "./device-presets";
 import { DEFAULT_CAPTURE_QUALITY } from "./capture-settings";
+import { DEVICE_PRESETS } from "./device-presets";
 
 export const browserDisplayPreferencesSchema = z.object({
-  captureQuality: z
-    .enum(["low", "medium", "high"])
-    .default(DEFAULT_CAPTURE_QUALITY),
-  favoritePresetIds: z
-    .array(z.string().min(1).max(128))
-    .max(DEVICE_PRESETS.length)
-    .default([]),
+  captureQuality: z.enum(["low", "medium", "high"]).default(DEFAULT_CAPTURE_QUALITY),
+  favoritePresetIds: z.array(z.string().min(1).max(128)).max(DEVICE_PRESETS.length).default([]),
 });
 
-export type BrowserDisplayPreferences = z.output<
-  typeof browserDisplayPreferencesSchema
->;
+export type BrowserDisplayPreferences = z.output<typeof browserDisplayPreferencesSchema>;
 
 /** One revisioned document per plugin host, shared across that host's panels. */
 export const browserDisplayPreferences = defineSettings({

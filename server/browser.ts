@@ -9,16 +9,16 @@ import type {
   acquireControlRpc,
   applyDevicePresetRpc,
   attachBrowserRpc,
+  beginBrowserGestureRpc,
   captureBrowserRpc,
   detachBrowserRpc,
+  endBrowserGestureRpc,
   listOpenBrowserWorkspacesRpc,
   navigateBrowserRpc,
   releaseControlRpc,
   resizeBrowserRpc,
   sendBrowserInputRpc,
-  beginBrowserGestureRpc,
   updateBrowserGestureRpc,
-  endBrowserGestureRpc,
 } from "../shared/browser";
 import { resolveBrowserRuntimeRoot } from "./runtime-path";
 import type { JsonValue } from "./runtime-protocol";
@@ -315,11 +315,15 @@ export async function handleSendBrowserInput(input: SendInput): Promise<SendOutp
 }
 
 /** Human-viewer live gestures use the existing authenticated supervisor, never an agent ticket. */
-export async function handleBeginBrowserGesture(input: BeginGestureInput): Promise<BeginGestureOutput> {
+export async function handleBeginBrowserGesture(
+  input: BeginGestureInput,
+): Promise<BeginGestureOutput> {
   return (await getProductionManager()).beginGesture(input);
 }
 
-export async function handleUpdateBrowserGesture(input: UpdateGestureInput): Promise<UpdateGestureOutput> {
+export async function handleUpdateBrowserGesture(
+  input: UpdateGestureInput,
+): Promise<UpdateGestureOutput> {
   return (await getProductionManager()).updateGesture(input);
 }
 

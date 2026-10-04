@@ -42,7 +42,8 @@ export function bindBrowserToolbarMenuWeb(
   const enabledItems = () =>
     Array.from(menu.querySelectorAll('[role="menuitem"]')).filter(
       (item) =>
-        item.getAttribute("aria-disabled") !== "true" && item.getAttribute("disabled") === null &&
+        item.getAttribute("aria-disabled") !== "true" &&
+        item.getAttribute("disabled") === null &&
         (!item.closest || item.closest('[role="menu"]') === menu),
     );
   enabledItems()[0]?.focus();
@@ -59,7 +60,11 @@ export function bindBrowserToolbarMenuWeb(
     // entire popup, and its cleanup performs the one final focus restoration.
     if (event.key === "Tab" && hierarchy?.nested) return;
     if (event.key !== "Tab" && target.closest && target.closest('[role="menu"]') !== menu) return;
-    if (event.key === "ArrowRight" && target.getAttribute("aria-expanded") !== null && hierarchy?.openSubmenu) {
+    if (
+      event.key === "ArrowRight" &&
+      target.getAttribute("aria-expanded") !== null &&
+      hierarchy?.openSubmenu
+    ) {
       event.preventDefault();
       event.stopPropagation();
       hierarchy.openSubmenu();
@@ -75,7 +80,9 @@ export function bindBrowserToolbarMenuWeb(
       if (event.key === "Tab") {
         // Menu Tab leaves the popup rather than walking its command rows or
         // trapping focus. Follow the trigger's surrounding host tab order.
-        const triggerButton = Array.from(anchor?.querySelectorAll('[role="button"], [role="menuitem"]') ?? [])[0];
+        const triggerButton = Array.from(
+          anchor?.querySelectorAll('[role="button"], [role="menuitem"]') ?? [],
+        )[0];
         const focusable = Array.from(
           menu.ownerDocument.querySelectorAll?.(
             'button, [role="button"], input:not([type="hidden"]), select, textarea, a[href], [tabindex]',
@@ -135,14 +142,18 @@ export function bindBrowserToolbarMenuWeb(
     // Native React unmount can remove the focused row before passive cleanup.
     // Remember ownership rather than consulting only the now-detached node.
     if (restoreFocus() && focusOwned) {
-      (returnTarget ?? Array.from(anchor?.querySelectorAll('[role="button"], [role="menuitem"]') ?? [])[0])?.focus();
+      (
+        returnTarget ??
+        Array.from(anchor?.querySelectorAll('[role="button"], [role="menuitem"]') ?? [])[0]
+      )?.focus();
     }
   };
 }
 
 /** Restore an in-menu trigger after compact Back, without touching native hosts. */
 export function focusBrowserMenuTrigger(node: unknown): void {
-  if (Platform.OS !== "web" || !node || typeof node !== "object" || !("querySelectorAll" in node)) return;
+  if (Platform.OS !== "web" || !node || typeof node !== "object" || !("querySelectorAll" in node))
+    return;
   const trigger = node as MenuNode;
   Array.from(trigger.querySelectorAll('[role="menuitem"], [role="button"]'))[0]?.focus();
 }

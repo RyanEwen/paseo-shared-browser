@@ -9,6 +9,7 @@ import { resolveBrowserRuntimeRoot } from "../server/runtime-path";
 import { resolveSupervisorPaths, startSupervisorServer } from "../server/supervisor";
 import { SupervisorClient } from "../server/supervisor-client";
 import type { BrowserFrame, BrowserState } from "../shared/browser";
+import { DEFAULT_CAPTURE_QUALITY } from "../shared/capture-settings";
 
 const roots: string[] = [];
 afterEach(async () => {
@@ -153,7 +154,15 @@ it("shares and persists a production agent-browser runtime across supervisor cli
       action: { kind: "goto", url: `${origin}/?delayed=1` },
     });
     expect(navigated.state.url).toBe(`${origin}/?delayed=1`);
-    expect(navigated.state.title).toBe("Shared Browser Smoke");
+    // URL actions acknowledge native navigation; this fixture separately waits
+    // for its delayed DOM before exercising the remote input elements below.
+    await vi.waitFor(
+      async () => {
+        const current = await manager.status(first.viewerToken);
+        expect(current.state.title).toBe("Shared Browser Smoke");
+      },
+      { timeout: 5_000 },
+    );
     console.log("browser-smoke: navigated");
 
     const firstCapture = await manager.capture(first.viewerToken, "medium", null);
@@ -245,7 +254,13 @@ it("shares and persists a production agent-browser runtime across supervisor cli
     });
     await vi.waitFor(() => expect(lastUserAgent).toContain("Pixel 7"));
     await vi.waitFor(async () => {
-      const resumedCapture = await manager.capture(resumed.viewerToken, "medium", null);
+      // Only the default quality requests the shared CDP stream. Other viewer
+      // qualities intentionally use screenshots without restarting that stream.
+      const resumedCapture = await manager.capture(
+        resumed.viewerToken,
+        DEFAULT_CAPTURE_QUALITY,
+        null,
+      );
       expect(resumedCapture.frame?.transport).toBe("cdp-screencast");
     });
     console.log("browser-smoke: emulated");

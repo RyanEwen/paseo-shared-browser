@@ -1,10 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
+import type { BrowserGestureEvent, BrowserState } from "../shared/browser";
 import {
-  createBrowserInputQueue,
   type BrowserGestureAuthority,
   type BrowserGestureTransport,
+  createBrowserInputQueue,
 } from "./browser-input-queue";
-import type { BrowserGestureEvent, BrowserState } from "../shared/browser";
 
 const authority: BrowserGestureAuthority = {
   viewerToken: "viewer",
@@ -53,8 +53,7 @@ function fixture(waitForFrame?: (afterFrameId: string, maxWaitMs?: number) => Pr
   const states: BrowserState[] = [];
   let projectState: ((state: BrowserState) => void) | null = null;
   let finished = 0;
-  const beginGate =
-    deferred<Awaited<ReturnType<BrowserGestureTransport["begin"]>>>();
+  const beginGate = deferred<Awaited<ReturnType<BrowserGestureTransport["begin"]>>>();
   const transport: BrowserGestureTransport = {
     begin: async () => await beginGate.promise,
     update: async (input) => {
@@ -74,10 +73,15 @@ function fixture(waitForFrame?: (afterFrameId: string, maxWaitMs?: number) => Pr
   const queue = createBrowserInputQueue({
     transport,
     authority: () => current,
-    onState: next => { states.push(next); projectState?.(next); },
+    onState: (next) => {
+      states.push(next);
+      projectState?.(next);
+    },
     onCursor: (cursor) => cursors.push(cursor),
     onError: (error) => errors.push(error),
-    onFinish: () => { finished += 1; },
+    onFinish: () => {
+      finished += 1;
+    },
     onNavigationComplete: () => navigationCompleted.push(true),
     ...(waitForFrame ? { waitForFrame } : {}),
   });
@@ -92,7 +96,9 @@ function fixture(waitForFrame?: (afterFrameId: string, maxWaitMs?: number) => Pr
     navigationCompleted,
     states,
     finishes: () => finished,
-    projectState(callback: (state: BrowserState) => void) { projectState = callback; },
+    projectState(callback: (state: BrowserState) => void) {
+      projectState = callback;
+    },
     changeAuthority(next: BrowserGestureAuthority | null) {
       current = next;
     },
@@ -103,17 +109,44 @@ describe("bounded browser input queue", () => {
   it("completes acknowledged Enter navigation before state projection revokes the decoded frame", async () => {
     const f = fixture();
     const next: BrowserState = {
-      ...state, status: "ready", controller: "self", sessionId: "session", runtimeId: "runtime",
-      bridgeEpoch: 1, viewportGeneration: 1, navigationGeneration: 2,
+      ...state,
+      status: "ready",
+      controller: "self",
+      sessionId: "session",
+      runtimeId: "runtime",
+      bridgeEpoch: 1,
+      viewportGeneration: 1,
+      navigationGeneration: 2,
     };
-    f.projectState(reply => { if (reply.navigationGeneration === 2) f.changeAuthority(null); });
-    f.transport.update = async input => {
+    f.projectState((reply) => {
+      if (reply.navigationGeneration === 2) f.changeAuthority(null);
+    });
+    f.transport.update = async (input) => {
       f.sent.push(input);
-      return { state: next, gestureId: input.gestureId, nextSequence: input.sequence + 1,
-        cursor: null, completion: "navigation" };
+      return {
+        state: next,
+        gestureId: input.gestureId,
+        nextSequence: input.sequence + 1,
+        cursor: null,
+        completion: "navigation",
+      };
     };
-    f.queue.enqueue({ kind: "key", type: "down", key: "Enter", code: "Enter", modifiers: 0, repeat: false });
-    f.queue.enqueue({ kind: "key", type: "up", key: "Enter", code: "Enter", modifiers: 0, repeat: false });
+    f.queue.enqueue({
+      kind: "key",
+      type: "down",
+      key: "Enter",
+      code: "Enter",
+      modifiers: 0,
+      repeat: false,
+    });
+    f.queue.enqueue({
+      kind: "key",
+      type: "up",
+      key: "Enter",
+      code: "Enter",
+      modifiers: 0,
+      repeat: false,
+    });
     f.queue.enqueue({ kind: "text", text: "never type on the destination" });
     f.queue.finish();
     f.beginGate.resolve({ state, gestureId: "owned", nextSequence: 1 });
@@ -128,23 +161,43 @@ describe("bounded browser input queue", () => {
 
   it("keeps the acknowledged click release but drops later old-page wheel and end", async () => {
     const f = fixture();
-    f.transport.update = async input => {
+    f.transport.update = async (input) => {
       f.sent.push(input);
       if (input.event.kind !== "up") {
-        return { state, gestureId: input.gestureId, nextSequence: input.sequence + 1, cursor: null };
+        return {
+          state,
+          gestureId: input.gestureId,
+          nextSequence: input.sequence + 1,
+          cursor: null,
+        };
       }
-      return { state: { ...state, status: "ready", controller: "self", sessionId: "session", runtimeId: "runtime",
-        bridgeEpoch: 1, viewportGeneration: 1, navigationGeneration: 2 },
-        gestureId: input.gestureId, nextSequence: input.sequence + 1, cursor: null, completion: "navigation" };
+      return {
+        state: {
+          ...state,
+          status: "ready",
+          controller: "self",
+          sessionId: "session",
+          runtimeId: "runtime",
+          bridgeEpoch: 1,
+          viewportGeneration: 1,
+          navigationGeneration: 2,
+        },
+        gestureId: input.gestureId,
+        nextSequence: input.sequence + 1,
+        cursor: null,
+        completion: "navigation",
+      };
     };
-    f.projectState(reply => { if (reply.navigationGeneration === 2) f.changeAuthority(null); });
+    f.projectState((reply) => {
+      if (reply.navigationGeneration === 2) f.changeAuthority(null);
+    });
     f.queue.enqueue({ kind: "down", point: point(1), button: "left", clickCount: 1 });
     f.queue.enqueue({ kind: "up", point: point(1), button: "left", clickCount: 1 });
     f.queue.enqueue({ kind: "scroll", point: point(1), deltaX: 0, deltaY: 10 });
     f.queue.finish();
     f.beginGate.resolve({ state, gestureId: "owned", nextSequence: 1 });
     await flush();
-    expect(f.sent.map(input => input.event.kind)).toEqual(["down", "up"]);
+    expect(f.sent.map((input) => input.event.kind)).toEqual(["down", "up"]);
     expect(f.errors).toEqual([]);
     expect(f.navigationCompleted).toEqual([true]);
     expect(f.ended).toEqual([]);
@@ -152,21 +205,37 @@ describe("bounded browser input queue", () => {
 
   it("does not grant navigation completion for changed runtime, bridge, viewport, controller or sequence", async () => {
     const next: BrowserState = {
-      ...state, status: "ready", controller: "self", sessionId: "session", runtimeId: "runtime",
-      bridgeEpoch: 1, viewportGeneration: 1, navigationGeneration: 2,
+      ...state,
+      status: "ready",
+      controller: "self",
+      sessionId: "session",
+      runtimeId: "runtime",
+      bridgeEpoch: 1,
+      viewportGeneration: 1,
+      navigationGeneration: 2,
     };
     for (const altered of [
-      { sessionId: "another-session" }, { runtimeId: "another-runtime" }, { bridgeEpoch: 2 },
-      { viewportGeneration: 2 }, { controller: "other" as const }, { navigationGeneration: 1 },
+      { sessionId: "another-session" },
+      { runtimeId: "another-runtime" },
+      { bridgeEpoch: 2 },
+      { viewportGeneration: 2 },
+      { controller: "other" as const },
+      { navigationGeneration: 1 },
       { status: "error" as const },
     ]) {
       const f = fixture();
-      f.transport.update = async input => {
+      f.transport.update = async (input) => {
         f.sent.push(input);
-        return { state: { ...next, ...altered }, gestureId: input.gestureId,
-          nextSequence: input.sequence + 1, cursor: null, completion: "navigation" };
+        return {
+          state: { ...next, ...altered },
+          gestureId: input.gestureId,
+          nextSequence: input.sequence + 1,
+          cursor: null,
+          completion: "navigation",
+        };
       };
-      f.queue.enqueue(move(1)); f.queue.enqueue(move(2));
+      f.queue.enqueue(move(1));
+      f.queue.enqueue(move(2));
       f.beginGate.resolve({ state, gestureId: "owned", nextSequence: 1 });
       await flush();
       expect(f.navigationCompleted).toEqual([]);
@@ -175,8 +244,13 @@ describe("bounded browser input queue", () => {
       expect(f.ended).toHaveLength(1);
     }
     const sequence = fixture();
-    sequence.transport.update = async input => ({ state: next, gestureId: input.gestureId,
-      nextSequence: input.sequence + 2, cursor: null, completion: "navigation" });
+    sequence.transport.update = async (input) => ({
+      state: next,
+      gestureId: input.gestureId,
+      nextSequence: input.sequence + 2,
+      cursor: null,
+      completion: "navigation",
+    });
     sequence.queue.enqueue(move(1));
     sequence.beginGate.resolve({ state, gestureId: "owned", nextSequence: 1 });
     await flush();
@@ -187,9 +261,15 @@ describe("bounded browser input queue", () => {
   it("unmarked navigation and replacement control retain the existing context rejection", async () => {
     const f = fixture();
     const next: BrowserState = { ...state, navigationGeneration: 2 };
-    f.projectState(reply => { if (reply.navigationGeneration === 2) f.changeAuthority(null); });
-    f.transport.update = async input => ({ state: next, gestureId: input.gestureId,
-      nextSequence: input.sequence + 1, cursor: null });
+    f.projectState((reply) => {
+      if (reply.navigationGeneration === 2) f.changeAuthority(null);
+    });
+    f.transport.update = async (input) => ({
+      state: next,
+      gestureId: input.gestureId,
+      nextSequence: input.sequence + 1,
+      cursor: null,
+    });
     f.queue.enqueue(move(1));
     f.beginGate.resolve({ state, gestureId: "owned", nextSequence: 1 });
     await flush();
@@ -197,11 +277,23 @@ describe("bounded browser input queue", () => {
     expect(f.navigationCompleted).toEqual([]);
 
     const changed = fixture();
-    changed.transport.update = async input => {
+    changed.transport.update = async (input) => {
       changed.changeAuthority({ ...authority, controlToken: "replacement" });
-      return { state: { ...next, status: "ready", controller: "self", sessionId: "session",
-        runtimeId: "runtime", bridgeEpoch: 1, viewportGeneration: 1 },
-        gestureId: input.gestureId, nextSequence: input.sequence + 1, cursor: null, completion: "navigation" };
+      return {
+        state: {
+          ...next,
+          status: "ready",
+          controller: "self",
+          sessionId: "session",
+          runtimeId: "runtime",
+          bridgeEpoch: 1,
+          viewportGeneration: 1,
+        },
+        gestureId: input.gestureId,
+        nextSequence: input.sequence + 1,
+        cursor: null,
+        completion: "navigation",
+      };
     };
     changed.queue.enqueue(move(1));
     changed.beginGate.resolve({ state, gestureId: "owned", nextSequence: 1 });
@@ -334,8 +426,7 @@ describe("bounded browser input queue", () => {
 
   it("holds at one in-flight update and never publishes a late cursor into a new generation", async () => {
     const f = fixture();
-    const updateGate =
-      deferred<Awaited<ReturnType<BrowserGestureTransport["update"]>>>();
+    const updateGate = deferred<Awaited<ReturnType<BrowserGestureTransport["update"]>>>();
     let attempts = 0;
     f.transport.update = async () => {
       attempts++;
@@ -419,11 +510,7 @@ describe("bounded browser input queue", () => {
     frame.resolve();
     await flush();
     expect(f.sent[1]?.target?.frameId).toBe("new-front");
-    expect(f.sent.map((input) => input.event.kind)).toEqual([
-      "scroll",
-      "down",
-      "up",
-    ]);
+    expect(f.sent.map((input) => input.event.kind)).toEqual(["scroll", "down", "up"]);
     expect(f.errors).toEqual([]);
   });
 
@@ -449,11 +536,7 @@ describe("bounded browser input queue", () => {
     f.queue.finish();
     f.beginGate.resolve({ state, gestureId: "owned", nextSequence: 1 });
     await flush();
-    expect(f.sent.map((input) => input.event.kind)).toEqual([
-      "down",
-      "up",
-      "leave",
-    ]);
+    expect(f.sent.map((input) => input.event.kind)).toEqual(["down", "up", "leave"]);
     expect(f.ended).toHaveLength(1);
     expect(f.ended[0]?.cancel).toBe(false);
     expect(waits).toEqual([]);
@@ -461,12 +544,17 @@ describe("bounded browser input queue", () => {
   });
   it("refreshes only a known unadmitted begin, then sends the pending wheel once", async () => {
     const f = fixture(async () => {
-      f.changeAuthority({ ...authority, target: { ...authority.target, frameId: "post-scroll-decoded" } });
+      f.changeAuthority({
+        ...authority,
+        target: { ...authority.target, frameId: "post-scroll-decoded" },
+      });
     });
     let begins = 0;
     f.transport.begin = async () => {
       begins += 1;
-      return begins === 1 ? { state, admission: "stale-frame" } : { state, gestureId: "owned", nextSequence: 1 };
+      return begins === 1
+        ? { state, admission: "stale-frame" }
+        : { state, gestureId: "owned", nextSequence: 1 };
     };
     f.queue.enqueue({ kind: "scroll", point: point(1), deltaX: 0, deltaY: 20 });
     await flush();
@@ -477,7 +565,9 @@ describe("bounded browser input queue", () => {
 
   it("does not retry begin or update after transport error or uncertain physical publication", async () => {
     for (const failure of ["begin", "update"] as const) {
-      const f = fixture(async () => { throw new Error("Must not wait/retry"); });
+      const f = fixture(async () => {
+        throw new Error("Must not wait/retry");
+      });
       let begins = 0;
       let updates = 0;
       f.transport.begin = async () => {
@@ -485,7 +575,10 @@ describe("bounded browser input queue", () => {
         if (failure === "begin") throw new Error("Outcome unknown");
         return { state, gestureId: "owned", nextSequence: 1 };
       };
-      f.transport.update = async () => { updates += 1; throw new Error("Outcome unknown"); };
+      f.transport.update = async () => {
+        updates += 1;
+        throw new Error("Outcome unknown");
+      };
       f.queue.enqueue({ kind: "scroll", point: point(1), deltaX: 0, deltaY: 20 });
       await flush();
       expect(begins).toBe(1);
@@ -496,19 +589,30 @@ describe("bounded browser input queue", () => {
 
   it("bounds stale admission and refuses replacement control while waiting for decode", async () => {
     const f = fixture(async () => {
-      f.changeAuthority({ ...authority, target: { ...authority.target, frameId: String(++front) } });
+      f.changeAuthority({
+        ...authority,
+        target: { ...authority.target, frameId: String(++front) },
+      });
     });
     let front = 0;
     let begins = 0;
-    f.transport.begin = async () => { begins += 1; return { state, admission: "stale-frame" }; };
+    f.transport.begin = async () => {
+      begins += 1;
+      return { state, admission: "stale-frame" };
+    };
     f.queue.enqueue(move(1));
     await flush();
     expect(begins).toBe(3);
     expect(f.sent).toHaveLength(0);
     expect(f.errors).toHaveLength(1);
-    const changed = fixture(async () => { changed.changeAuthority({ ...authority, controlToken: "replacement" }); });
+    const changed = fixture(async () => {
+      changed.changeAuthority({ ...authority, controlToken: "replacement" });
+    });
     let changedBegins = 0;
-    changed.transport.begin = async () => { changedBegins += 1; return { state, admission: "stale-frame" }; };
+    changed.transport.begin = async () => {
+      changedBegins += 1;
+      return { state, admission: "stale-frame" };
+    };
     changed.queue.enqueue(move(1));
     await flush();
     expect(changedBegins).toBe(1);
@@ -523,23 +627,36 @@ describe("bounded browser input queue", () => {
       const f = fixture(async (_id, budget) => {
         budgets.push(budget!);
         clock += budgets.length === 1 ? 3_000 : 1_001;
-        f.changeAuthority({ ...authority, target: { ...authority.target, frameId: String(clock) } });
+        f.changeAuthority({
+          ...authority,
+          target: { ...authority.target, frameId: String(clock) },
+        });
       });
       let begins = 0;
-      f.transport.begin = async () => { begins += 1; return { state, admission: "stale-frame" }; };
+      f.transport.begin = async () => {
+        begins += 1;
+        return { state, admission: "stale-frame" };
+      };
       f.queue.enqueue(move(1));
       await flush();
       expect(budgets).toEqual([4_000, 1_000]);
       expect(begins).toBe(2);
       expect(f.sent).toHaveLength(0);
       expect(f.errors).toHaveLength(1);
-    } finally { now.mockRestore(); }
+    } finally {
+      now.mockRestore();
+    }
   });
 
   it("does not begin under replacement control after the initial invalidated-frame wait", async () => {
-    const f = fixture(async () => { f.changeAuthority({ ...authority, controlToken: "replacement" }); });
+    const f = fixture(async () => {
+      f.changeAuthority({ ...authority, controlToken: "replacement" });
+    });
     let begins = 0;
-    f.transport.begin = async () => { begins += 1; return { state, gestureId: "owned", nextSequence: 1 }; };
+    f.transport.begin = async () => {
+      begins += 1;
+      return { state, gestureId: "owned", nextSequence: 1 };
+    };
     f.queue.enqueue({ kind: "scroll", point: point(1), deltaX: 0, deltaY: 20 });
     await flush();
     f.queue.finish();
@@ -550,12 +667,18 @@ describe("bounded browser input queue", () => {
     expect(f.sent).toHaveLength(1);
     expect(f.errors).toEqual([]);
   });
-
 });
 
 it("keeps keyboard repeat/Unicode edges ordered and a held modifier alive across mouse release", async () => {
   const f = fixture();
-  const key = { kind: "key", type: "down", key: "Control", code: "ControlLeft", modifiers: 2, repeat: false } as const;
+  const key = {
+    kind: "key",
+    type: "down",
+    key: "Control",
+    code: "ControlLeft",
+    modifiers: 2,
+    repeat: false,
+  } as const;
   f.queue.enqueue(key);
   f.queue.enqueue({ kind: "down", point: point(1), button: "left", clickCount: 1 });
   f.queue.enqueue({ kind: "up", point: point(1), button: "left", clickCount: 1 });
@@ -564,14 +687,37 @@ it("keeps keyboard repeat/Unicode edges ordered and a held modifier alive across
   await flush();
   expect(f.ended).toEqual([]);
   f.queue.enqueue({ ...key, type: "up", modifiers: 0 });
-  f.queue.enqueue({ kind: "key", type: "down", key: "é", code: "KeyE", modifiers: 0, repeat: false });
-  f.queue.enqueue({ kind: "key", type: "down", key: "é", code: "KeyE", modifiers: 0, repeat: true });
+  f.queue.enqueue({
+    kind: "key",
+    type: "down",
+    key: "é",
+    code: "KeyE",
+    modifiers: 0,
+    repeat: false,
+  });
+  f.queue.enqueue({
+    kind: "key",
+    type: "down",
+    key: "é",
+    code: "KeyE",
+    modifiers: 0,
+    repeat: true,
+  });
   f.queue.enqueue({ kind: "key", type: "up", key: "é", code: "KeyE", modifiers: 0, repeat: false });
   f.queue.enqueue({ kind: "text", text: "漢字\n😀" });
   f.queue.finish();
   await flush();
-  expect(f.sent.map((input) => input.event.kind)).toEqual(["key", "down", "up", "key", "key", "key", "key", "text"]);
-  expect(f.sent.map((input) => input.sequence)).toEqual([1,2,3,4,5,6,7,8]);
+  expect(f.sent.map((input) => input.event.kind)).toEqual([
+    "key",
+    "down",
+    "up",
+    "key",
+    "key",
+    "key",
+    "key",
+    "text",
+  ]);
+  expect(f.sent.map((input) => input.sequence)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
   expect(f.ended).toHaveLength(1);
   expect(f.errors).toEqual([]);
 });

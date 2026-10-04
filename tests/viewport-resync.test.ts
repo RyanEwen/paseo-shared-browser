@@ -26,10 +26,17 @@ function jpeg(width: number, height: number): string {
   ]).toString("base64");
 }
 
-function fakeRuntime(heights: number[], viewport = { width: 1280, height: 800 }, captureScale = 1, dpr = 1) {
+function fakeRuntime(
+  heights: number[],
+  viewport = { width: 1280, height: 800 },
+  captureScale = 1,
+  dpr = 1,
+) {
   const calls: string[] = [];
   const page = {
-    async send(method: string) {
+    async send(
+      method: string,
+    ): Promise<{ data?: string; cssVisualViewport?: { pageX: number; pageY: number } }> {
       calls.push(method);
       if (method === "Page.captureScreenshot") {
         const height = heights.shift() ?? 800;
@@ -46,14 +53,15 @@ function fakeRuntime(heights: number[], viewport = { width: 1280, height: 800 },
     ipcDirectory: "/tmp/i",
     session: "fake",
   });
+  const connection = { isOpen: true };
   Object.assign(runtime, {
     page,
     emulationAppliedPage: page,
-    connection: { isOpen: true },
+    connection,
     viewport: { ...viewport, deviceScaleFactor: dpr, captureScale, mobile: false, touch: false },
   });
   const control = runtime as unknown as { requirePage: () => Promise<typeof page> };
-  Object.assign(page, { connection: (runtime as any).connection });
+  Object.assign(page, { connection });
   control.requirePage = async () => page;
   return { runtime, calls, page };
 }
@@ -89,7 +97,6 @@ describe("fallback frame viewport resync", () => {
   });
 });
 
-
 it("recovers to captureScale pixels independently of mobile DPR", async () => {
   const { runtime, calls } = fakeRuntime([600, 1600], { width: 1280, height: 800 }, 2, 3);
   expect(await runtime.frame(1000000, 65, 1)).toMatchObject({ width: 2560, height: 1600 });
@@ -99,9 +106,10 @@ it("recovers to captureScale pixels independently of mobile DPR", async () => {
 it("rejects malformed JPEG without using it to trigger viewport recovery", async () => {
   const { runtime, calls, page } = fakeRuntime([800]);
   const original = page.send;
-  page.send = async (method: string) => method === "Page.captureScreenshot"
-    ? { data: Buffer.from("not a jpeg").toString("base64") } as any
-    : original(method);
+  page.send = async (method: string) =>
+    method === "Page.captureScreenshot"
+      ? { data: Buffer.from("not a jpeg").toString("base64") }
+      : original(method);
   await expect(runtime.frame(1000000, 65, 1)).rejects.toThrow("malformed JPEG");
   expect(calls).not.toContain("Emulation.setDeviceMetricsOverride");
 });
@@ -112,7 +120,7 @@ it("drops viewport recovery after a mutation supersedes capture", async () => {
   page.send = async (method: string) => {
     const result = await original(method);
     if (method === "Emulation.setDeviceMetricsOverride") {
-      (runtime as any).invalidateScreencastFrame();
+      (runtime as unknown as { invalidateScreencastFrame(): void }).invalidateScreencastFrame();
     }
     return result;
   };

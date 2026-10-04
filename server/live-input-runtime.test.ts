@@ -50,14 +50,20 @@ describe("runtime-owned live input", () => {
   it("completes acknowledged input that navigates while closing original held-input cleanup", async () => {
     const state = fixture();
     await state.runtime.beginLiveInput("owned");
-    state.intercept(async method => {
-      if (method !== "Input.dispatchKeyEvent" || state.calls.at(-1)?.params.type !== "keyDown") return;
+    state.intercept(async (method) => {
+      if (method !== "Input.dispatchKeyEvent" || state.calls.at(-1)?.params.type !== "keyDown")
+        return;
       state.control.documentGeneration++;
       await state.runtime.endLiveInput("owned");
     });
-    await expect(state.runtime.dispatchKey({kind:"key",type:"down",key:"Enter",code:"Enter",modifiers:0,repeat:false},"owned")).resolves.toBeUndefined();
-    expect(state.calls.filter(call => call.params.type === "keyDown")).toHaveLength(1);
-    expect(state.calls.filter(call => call.params.type === "keyUp")).toHaveLength(1);
+    await expect(
+      state.runtime.dispatchKey(
+        { kind: "key", type: "down", key: "Enter", code: "Enter", modifiers: 0, repeat: false },
+        "owned",
+      ),
+    ).resolves.toBeUndefined();
+    expect(state.calls.filter((call) => call.params.type === "keyDown")).toHaveLength(1);
+    expect(state.calls.filter((call) => call.params.type === "keyUp")).toHaveLength(1);
     await expect(state.runtime.assertLiveInput("owned")).rejects.toThrow("attachment");
   });
 
@@ -65,13 +71,15 @@ describe("runtime-owned live input", () => {
     for (const scenario of ["replacement", "uncertain"] as const) {
       const state = fixture();
       await state.runtime.beginLiveInput("owned");
-      state.intercept(async method => {
+      state.intercept(async (method) => {
         if (method !== "Input.dispatchMouseEvent") return;
         state.control.documentGeneration++;
         if (scenario === "uncertain") throw new Error("Mutation outcome is unknown");
-        state.control.page = {send:async()=>({})};
+        state.control.page = { send: async () => ({}) };
       });
-      await expect(state.runtime.mouseDown(20,30,"left",1,"owned")).rejects.toThrow(scenario === "replacement" ? "attachment" : "unknown");
+      await expect(state.runtime.mouseDown(20, 30, "left", 1, "owned")).rejects.toThrow(
+        scenario === "replacement" ? "attachment" : "unknown",
+      );
       state.intercept(async () => {});
       await state.runtime.endLiveInput("owned");
     }
@@ -80,14 +88,15 @@ describe("runtime-owned live input", () => {
   it("does not restore held touches after an acknowledged touch start navigates", async () => {
     const state = fixture();
     await state.runtime.beginLiveInput("owned");
-    state.intercept(async method => {
-      if (method !== "Input.dispatchTouchEvent" || state.calls.at(-1)?.params.type !== "touchStart") return;
+    state.intercept(async (method) => {
+      if (method !== "Input.dispatchTouchEvent" || state.calls.at(-1)?.params.type !== "touchStart")
+        return;
       state.control.documentGeneration++;
       await state.runtime.endLiveInput("owned");
     });
-    await state.runtime.touch("touchStart",[{x:20,y:30,id:7}],"owned");
+    await state.runtime.touch("touchStart", [{ x: 20, y: 30, id: 7 }], "owned");
     await state.runtime.releaseHeldInput();
-    expect(state.calls.filter(call => call.params.type === "touchCancel")).toHaveLength(1);
+    expect(state.calls.filter((call) => call.params.type === "touchCancel")).toHaveLength(1);
     await expect(state.runtime.assertLiveInput("owned")).rejects.toThrow("attachment");
   });
 
@@ -236,14 +245,28 @@ describe("runtime-owned live input", () => {
       ).rejects.toThrow();
     }
     expect(runtime.touch).toHaveBeenCalledTimes(1);
-    const event = { kind: "key", type: "down", key: "Enter", code: "Enter", modifiers: 0, repeat: false };
+    const event = {
+      kind: "key",
+      type: "down",
+      key: "Enter",
+      code: "Enter",
+      modifiers: 0,
+      repeat: false,
+    };
     await owner.request(owned, "input.key", { gestureId: "gesture", event });
     await owner.request(owned, "input.text", { gestureId: "gesture", text: "漢字😀" });
     expect(runtime.dispatchKey).toHaveBeenCalledWith(event, "gesture");
     expect(runtime.insertText).toHaveBeenCalledWith("漢字😀", "gesture");
     await expect(owner.request(owned, "input.key", { event })).rejects.toThrow();
-    await expect(owner.request(owned, "input.key", { gestureId: "gesture", event: { ...event, modifiers: 99 } })).rejects.toThrow();
-    await expect(owner.request(owned, "input.text", { gestureId: "gesture", text: "x".repeat(16001) })).rejects.toThrow();
+    await expect(
+      owner.request(owned, "input.key", {
+        gestureId: "gesture",
+        event: { ...event, modifiers: 99 },
+      }),
+    ).rejects.toThrow();
+    await expect(
+      owner.request(owned, "input.text", { gestureId: "gesture", text: "x".repeat(16001) }),
+    ).rejects.toThrow();
     expect(runtime.dispatchKey).toHaveBeenCalledTimes(1);
     expect(runtime.insertText).toHaveBeenCalledTimes(1);
   });
@@ -275,9 +298,7 @@ describe("runtime-owned live input", () => {
       await state.runtime.mouseUp(20, 30, button, 1, "owned");
       await state.runtime.mouseMove(30, 40, "owned");
       expect(
-        state.calls
-          .filter((call) => call.params.type === "mouseMoved")
-          .map((call) => call.params),
+        state.calls.filter((call) => call.params.type === "mouseMoved").map((call) => call.params),
       ).toEqual([
         { type: "mouseMoved", x: 20, y: 30, button, buttons: mask },
         { type: "mouseMoved", x: 30, y: 40, button: "none", buttons: 0 },
@@ -313,8 +334,7 @@ describe("runtime-owned live input", () => {
       ["none", 0],
     ]);
     expect(
-      state.calls.filter((call) => call.params.type === "mouseReleased").at(-1)
-        ?.params.button,
+      state.calls.filter((call) => call.params.type === "mouseReleased").at(-1)?.params.button,
     ).toBe("middle");
     await state.runtime.endLiveInput("next");
   });
@@ -323,31 +343,62 @@ describe("runtime-owned live input", () => {
 it("publishes ordered native Unicode/repeat/shortcut keys and committed text on the pinned attachment", async () => {
   const state = fixture();
   await state.runtime.beginLiveInput("keys");
-  await state.runtime.dispatchKey({ kind: "key", type: "down", key: "é", code: "KeyE", modifiers: 0, repeat: false }, "keys");
-  await state.runtime.dispatchKey({ kind: "key", type: "down", key: "é", code: "KeyE", modifiers: 0, repeat: true }, "keys");
-  await state.runtime.dispatchKey({ kind: "key", type: "up", key: "é", code: "KeyE", modifiers: 0, repeat: false }, "keys");
-  await state.runtime.dispatchKey({ kind: "key", type: "down", key: "Control", code: "ControlLeft", modifiers: 2, repeat: false }, "keys");
+  await state.runtime.dispatchKey(
+    { kind: "key", type: "down", key: "é", code: "KeyE", modifiers: 0, repeat: false },
+    "keys",
+  );
+  await state.runtime.dispatchKey(
+    { kind: "key", type: "down", key: "é", code: "KeyE", modifiers: 0, repeat: true },
+    "keys",
+  );
+  await state.runtime.dispatchKey(
+    { kind: "key", type: "up", key: "é", code: "KeyE", modifiers: 0, repeat: false },
+    "keys",
+  );
+  await state.runtime.dispatchKey(
+    { kind: "key", type: "down", key: "Control", code: "ControlLeft", modifiers: 2, repeat: false },
+    "keys",
+  );
   await state.runtime.mouseDown(10, 20, "left", 1, "keys");
   await state.runtime.insertText("漢字\n😀", "keys");
-  expect(state.calls.filter((call) => call.method === "Input.dispatchKeyEvent").map((call) => call.params)).toMatchObject([
+  expect(
+    state.calls
+      .filter((call) => call.method === "Input.dispatchKeyEvent")
+      .map((call) => call.params),
+  ).toMatchObject([
     { type: "keyDown", text: "é", code: "KeyE", autoRepeat: false },
     { type: "keyDown", text: "é", autoRepeat: true },
     { type: "keyUp", code: "KeyE" },
     { type: "rawKeyDown", code: "ControlLeft", modifiers: 2 },
   ]);
   expect(state.calls.find((call) => call.params.type === "mousePressed")?.params.modifiers).toBe(2);
-  expect(state.calls.find((call) => call.method === "Input.insertText")?.params).toEqual({ text: "漢字\n😀" });
+  expect(state.calls.find((call) => call.method === "Input.insertText")?.params).toEqual({
+    text: "漢字\n😀",
+  });
   await state.runtime.endLiveInput("keys");
-  expect(state.calls.at(-1)?.params).toMatchObject({ type: "keyUp", key: "Control", code: "ControlLeft" });
+  expect(state.calls.at(-1)?.params).toMatchObject({
+    type: "keyUp",
+    key: "Control",
+    code: "ControlLeft",
+  });
 });
 
 it("cleans possibly published keys on the original page and rejects unmatched repeat/up", async () => {
   const state = fixture();
   await state.runtime.beginLiveInput("keys");
-  const down = { kind: "key", type: "down", key: "Shift", code: "ShiftRight", modifiers: 8, repeat: false } as const;
+  const down = {
+    kind: "key",
+    type: "down",
+    key: "Shift",
+    code: "ShiftRight",
+    modifiers: 8,
+    repeat: false,
+  } as const;
   await expect(state.runtime.dispatchKey({ ...down, repeat: true }, "keys")).rejects.toThrow();
   await expect(state.runtime.dispatchKey({ ...down, type: "up" }, "keys")).rejects.toThrow();
-  state.intercept(async (method) => { if (method === "Input.dispatchKeyEvent") throw new Error("Lost key acknowledgment"); });
+  state.intercept(async (method) => {
+    if (method === "Input.dispatchKeyEvent") throw new Error("Lost key acknowledgment");
+  });
   await expect(state.runtime.dispatchKey(down, "keys")).rejects.toThrow("Lost key");
   state.control.page = { send: async () => ({}) };
   await state.runtime.endLiveInput("keys");
@@ -358,7 +409,10 @@ it("expires held keyboard modifiers without another client request", async () =>
   vi.useFakeTimers();
   const state = fixture();
   await state.runtime.beginLiveInput("keys");
-  await state.runtime.dispatchKey({ kind: "key", type: "down", key: "Alt", code: "AltLeft", modifiers: 1, repeat: false }, "keys");
+  await state.runtime.dispatchKey(
+    { kind: "key", type: "down", key: "Alt", code: "AltLeft", modifiers: 1, repeat: false },
+    "keys",
+  );
   await vi.advanceTimersByTimeAsync(5001);
   expect(state.calls.filter((call) => call.params.type === "keyUp")).toHaveLength(1);
   await expect(state.runtime.insertText("late", "keys")).rejects.toThrow("attachment");

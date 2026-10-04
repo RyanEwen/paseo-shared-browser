@@ -104,8 +104,7 @@ The plugin automatically injects its stdio MCP adapter only when a new, non-inte
 created with a provider that accepts external MCP servers. Agents that already exist, resumed
 sessions, imported sessions, and Paseo's internal agents are not modified. Paseo's built-in OMP
 provider accepts session MCP servers from Paseo 0.11, so new OMP agents receive the adapter there.
-On Paseo 0.9 and 0.10 the built-in OMP adapter rejects external MCP servers, so OMP agents are left
-unchanged. Pi agents continue to receive the adapter, but they require Pi's optional MCP support to
+Pi agents also receive the adapter, but require Pi's optional MCP support to
 launch it.
 
 The injected MCP server exposes exactly these tools: `shared_browser_status`,
@@ -253,13 +252,17 @@ User-supplied `AGENT_BROWSER_*` variables are deliberately ignored.
 ```bash
 bun install
 bun run typecheck
-bun run lint
-bun run format:check
+bun run check
 bun run test:unit
-bun run prepare:runtime
+PASEO_HOME="$(mktemp -d)" bun run prepare:runtime
 ```
 
-`bun run test:smoke` launches the configured real Chromium runtime and exercises two viewers,
+Treat the default Paseo daemon and profile as live user state. Use an isolated
+`PASEO_HOME` for runtime preparation and tests; do not run development lifecycle
+commands against the default daemon. Keep the prepared home available for smoke
+tests so they can resolve its runtime assets.
+
+`PASEO_HOME=<prepared-test-home> bun run test:smoke` launches the configured real Chromium runtime and exercises two viewers,
 control handoff, reconnect, stale-frame rejection, viewport changes, device emulation, profile
 persistence, and archive teardown.
 

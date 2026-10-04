@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { createCaptureTransportPolicy } from "./capture-transport-policy";
 import type { RuntimeFrame } from "./agent-browser-runtime";
+import { createCaptureTransportPolicy } from "./capture-transport-policy";
 
 const frame: RuntimeFrame = {
   dataBase64: "Zml4dHVyZQ==",

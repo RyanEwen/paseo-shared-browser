@@ -3,30 +3,35 @@ import type { RpcInput, RpcOutput } from "@getpaseo/plugin";
 import {
   type applyDevicePresetRpc,
   type BrowserFrame,
-  type BrowserInputEvent,
   type BrowserGestureEvent,
+  type BrowserInputEvent,
   type BrowserState,
+  type beginBrowserGestureRpc,
+  browserCursorSchema,
+  browserGestureEventSchema,
   DEFAULT_VIEWPORT,
   DEVICE_PRESETS,
   type DevicePresetId,
+  type endBrowserGestureRpc,
   FRAME_MAX_BYTES,
   MAX_VIEWPORT,
   MIN_VIEWPORT,
   mapDisplayedPoint,
-  type beginBrowserGestureRpc,
-  type updateBrowserGestureRpc,
-  type endBrowserGestureRpc,
-  browserGestureEventSchema,
-  browserCursorSchema,
   type navigateBrowserRpc,
   type resizeBrowserRpc,
   type sendBrowserInputRpc,
+  type updateBrowserGestureRpc,
   type Viewport,
 } from "../shared/browser";
-import type { JsonValue } from "./runtime-protocol";
-import { DEFAULT_CAPTURE_QUALITY, DEFAULT_JPEG_QUALITY, JPEG_QUALITY, captureDimensions } from "../shared/capture-settings";
+import {
+  captureDimensions,
+  DEFAULT_CAPTURE_QUALITY,
+  DEFAULT_JPEG_QUALITY,
+  JPEG_QUALITY,
+} from "../shared/capture-settings";
 import { BrowserGesture } from "./browser-gesture";
 import { sameRuntimeInputAttachment } from "./input-generation";
+import type { JsonValue } from "./runtime-protocol";
 export type WorkspaceValidator = (workspaceId: string) => Promise<void | boolean>;
 type NavigateInput = RpcInput<typeof navigateBrowserRpc>;
 type ResizeInput = RpcInput<typeof resizeBrowserRpc>;
@@ -34,7 +39,9 @@ type ApplyDevicePresetInput = RpcInput<typeof applyDevicePresetRpc>;
 type SendInput = RpcInput<typeof sendBrowserInputRpc>;
 type BeginGestureInput = RpcInput<typeof beginBrowserGestureRpc>;
 type UpdateGestureInput = RpcInput<typeof updateBrowserGestureRpc>;
-type UpdateGestureReply = Omit<RpcOutput<typeof updateBrowserGestureRpc>, "state"> & { state: BrowserState };
+type UpdateGestureReply = Omit<RpcOutput<typeof updateBrowserGestureRpc>, "state"> & {
+  state: BrowserState;
+};
 type EndGestureInput = RpcInput<typeof endBrowserGestureRpc>;
 type CaptureQuality = "low" | "medium" | "high";
 type InputTarget = SendInput["target"];
@@ -96,12 +103,15 @@ interface BrowserSession {
   viewers: Map<string, Viewer>;
   controller: Controller | null;
   mutationTail: Promise<void>;
-  frameCache: Map<CaptureQuality, {
-    frame: BrowserFrame;
-    cachedAt: number;
-    /** Exact runtime receipt, distinct from its normalized public frame fields. */
-    rawFrame: Record<string, JsonValue>;
-  }>;
+  frameCache: Map<
+    CaptureQuality,
+    {
+      frame: BrowserFrame;
+      cachedAt: number;
+      /** Exact runtime receipt, distinct from its normalized public frame fields. */
+      rawFrame: Record<string, JsonValue>;
+    }
+  >;
   recentFrames: Map<
     string,
     { navigationGeneration: number; viewportGeneration: number; expiresAt: number }
@@ -459,12 +469,21 @@ export class SessionManager {
         // may obtain another decoded frame before admitting its still-unsent input.
         const state = await this.snapshotState(session, input.viewerToken);
         this.requireMutationAccess(session, input);
-        if (state.status !== "ready") throw new Error(state.error ?? "Browser runtime is unavailable");
+        if (state.status !== "ready")
+          throw new Error(state.error ?? "Browser runtime is unavailable");
         return { state, admission: "stale-frame" as const };
       }
       await this.cancelGesture(session);
-      const gesture = new BrowserGesture(this.issueUniqueToken(), input.viewerToken, input.controlToken,
-        input.pointerKind, { ...input.expected }, { ...session.viewport }, this.now(), session.inputGeneration);
+      const gesture = new BrowserGesture(
+        this.issueUniqueToken(),
+        input.viewerToken,
+        input.controlToken,
+        input.pointerKind,
+        { ...input.expected },
+        { ...session.viewport },
+        this.now(),
+        session.inputGeneration,
+      );
       session.gesture = gesture;
       try {
         await this.request(session, "input.begin", { gestureId: gesture.id });
@@ -494,32 +513,56 @@ export class SessionManager {
         gesture.assertSequence(input.sequence, this.now());
         await this.assertGestureCurrent(session, gesture);
         gesture.validate(event);
-        if (event.kind === "down" || (event.kind === "touch" && event.type === "start" && gesture.touches.size === 0)) {
+        if (
+          event.kind === "down" ||
+          (event.kind === "touch" && event.type === "start" && gesture.touches.size === 0)
+        ) {
           if (!input.target) throw new Error("A current frame is required for a new press");
           this.requireRecentFrame(session, input.target);
         }
         const hover = gesture.isHover(event);
         if (event.kind === "key") {
-          await this.request(session, "input.key", { gestureId: gesture.id, event: {
-            kind: event.kind, type: event.type, key: event.key, code: event.code,
-            modifiers: event.modifiers, repeat: event.repeat,
-            ...(event.text !== undefined ? { text: event.text } : {}),
-          } });
+          await this.request(session, "input.key", {
+            gestureId: gesture.id,
+            event: {
+              kind: event.kind,
+              type: event.type,
+              key: event.key,
+              code: event.code,
+              modifiers: event.modifiers,
+              repeat: event.repeat,
+              ...(event.text !== undefined ? { text: event.text } : {}),
+            },
+          });
         } else if (event.kind === "text") {
           await this.request(session, "input.text", { gestureId: gesture.id, text: event.text });
         } else if (event.kind === "leave") {
           await this.request(session, "mouse.leave", { gestureId: gesture.id });
           gesture.lastPoint = null;
         } else if (event.kind === "touch") {
-          const points = event.points.map(point => ({ ...gesture.mapPoint(point), id: point.id }));
+          const points = event.points.map((point) => ({
+            ...gesture.mapPoint(point),
+            id: point.id,
+          }));
           await this.request(session, "touch", { gestureId: gesture.id, type: event.type, points });
         } else {
           const point = gesture.mapPoint(event.point);
-          const operation = event.kind === "move" ? "mouse.move" : event.kind === "down" ? "mouse.down"
-            : event.kind === "up" ? "mouse.up" : "mouse.wheel";
-          await this.request(session, operation, { ...point, gestureId: gesture.id,
-            ...(event.kind === "down" || event.kind === "up" ? { button: event.button, clickCount: event.clickCount } : {}),
-            ...(event.kind === "scroll" ? { deltaX: event.deltaX, deltaY: event.deltaY } : {}) });
+          const operation =
+            event.kind === "move"
+              ? "mouse.move"
+              : event.kind === "down"
+                ? "mouse.down"
+                : event.kind === "up"
+                  ? "mouse.up"
+                  : "mouse.wheel";
+          await this.request(session, operation, {
+            ...point,
+            gestureId: gesture.id,
+            ...(event.kind === "down" || event.kind === "up"
+              ? { button: event.button, clickCount: event.clickCount }
+              : {}),
+            ...(event.kind === "scroll" ? { deltaX: event.deltaX, deltaY: event.deltaY } : {}),
+          });
         }
         publishedEvent = event;
         await this.assertGestureCurrent(session, gesture);
@@ -537,7 +580,12 @@ export class SessionManager {
         return { state, gestureId: gesture.id, nextSequence: gesture.nextSequence, cursor };
       } catch (error) {
         if (publishedEvent) {
-          const completion = await this.completeNavigatingInput(session, gesture, publishedEvent, eventAcknowledged).catch(() => null);
+          const completion = await this.completeNavigatingInput(
+            session,
+            gesture,
+            publishedEvent,
+            eventAcknowledged,
+          ).catch(() => null);
           if (completion) return completion;
         }
         await this.cancelGesture(session, gesture);
@@ -547,13 +595,19 @@ export class SessionManager {
   }
 
   /** Return a fresh viewing state after acknowledged input navigated, without admitting another input. */
-  private async completeNavigatingInput(session: BrowserSession, gesture: BrowserGesture, event: BrowserGestureEvent, eventAcknowledged: boolean) {
+  private async completeNavigatingInput(
+    session: BrowserSession,
+    gesture: BrowserGesture,
+    event: BrowserGestureEvent,
+    eventAcknowledged: boolean,
+  ) {
     const state = await this.snapshotState(session, gesture.viewerToken);
     if (state.navigationGeneration === gesture.expected.navigationGeneration) return null;
     // Runtime inputGeneration is the private native attachment:document tuple.
     // A target replacement can also bump policy navigationGeneration, but must
     // never be accepted as same-attachment navigation after an acknowledged input.
-    if (!sameRuntimeInputAttachment(gesture.runtimeInputGeneration, session.inputGeneration)) return null;
+    if (!sameRuntimeInputAttachment(gesture.runtimeInputGeneration, session.inputGeneration))
+      return null;
 
     // Only the old document constraint may change after successful publication.
     // Takeover, viewport changes and runtime/bridge fences are still refused.
@@ -565,7 +619,8 @@ export class SessionManager {
     if (!eventAcknowledged) gesture.acknowledge(event, this.now());
     await this.cancelGesture(session, gesture);
     const finalState = await this.snapshotState(session, gesture.viewerToken);
-    if (!sameRuntimeInputAttachment(gesture.runtimeInputGeneration, session.inputGeneration)) return null;
+    if (!sameRuntimeInputAttachment(gesture.runtimeInputGeneration, session.inputGeneration))
+      return null;
     this.requireMutationAccess(session, {
       viewerToken: gesture.viewerToken,
       controlToken: gesture.controlToken,
@@ -573,7 +628,13 @@ export class SessionManager {
     });
     this.invalidateFrames(session);
     this.renewController(session, gesture.viewerToken);
-    return { state: finalState, gestureId: gesture.id, nextSequence: gesture.nextSequence, cursor: null, completion: "navigation" as const };
+    return {
+      state: finalState,
+      gestureId: gesture.id,
+      nextSequence: gesture.nextSequence,
+      cursor: null,
+      completion: "navigation" as const,
+    };
   }
 
   /** Cancellation releases only this channel, even after a lost update reply or navigation drift. */
@@ -599,48 +660,93 @@ export class SessionManager {
     });
   }
 
-  private requireGesture(session: BrowserSession, input: UpdateGestureInput | EndGestureInput): BrowserGesture {
+  private requireGesture(
+    session: BrowserSession,
+    input: UpdateGestureInput | EndGestureInput,
+  ): BrowserGesture {
     const gesture = session.gesture;
-    if (!gesture || gesture.id !== input.gestureId || gesture.viewerToken !== input.viewerToken
-      || gesture.controlToken !== input.controlToken) throw new Error("Browser gesture is unavailable");
+    if (
+      !gesture ||
+      gesture.id !== input.gestureId ||
+      gesture.viewerToken !== input.viewerToken ||
+      gesture.controlToken !== input.controlToken
+    )
+      throw new Error("Browser gesture is unavailable");
     return gesture;
   }
 
-  private assertGesturePacketContext(gesture: BrowserGesture, expected: BeginGestureInput["expected"]): void {
+  private assertGesturePacketContext(
+    gesture: BrowserGesture,
+    expected: BeginGestureInput["expected"],
+  ): void {
     // JSON member order is irrelevant; identity fields must match individually.
-    for (const key of ["sessionId", "runtimeId", "bridgeEpoch", "navigationGeneration", "viewportGeneration"] as const) {
-      if (gesture.expected[key] !== expected[key]) throw new Error("Browser gesture context changed");
+    for (const key of [
+      "sessionId",
+      "runtimeId",
+      "bridgeEpoch",
+      "navigationGeneration",
+      "viewportGeneration",
+    ] as const) {
+      if (gesture.expected[key] !== expected[key])
+        throw new Error("Browser gesture context changed");
     }
   }
 
-  private async assertGestureCurrent(session: BrowserSession, gesture: BrowserGesture): Promise<void> {
-    this.requireMutationAccess(session, { viewerToken: gesture.viewerToken, controlToken: gesture.controlToken, expected: gesture.expected });
-    if (session.gesture !== gesture || this.now() >= gesture.idleUntil || this.now() >= gesture.expiresAt) throw new Error("Browser gesture expired");
+  private async assertGestureCurrent(
+    session: BrowserSession,
+    gesture: BrowserGesture,
+  ): Promise<void> {
+    this.requireMutationAccess(session, {
+      viewerToken: gesture.viewerToken,
+      controlToken: gesture.controlToken,
+      expected: gesture.expected,
+    });
+    if (
+      session.gesture !== gesture ||
+      this.now() >= gesture.idleUntil ||
+      this.now() >= gesture.expiresAt
+    )
+      throw new Error("Browser gesture expired");
     // Runtime check pins the CDP document/attachment without repeating a full
     // metadata read for every drag point. snapshotState supplies final metadata.
     await this.request(session, "input.check", { gestureId: gesture.id });
-    this.requireMutationAccess(session, { viewerToken: gesture.viewerToken, controlToken: gesture.controlToken, expected: gesture.expected });
+    this.requireMutationAccess(session, {
+      viewerToken: gesture.viewerToken,
+      controlToken: gesture.controlToken,
+      expected: gesture.expected,
+    });
     if (session.gesture !== gesture) throw new Error("Browser gesture was cancelled");
   }
 
   private async gestureCursor(session: BrowserSession, gesture: BrowserGesture) {
     if (!gesture.lastPoint || gesture.pointerKind !== "mouse") return null;
     try {
-      const raw = await this.request(session, "cursor", { ...gesture.lastPoint, gestureId: gesture.id });
+      const raw = await this.request(session, "cursor", {
+        ...gesture.lastPoint,
+        gestureId: gesture.id,
+      });
       const parsed = browserCursorSchema.safeParse(raw);
       return parsed.success ? parsed.data : null;
-    } catch { return null; }
+    } catch {
+      return null;
+    }
   }
 
   private scheduleGestureTimeout(session: BrowserSession, gesture: BrowserGesture): void {
     if (gesture.timer) clearTimeout(gesture.timer);
-    gesture.timer = setTimeout(() => {
-      void this.serialize(session, async () => {
-        if (session.gesture === gesture && this.now() >= Math.min(gesture.idleUntil, gesture.expiresAt)) {
-          await this.cancelGesture(session, gesture);
-        }
-      }).catch(() => undefined);
-    }, Math.max(1, Math.min(gesture.idleUntil, gesture.expiresAt) - this.now()));
+    gesture.timer = setTimeout(
+      () => {
+        void this.serialize(session, async () => {
+          if (
+            session.gesture === gesture &&
+            this.now() >= Math.min(gesture.idleUntil, gesture.expiresAt)
+          ) {
+            await this.cancelGesture(session, gesture);
+          }
+        }).catch(() => undefined);
+      },
+      Math.max(1, Math.min(gesture.idleUntil, gesture.expiresAt) - this.now()),
+    );
     gesture.timer.unref?.();
   }
 
@@ -651,8 +757,11 @@ export class SessionManager {
     if (gesture.timer) clearTimeout(gesture.timer);
     // Cleanup targets the runtime's original attachment, never a newly navigated
     // or replaced page. Failure is best-effort and cannot replay the input.
-    try { await this.request(session, "input.end", { gestureId: gesture.id }); }
-    catch { /* Best-effort old-attachment cleanup must not escape teardown. */ }
+    try {
+      await this.request(session, "input.end", { gestureId: gesture.id });
+    } catch {
+      /* Best-effort old-attachment cleanup must not escape teardown. */
+    }
   }
 
   reset(): void {
@@ -849,11 +958,13 @@ export class SessionManager {
   ): boolean {
     this.pruneRecentFrames(session);
     const frame = session.recentFrames.get(target.frameId);
-    return Boolean(frame &&
-      target.navigationGeneration === session.navigationGeneration &&
-      target.viewportGeneration === session.viewportGeneration &&
-      frame.navigationGeneration === session.navigationGeneration &&
-      frame.viewportGeneration === session.viewportGeneration);
+    return Boolean(
+      frame &&
+        target.navigationGeneration === session.navigationGeneration &&
+        target.viewportGeneration === session.viewportGeneration &&
+        frame.navigationGeneration === session.navigationGeneration &&
+        frame.viewportGeneration === session.viewportGeneration,
+    );
   }
   private renewController(session: BrowserSession, token: string): void {
     this.heartbeatViewer(session, token);
@@ -965,8 +1076,9 @@ export class SessionManager {
       cached.frame.captureEpoch === generation.captureEpoch &&
       cached.frame.navigationGeneration === generation.navigationGeneration &&
       cached.frame.viewportGeneration === generation.viewportGeneration &&
-      (["dataBase64", "byteLength", "width", "height", "capturedAt", "transport"] as const)
-        .every(key => cached.rawFrame[key] === raw[key])
+      (["dataBase64", "byteLength", "width", "height", "capturedAt", "transport"] as const).every(
+        (key) => cached.rawFrame[key] === raw[key],
+      )
     ) {
       cached.cachedAt = this.now();
       return cached.frame;
@@ -1077,7 +1189,8 @@ export class SessionManager {
     const raw = asRecord(await this.request(session, "state", null));
     const url = boundedText(String(raw.url ?? ""), 8192);
     const inputGeneration = typeof raw.inputGeneration === "string" ? raw.inputGeneration : null;
-    const documentChanged = session.inputGeneration !== null && inputGeneration !== session.inputGeneration;
+    const documentChanged =
+      session.inputGeneration !== null && inputGeneration !== session.inputGeneration;
     if ((session.lastUrl && session.lastUrl !== url) || documentChanged) {
       await this.cancelGesture(session);
       session.navigationGeneration += 1;

@@ -94,18 +94,13 @@ export function bindBrowserCanvasWeb(
   const mouse = (type: "move" | "down" | "up", event: DomEvent) => {
     // Consumed touch events suppress compatibility mouse events in browsers.
     // Chromium also explicitly identifies them; never forward a second tap.
-    if (
-      touchActive ||
-      event.sourceCapabilities?.firesTouchEvents ||
-      !enabled()
-    ) {
+    if (touchActive || event.sourceCapabilities?.firesTouchEvents || !enabled()) {
       return;
     }
     const location = point(event.clientX, event.clientY);
     if (!location) return;
     onCursorVisibility(true);
-    const button =
-      event.button === 2 ? "right" : event.button === 1 ? "middle" : "left";
+    const button = event.button === 2 ? "right" : event.button === 1 ? "middle" : "left";
     const count = event.detail === 2 ? 2 : 1;
     if (type === "down") {
       if (input.mouseDown(location, button, count)) consume(event);
@@ -164,16 +159,10 @@ export function bindBrowserCanvasWeb(
     if (!location) return;
     // Wheel deltaMode is local CSS pixels, lines, or pages. Line-mode uses the
     // browser's conventional 16 CSS-pixel step; page mode uses this image's size.
-    const multiplierX =
-      event.deltaMode === 2 ? location.width : event.deltaMode === 1 ? 16 : 1;
-    const multiplierY =
-      event.deltaMode === 2 ? location.height : event.deltaMode === 1 ? 16 : 1;
+    const multiplierX = event.deltaMode === 2 ? location.width : event.deltaMode === 1 ? 16 : 1;
+    const multiplierY = event.deltaMode === 2 ? location.height : event.deltaMode === 1 ? 16 : 1;
     if (
-      input.wheel(
-        location,
-        (event.deltaX ?? 0) * multiplierX,
-        (event.deltaY ?? 0) * multiplierY,
-      )
+      input.wheel(location, (event.deltaX ?? 0) * multiplierX, (event.deltaY ?? 0) * multiplierY)
     ) {
       consume(event);
     }
@@ -204,11 +193,10 @@ export function bindBrowserCanvasWeb(
       }
     };
     documentTouchListeners.set(`touch${phase}`, trackUncontrolledContact);
-    node.ownerDocument.addEventListener(
-      `touch${phase}`,
-      trackUncontrolledContact,
-      { capture: true, passive: true },
-    );
+    node.ownerDocument.addEventListener(`touch${phase}`, trackUncontrolledContact, {
+      capture: true,
+      passive: true,
+    });
     listen(`touch${phase}`, (event) => {
       touchActive = phase !== "cancel" && (event.touches?.length ?? 0) > 0;
       const points = Array.from(event.touches ?? []).map((touch) => {
@@ -256,16 +244,8 @@ export function bindBrowserCanvasWeb(
 }
 
 /** Cursor enums originate from the guarded remote response, never custom URLs. */
-export function setBrowserCanvasCursor(
-  node: unknown,
-  cursor: BrowserCursor | null,
-): void {
-  if (
-    Platform.OS === "web" &&
-    node &&
-    typeof node === "object" &&
-    "style" in node
-  ) {
+export function setBrowserCanvasCursor(node: unknown, cursor: BrowserCursor | null): void {
+  if (Platform.OS === "web" && node && typeof node === "object" && "style" in node) {
     (node as BrowserCanvasNode).style.cursor = cursor ?? "default";
   }
 }

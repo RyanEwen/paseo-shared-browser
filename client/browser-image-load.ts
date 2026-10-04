@@ -13,10 +13,12 @@ export function createBrowserImageLoadHandler(
   settle: (ticket: number, succeeded: boolean) => unknown,
 ): (event: unknown) => void {
   return (event) => {
-    const nativeEvent = event && typeof event === "object" && "nativeEvent" in event
-      ? event.nativeEvent : undefined;
-    const source = nativeEvent && typeof nativeEvent === "object" && "source" in nativeEvent
-      ? nativeEvent.source : undefined;
+    const nativeEvent =
+      event && typeof event === "object" && "nativeEvent" in event ? event.nativeEvent : undefined;
+    const source =
+      nativeEvent && typeof nativeEvent === "object" && "source" in nativeEvent
+        ? nativeEvent.source
+        : undefined;
     const uri = source && typeof source === "object" && "uri" in source ? source.uri : undefined;
     if (uri && uri !== expectedUri) return;
     settle(ticket, true);

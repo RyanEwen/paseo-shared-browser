@@ -3,7 +3,7 @@
  * visible-frame ref is changed in a layout effect, after the image-layer commit,
  * so transport metadata cannot authorize input against pixels not yet displayed.
  */
-import { useCallback, useLayoutEffect, useState, type RefObject } from "react";
+import { type RefObject, useCallback, useLayoutEffect, useState } from "react";
 import type { BrowserFrame } from "../shared/browser";
 import { createBrowserFrameBuffer, type FrameCandidate } from "./browser-frame-buffer";
 

@@ -5,10 +5,7 @@
  * click counts come from physical events; surrounding Paseo chrome is untouched.
  */
 import type { BrowserGestureEvent } from "../shared/browser";
-import type {
-  BrowserGesturePoint,
-  BrowserTouchPoint,
-} from "./browser-input-queue";
+import type { BrowserGesturePoint, BrowserTouchPoint } from "./browser-input-queue";
 
 export interface CanvasInputOptions {
   enabled(): boolean;
@@ -31,16 +28,9 @@ function scroll(
   let remainingX = deltaX;
   let remainingY = deltaY;
   while (Math.abs(remainingX) > 0.001 || Math.abs(remainingY) > 0.001) {
-    const x = Math.max(
-      -MAX_SCROLL_DELTA,
-      Math.min(MAX_SCROLL_DELTA, remainingX),
-    );
-    const y = Math.max(
-      -MAX_SCROLL_DELTA,
-      Math.min(MAX_SCROLL_DELTA, remainingY),
-    );
-    if (!options.enqueue({ kind: "scroll", point, deltaX: x, deltaY: y }))
-      return;
+    const x = Math.max(-MAX_SCROLL_DELTA, Math.min(MAX_SCROLL_DELTA, remainingX));
+    const y = Math.max(-MAX_SCROLL_DELTA, Math.min(MAX_SCROLL_DELTA, remainingY));
+    if (!options.enqueue({ kind: "scroll", point, deltaX: x, deltaY: y })) return;
     remainingX -= x;
     remainingY -= y;
   }
@@ -104,11 +94,7 @@ export function createBrowserCanvasInput(options: CanvasInputOptions) {
     }
     return accepted;
   };
-  const wheel = (
-    point: BrowserGesturePoint,
-    deltaX: number,
-    deltaY: number,
-  ) => {
+  const wheel = (point: BrowserGesturePoint, deltaX: number, deltaY: number) => {
     if (!options.enabled()) return false;
     const viewport = options.viewport();
     if (!viewport) return false;
@@ -123,10 +109,7 @@ export function createBrowserCanvasInput(options: CanvasInputOptions) {
     return true;
   };
 
-  const touch = (
-    phase: "start" | "move" | "end" | "cancel",
-    points: BrowserTouchPoint[],
-  ) => {
+  const touch = (phase: "start" | "move" | "end" | "cancel", points: BrowserTouchPoint[]) => {
     if (phase === "cancel") {
       cancel();
       // Native touchCancel terminates the physical contact session itself.
@@ -143,10 +126,7 @@ export function createBrowserCanvasInput(options: CanvasInputOptions) {
       cancel();
       return false;
     }
-    if (
-      points.length > 5 ||
-      new Set(points.map((point) => point.id)).size !== points.length
-    ) {
+    if (points.length > 5 || new Set(points.map((point) => point.id)).size !== points.length) {
       cancel();
       return false;
     }

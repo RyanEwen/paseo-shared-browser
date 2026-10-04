@@ -6,15 +6,12 @@
 import { useSettings } from "@getpaseo/plugin/client";
 import { useRef, useState } from "react";
 import {
-  browserDisplayPreferences,
   type BrowserDisplayPreferences,
+  browserDisplayPreferences,
 } from "../shared/browser-display-preferences";
 import { DEFAULT_CAPTURE_QUALITY } from "../shared/capture-settings";
-import {
-  normalizeResolutionFavorites,
-  toggleResolutionFavorite,
-} from "../shared/resolution-menu";
 import type { DevicePresetId } from "../shared/device-presets";
+import { normalizeResolutionFavorites, toggleResolutionFavorite } from "../shared/resolution-menu";
 
 /** Call with the surface's host.id; persistence itself is scoped by Paseo. */
 export function useResolutionFavorites(hostId: string) {
@@ -48,10 +45,7 @@ export function useResolutionFavorites(hostId: string) {
     pending.current = operation;
     setPendingHost(hostId);
     try {
-      const saved = await settings.save(
-        update(settings.values),
-        settings.revision,
-      );
+      const saved = await settings.save(update(settings.values), settings.revision);
       return currentHost.current === hostId && saved;
     } finally {
       if (pending.current === operation) {
@@ -64,27 +58,20 @@ export function useResolutionFavorites(hostId: string) {
   return {
     favoritePresetIds,
     captureQuality:
-      settings.status === "ready"
-        ? settings.values.captureQuality
-        : DEFAULT_CAPTURE_QUALITY,
+      settings.status === "ready" ? settings.values.captureQuality : DEFAULT_CAPTURE_QUALITY,
     loading: settings.status === "loading",
     saving,
     disabled,
     error,
     toggleFavorite: (id: DevicePresetId) => {
-      if (normalizeResolutionFavorites([id]).length === 0)
-        return Promise.resolve(false);
+      if (normalizeResolutionFavorites([id]).length === 0) return Promise.resolve(false);
       return savePreferences((values) => ({
         ...values,
-        favoritePresetIds: toggleResolutionFavorite(
-          values.favoritePresetIds,
-          id,
-        ),
+        favoritePresetIds: toggleResolutionFavorite(values.favoritePresetIds, id),
       }));
     },
-    changeQuality: (
-      captureQuality: BrowserDisplayPreferences["captureQuality"],
-    ) => savePreferences((values) => ({ ...values, captureQuality })),
+    changeQuality: (captureQuality: BrowserDisplayPreferences["captureQuality"]) =>
+      savePreferences((values) => ({ ...values, captureQuality })),
     reload: settings.reload,
     resetPreferences: settings.reset,
   };

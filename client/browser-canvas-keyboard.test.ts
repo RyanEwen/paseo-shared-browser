@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
-  canvasKeyModifiers,
-  createBrowserCanvasKeyboard,
   type CanvasKeyboardEvent,
   type CanvasKeyEnvelope,
+  canvasKeyModifiers,
+  createBrowserCanvasKeyboard,
 } from "./browser-canvas-keyboard";
 
 const envelope = (overrides: Partial<CanvasKeyEnvelope> = {}): CanvasKeyEnvelope => ({
@@ -45,16 +45,31 @@ function fixture() {
 describe("physical canvas keyboard", () => {
   it("commits qualified AltGraph text once but never converts Ctrl+Alt shortcuts", () => {
     const f = fixture();
-    const euro = envelope({ key: "€", code: "KeyE", ctrlKey: true, altKey: true, getModifierState: value => value === "AltGraph" });
+    const euro = envelope({
+      key: "€",
+      code: "KeyE",
+      ctrlKey: true,
+      altKey: true,
+      getModifierState: (value) => value === "AltGraph",
+    });
     f.input.key("down", euro);
     f.input.key("up", euro);
     f.input.key("down", envelope({ key: "e", code: "KeyE", ctrlKey: true, altKey: true }));
-    expect(f.events.filter(event => event.kind === "text")).toEqual([{ kind: "text", text: "€" }]);
-    expect(f.events.filter(event => event.kind === "key")).toHaveLength(3);
-    expect(f.events.filter(event => event.kind === "key").every(event => event.text === undefined)).toBe(true);
+    expect(f.events.filter((event) => event.kind === "text")).toEqual([
+      { kind: "text", text: "€" },
+    ]);
+    expect(f.events.filter((event) => event.kind === "key")).toHaveLength(3);
+    expect(
+      f.events.filter((event) => event.kind === "key").every((event) => event.text === undefined),
+    ).toBe(true);
     const separate = fixture();
-    separate.input.key("down", envelope({ key: "€", getModifierState: value => value === "AltGraph" }));
-    expect(separate.events).toEqual([{ kind: "key", type: "down", key: "€", code: "KeyA", modifiers: 0, repeat: false, text: "€" }]);
+    separate.input.key(
+      "down",
+      envelope({ key: "€", getModifierState: (value) => value === "AltGraph" }),
+    );
+    expect(separate.events).toEqual([
+      { kind: "key", type: "down", key: "€", code: "KeyA", modifiers: 0, repeat: false, text: "€" },
+    ]);
   });
   it("preserves Unicode text, physical repeat/code and all modifier bits", () => {
     const f = fixture();

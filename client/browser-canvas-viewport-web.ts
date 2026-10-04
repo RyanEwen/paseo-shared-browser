@@ -47,7 +47,12 @@ function readScrollNode(handle: BrowserCanvasScrollHandle): WebScrollNode | null
       const candidate: unknown = read.call(handle);
       if (!candidate || typeof candidate !== "object") continue;
       const node = candidate as Partial<WebScrollNode>;
-      if (!node.style || typeof node.style.overflowX !== "string" || typeof node.style.overflowY !== "string") continue;
+      if (
+        !node.style ||
+        typeof node.style.overflowX !== "string" ||
+        typeof node.style.overflowY !== "string"
+      )
+        continue;
       if (typeof node.scrollLeft !== "number" || typeof node.scrollTop !== "number") continue;
       return node as WebScrollNode;
     } catch {

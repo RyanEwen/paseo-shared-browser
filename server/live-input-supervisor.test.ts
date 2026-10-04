@@ -1,7 +1,7 @@
 import { expect, it } from "vitest";
-import { RuntimeSupervisor } from "./supervisor";
-import type { JsonValue, RuntimeRequest } from "./runtime-protocol";
 import { browserStateSchema } from "../shared/browser";
+import type { JsonValue, RuntimeRequest } from "./runtime-protocol";
+import { RuntimeSupervisor } from "./supervisor";
 
 /** Exercise the immutable supervisor's human RPC path without a plugin or browser process. */
 it("routes validated human gestures, fences replaced plugin bridges and never exposes live gesture operations to agent tickets", async () => {
@@ -90,10 +90,19 @@ it("routes validated human gestures, fences replaced plugin bridges and never ex
       ...context,
       gestureId: begun.gestureId,
       sequence: 1,
-      event: { kind: "key", type: "down", key: "Control", code: "ControlLeft", modifiers: 2, repeat: false },
+      event: {
+        kind: "key",
+        type: "down",
+        key: "Control",
+        code: "ControlLeft",
+        modifiers: 2,
+        repeat: false,
+      },
     });
     expect(calls.filter((value) => value === "input.key")).toHaveLength(1);
-    const afterKey = (await request("capture", { viewerToken: attached.viewerToken })) as { frame: { frameId: string } };
+    const afterKey = (await request("capture", { viewerToken: attached.viewerToken })) as {
+      frame: { frameId: string };
+    };
     await request("gesture.update", {
       ...context,
       gestureId: begun.gestureId,

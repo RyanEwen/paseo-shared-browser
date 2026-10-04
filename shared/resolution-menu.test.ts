@@ -1,24 +1,19 @@
 import { describe, expect, it } from "vitest";
+import {
+  browserDisplayPreferences,
+  browserDisplayPreferencesSchema,
+} from "./browser-display-preferences";
 import { DEVICE_PRESETS } from "./device-presets";
 import {
   groupResolutionPresets,
   normalizeResolutionFavorites,
   toggleResolutionFavorite,
 } from "./resolution-menu";
-import {
-  browserDisplayPreferences,
-  browserDisplayPreferencesSchema,
-} from "./browser-display-preferences";
 
 describe("resolution choices and host preferences", () => {
   it("groups the whole catalogue by viewport ratio, sorts width and retains mobile ties", () => {
     const groups = groupResolutionPresets();
-    expect(groups.map((group) => group.label)).toEqual([
-      "16:9",
-      "16:10",
-      "1:1",
-      "Mobile",
-    ]);
+    expect(groups.map((group) => group.label)).toEqual(["16:9", "16:10", "1:1", "Mobile"]);
     expect(
       groups
         .flatMap((group) => group.presets)
@@ -27,9 +22,7 @@ describe("resolution choices and host preferences", () => {
     ).toEqual(DEVICE_PRESETS.map((preset) => preset.id).sort());
     for (const group of groups) {
       expect(group.presets.map((preset) => preset.viewport.width)).toEqual(
-        group.presets
-          .map((preset) => preset.viewport.width)
-          .sort((a, b) => a - b),
+        group.presets.map((preset) => preset.viewport.width).sort((a, b) => a - b),
       );
       for (const preset of group.presets) {
         if (group.id === "mobile") expect(preset.isMobile).toBe(true);
@@ -59,30 +52,17 @@ describe("resolution choices and host preferences", () => {
         "unknown",
       ]),
     ).toEqual(["pixel-7-sharp", "desktop-chrome"]);
-    expect(normalizeResolutionFavorites(Array(100).fill("pixel-7"))).toEqual([
-      "pixel-7",
-    ]);
+    expect(normalizeResolutionFavorites(Array(100).fill("pixel-7"))).toEqual(["pixel-7"]);
     expect(
-      normalizeResolutionFavorites(
-        DEVICE_PRESETS.flatMap((preset) => [preset.id, preset.id]),
-      ),
+      normalizeResolutionFavorites(DEVICE_PRESETS.flatMap((preset) => [preset.id, preset.id])),
     ).toHaveLength(DEVICE_PRESETS.length);
   });
 
   it("toggles only catalogue entries and does not mutate stored input", () => {
-    const input = Object.freeze([
-      "retired",
-      "desktop-chrome",
-      "desktop-chrome",
-    ]);
-    expect(toggleResolutionFavorite(input, "pixel-7")).toEqual([
-      "desktop-chrome",
-      "pixel-7",
-    ]);
+    const input = Object.freeze(["retired", "desktop-chrome", "desktop-chrome"]);
+    expect(toggleResolutionFavorite(input, "pixel-7")).toEqual(["desktop-chrome", "pixel-7"]);
     expect(toggleResolutionFavorite(input, "desktop-chrome")).toEqual([]);
-    expect(toggleResolutionFavorite(input, "unknown")).toEqual([
-      "desktop-chrome",
-    ]);
+    expect(toggleResolutionFavorite(input, "unknown")).toEqual(["desktop-chrome"]);
     expect(input).toEqual(["retired", "desktop-chrome", "desktop-chrome"]);
   });
 
@@ -93,13 +73,11 @@ describe("resolution choices and host preferences", () => {
       captureQuality: "high",
     });
     expect(
-      browserDisplayPreferencesSchema.parse({ favoritePresetIds: ["retired"] })
-        .favoritePresetIds,
+      browserDisplayPreferencesSchema.parse({ favoritePresetIds: ["retired"] }).favoritePresetIds,
     ).toEqual(["retired"]);
-    expect(
-      browserDisplayPreferencesSchema.safeParse({ captureQuality: "ultra" })
-        .success,
-    ).toBe(false);
+    expect(browserDisplayPreferencesSchema.safeParse({ captureQuality: "ultra" }).success).toBe(
+      false,
+    );
     expect(
       browserDisplayPreferencesSchema.safeParse({
         favoritePresetIds: Array(DEVICE_PRESETS.length + 1).fill("pixel-7"),

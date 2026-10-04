@@ -5,9 +5,9 @@
  * Browser-reserved shortcuts are outside JavaScript's interception guarantees.
  */
 import {
-  createBrowserCanvasKeyboard,
-  type CanvasKeyEnvelope,
   type CanvasKeyboardEvent,
+  type CanvasKeyEnvelope,
+  createBrowserCanvasKeyboard,
 } from "./browser-canvas-keyboard";
 
 interface KeyboardDomEvent extends CanvasKeyEnvelope {
@@ -114,10 +114,10 @@ export function bindBrowserCanvasKeyboard(node: KeyboardCanvasNode, options: Bin
     }
     // Local paste supplies clipboard bytes separately. Sending Ctrl/Meta+V would
     // additionally paste an unrelated remote clipboard and duplicate the action.
-    const pasteShortcut = !event.altKey && (
-      ((event.ctrlKey || event.metaKey) && event.code === "KeyV") ||
-      (event.shiftKey && !event.ctrlKey && !event.metaKey && event.code === "Insert")
-    );
+    const pasteShortcut =
+      !event.altKey &&
+      (((event.ctrlKey || event.metaKey) && event.code === "KeyV") ||
+        (event.shiftKey && !event.ctrlKey && !event.metaKey && event.code === "Insert"));
     if (pasteShortcut) {
       if (options.enabled()) {
         event.stopPropagation();
@@ -125,8 +125,12 @@ export function bindBrowserCanvasKeyboard(node: KeyboardCanvasNode, options: Bin
       return;
     }
     if (keyboard.key("down", event)) {
-      const altPrintable = event.altKey && !event.ctrlKey && !event.metaKey &&
-        !event.getModifierState?.("AltGraph") && Array.from(event.key).length === 1;
+      const altPrintable =
+        event.altKey &&
+        !event.ctrlKey &&
+        !event.metaKey &&
+        !event.getModifierState?.("AltGraph") &&
+        Array.from(event.key).length === 1;
       altTextPending = altPrintable ? event.key : null;
       if (altTextPending) {
         // Option layouts can produce text with Alt held. Only the browser's

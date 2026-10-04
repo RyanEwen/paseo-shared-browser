@@ -63,7 +63,9 @@ export class BrowserGesture {
       throw new Error("Release held mouse buttons before leaving");
     if (event.kind === "key") {
       if (event.type === "down" && this.keys.has(event.code) !== event.repeat) {
-        throw new Error(event.repeat ? "Key repeat has no matching press" : "Key is already pressed");
+        throw new Error(
+          event.repeat ? "Key repeat has no matching press" : "Key is already pressed",
+        );
       }
       if (event.type === "up" && !this.keys.has(event.code)) {
         throw new Error("Key release has no matching press");

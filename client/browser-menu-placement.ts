@@ -58,7 +58,7 @@ export function browserSubmenuPlacement(
 ): MenuRect | null {
   const values = [pane.width, pane.height, parent.x, parent.width, row.y, preferredHeight];
   if (
-    values.some(value => !Number.isFinite(value)) ||
+    values.some((value) => !Number.isFinite(value)) ||
     pane.width <= 16 ||
     pane.height <= 16 ||
     preferredHeight <= 0

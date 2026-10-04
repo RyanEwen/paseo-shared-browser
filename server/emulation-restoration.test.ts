@@ -1,7 +1,7 @@
 import { EventEmitter } from "node:events";
 import { describe, expect, it } from "vitest";
 import { AgentBrowserRuntime, type DeviceEmulation } from "./agent-browser-runtime";
-import { CdpSession, type CdpConnection } from "./cdp";
+import { type CdpConnection, CdpSession } from "./cdp";
 
 /** Protocol fixture exercises real attachment/configuration methods without a browser process. */
 class ConnectionFixture extends EventEmitter {

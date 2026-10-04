@@ -44,7 +44,9 @@ function fixture() {
     session: "test",
   });
   const calls: string[] = [];
-  let capture: (params: Record<string, unknown>) => Promise<{ data: string }> = async () => ({ data: jpeg() });
+  let capture: (params: Record<string, unknown>) => Promise<{ data: string }> = async () => ({
+    data: jpeg(),
+  });
   const page = {
     send: async (method: string, params: Record<string, unknown> = {}) => {
       calls.push(method);
@@ -87,7 +89,7 @@ function fixture() {
 describe("runtime capture hysteresis", () => {
   it("captures only the visible viewport without Chromium's touch-resetting beyond-viewport mode", async () => {
     const { runtime, setCapture } = fixture();
-    setCapture(async params => {
+    setCapture(async (params) => {
       expect(params.captureBeyondViewport).toBe(false);
       expect(params.clip).toEqual({ x: 0, y: 0, width: 1280, height: 800, scale: 1 });
       return { data: jpeg() };
@@ -171,11 +173,10 @@ describe("runtime capture hysteresis", () => {
   });
 });
 
-
 it("honors low/medium quality independently while high viewers keep the shared stream", async () => {
   const { runtime, calls, emit, setCapture } = fixture();
   const qualities: unknown[] = [];
-  setCapture(async params => {
+  setCapture(async (params) => {
     qualities.push(params.quality);
     return { data: jpeg() };
   });
@@ -195,7 +196,7 @@ it("honors low/medium quality independently while high viewers keep the shared s
 it("reduces quality only to satisfy the byte cap and never substitutes a cached high-quality frame", async () => {
   const { runtime, setCapture } = fixture();
   const qualities: unknown[] = [];
-  setCapture(async params => {
+  setCapture(async (params) => {
     qualities.push(params.quality);
     return { data: params.quality === 70 ? jpeg() + "AAAA".repeat(50) : jpeg() };
   });

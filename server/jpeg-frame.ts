@@ -1,5 +1,7 @@
 /** Read actual JPEG dimensions so CDP viewport metadata cannot authorize input on cropped pixels. */
-export function readJpegFrameDimensions(dataBase64: string): { width: number; height: number } | null {
+export function readJpegFrameDimensions(
+  dataBase64: string,
+): { width: number; height: number } | null {
   const bytes = Buffer.from(dataBase64, "base64");
   if (bytes.length < 4 || bytes.readUInt16BE(0) !== 0xffd8) return null;
 

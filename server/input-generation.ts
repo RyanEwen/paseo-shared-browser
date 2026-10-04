@@ -6,14 +6,22 @@
 
 /** Serialize native counters without treating document navigation as target replacement. */
 export function formatRuntimeInputGeneration(attachment: number, document: number): string {
-  if (!Number.isSafeInteger(attachment) || attachment < 0 || !Number.isSafeInteger(document) || document < 0) {
+  if (
+    !Number.isSafeInteger(attachment) ||
+    attachment < 0 ||
+    !Number.isSafeInteger(document) ||
+    document < 0
+  ) {
     throw new Error("Invalid native input generation");
   }
   return `${attachment}:${document}`;
 }
 
 /** Compare only independently serialized attachment identity; malformed or absent metadata refuses completion. */
-export function sameRuntimeInputAttachment(original: string | null, current: string | null): boolean {
+export function sameRuntimeInputAttachment(
+  original: string | null,
+  current: string | null,
+): boolean {
   const before = readNativeCounters(original);
   const after = readNativeCounters(current);
   return before !== null && after !== null && before.attachment === after.attachment;

@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import { it } from "vitest";
-import { SessionManager, type BrowserRuntimeClient } from "./browser-policy";
 import {
-  createBrowserInputQueue,
   type BrowserGestureAuthority,
+  createBrowserInputQueue,
 } from "../client/browser-input-queue";
+import { type BrowserRuntimeClient, SessionManager } from "./browser-policy";
 
 it("recovers a captured-before-wheel frame that decodes after invalidation without repeating the first wheel", async () => {
   // No native process or profile: actual queue + policy, with delayed decoder and deterministic clock.

@@ -1,9 +1,5 @@
 /** Catalogue grouping and stable-ID favorites for every resolution picker surface. */
-import {
-  DEVICE_PRESETS,
-  DEVICE_PRESET_IDS,
-  type DevicePresetId,
-} from "./device-presets";
+import { DEVICE_PRESET_IDS, DEVICE_PRESETS, type DevicePresetId } from "./device-presets";
 
 export type ResolutionPreset = (typeof DEVICE_PRESETS)[number];
 export type ResolutionGroupId = "16:9" | "16:10" | "1:1" | "mobile";
@@ -34,26 +30,19 @@ export function groupResolutionPresets(): ResolutionGroup[] {
     else if (width === height) id = "1:1";
     else if (width * 9 === height * 16) id = "16:9";
     else if (width * 10 === height * 16) id = "16:10";
-    else
-      throw new Error(
-        `Resolution preset ${preset.id} requires an aspect-ratio group`,
-      );
+    else throw new Error(`Resolution preset ${preset.id} requires an aspect-ratio group`);
     const group = groups.find((candidate) => candidate.id === id);
     if (!group) throw new Error(`Resolution group ${id} is missing`);
     group.presets = [...group.presets, preset];
   }
   return groups.map((group) => ({
     ...group,
-    presets: [...group.presets].sort(
-      (a, b) => a.viewport.width - b.viewport.width,
-    ),
+    presets: [...group.presets].sort((a, b) => a.viewport.width - b.viewport.width),
   }));
 }
 
 /** Drop removed/unknown IDs and duplicates, retaining the user's favorite order. */
-export function normalizeResolutionFavorites(
-  ids: readonly string[],
-): DevicePresetId[] {
+export function normalizeResolutionFavorites(ids: readonly string[]): DevicePresetId[] {
   const favorites: DevicePresetId[] = [];
   const seen = new Set<string>();
   for (const id of ids) {
@@ -66,13 +55,9 @@ export function normalizeResolutionFavorites(
 }
 
 /** Toggle only a current preset. Unknown IDs cannot become persisted shortcuts. */
-export function toggleResolutionFavorite(
-  ids: readonly string[],
-  id: string,
-): DevicePresetId[] {
+export function toggleResolutionFavorite(ids: readonly string[], id: string): DevicePresetId[] {
   const current = normalizeResolutionFavorites(ids);
   if (!KNOWN_PRESET_IDS.has(id)) return current;
-  if (current.includes(id as DevicePresetId))
-    return current.filter((existing) => existing !== id);
+  if (current.includes(id as DevicePresetId)) return current.filter((existing) => existing !== id);
   return [...current, id as DevicePresetId];
 }

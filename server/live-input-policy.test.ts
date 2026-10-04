@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { SessionManager, type BrowserRuntimeClient } from "./browser-policy";
 import type { BrowserGestureEvent } from "../shared/browser";
+import { type BrowserRuntimeClient, SessionManager } from "./browser-policy";
 
 /** Exercise the real policy with a deterministic owned runtime; no browser or services are started. */
 async function fixture() {
@@ -103,7 +103,9 @@ async function fixture() {
     reloadSameUrl: () => {
       inputGeneration = "0:1";
     },
-    replaceTarget: () => { inputGeneration = "1:0"; },
+    replaceTarget: () => {
+      inputGeneration = "1:0";
+    },
     intercept: (fn: typeof intercept) => {
       intercept = fn;
     },
@@ -145,33 +147,62 @@ describe("owned ordered live input", () => {
     try {
       await state.begin();
       await state.update({ kind: "down", button: "left", clickCount: 1, point: point() }, true);
-      state.intercept(async operation => {
+      state.intercept(async (operation) => {
         if (operation === "mouse.up") state.changeUrl("https://fixture.invalid/after");
       });
-      const reply = await state.update({ kind: "up", button: "left", clickCount: 1, point: point() });
+      const reply = await state.update({
+        kind: "up",
+        button: "left",
+        clickCount: 1,
+        point: point(),
+      });
       expect(reply.state.url).toBe("https://fixture.invalid/after");
-      expect(reply.state.navigationGeneration).toBe(state.context.expected.navigationGeneration + 1);
+      expect(reply.state.navigationGeneration).toBe(
+        state.context.expected.navigationGeneration + 1,
+      );
       expect(reply.cursor).toBeNull();
       expect(reply.completion).toBe("navigation");
-      expect(state.calls.filter(call => call.operation === "mouse.up")).toHaveLength(1);
+      expect(state.calls.filter((call) => call.operation === "mouse.up")).toHaveLength(1);
       await expect(state.update({ kind: "move", point: point() })).rejects.toThrow("unavailable");
-    } finally { state.manager.disconnect(); }
+    } finally {
+      state.manager.disconnect();
+    }
   });
 
   it("acknowledges a form-submit key before same-URL document replacement without replay", async () => {
     const state = await fixture();
     try {
       await state.begin();
-      state.intercept(async operation => {
+      state.intercept(async (operation) => {
         if (operation === "input.key") state.reloadSameUrl();
       });
-      const reply = await state.update({kind:"key",type:"down",key:"Enter",code:"Enter",modifiers:0,repeat:false});
+      const reply = await state.update({
+        kind: "key",
+        type: "down",
+        key: "Enter",
+        code: "Enter",
+        modifiers: 0,
+        repeat: false,
+      });
       expect(reply.completion).toBe("navigation");
-      expect(reply.state.navigationGeneration).toBe(state.context.expected.navigationGeneration + 1);
-      expect(state.calls.filter(call => call.operation === "input.key")).toHaveLength(1);
-      expect(state.calls.filter(call => call.operation === "input.end")).toHaveLength(1);
-      await expect(state.update({kind:"key",type:"up",key:"Enter",code:"Enter",modifiers:0,repeat:false})).rejects.toThrow("unavailable");
-    } finally { state.manager.disconnect(); }
+      expect(reply.state.navigationGeneration).toBe(
+        state.context.expected.navigationGeneration + 1,
+      );
+      expect(state.calls.filter((call) => call.operation === "input.key")).toHaveLength(1);
+      expect(state.calls.filter((call) => call.operation === "input.end")).toHaveLength(1);
+      await expect(
+        state.update({
+          kind: "key",
+          type: "up",
+          key: "Enter",
+          code: "Enter",
+          modifiers: 0,
+          repeat: false,
+        }),
+      ).rejects.toThrow("unavailable");
+    } finally {
+      state.manager.disconnect();
+    }
   });
 
   it("keeps pre-publication document drift and uncertain publication failures rejected", async () => {
@@ -180,14 +211,21 @@ describe("owned ordered live input", () => {
       try {
         await state.begin();
         if (scenario === "before") state.reloadSameUrl();
-        else state.intercept(async operation => {
-          if (operation !== "mouse.down") return;
-          state.changeUrl("https://fixture.invalid/after");
-          throw new Error("Mutation outcome is unknown");
-        });
-        await expect(state.update({kind:"down",button:"left",clickCount:1,point:point()},true)).rejects.toThrow(scenario === "before" ? "attachment" : "unknown");
-        expect(state.calls.filter(call => call.operation === "mouse.down")).toHaveLength(scenario === "before" ? 0 : 1);
-      } finally { state.manager.disconnect(); }
+        else
+          state.intercept(async (operation) => {
+            if (operation !== "mouse.down") return;
+            state.changeUrl("https://fixture.invalid/after");
+            throw new Error("Mutation outcome is unknown");
+          });
+        await expect(
+          state.update({ kind: "down", button: "left", clickCount: 1, point: point() }, true),
+        ).rejects.toThrow(scenario === "before" ? "attachment" : "unknown");
+        expect(state.calls.filter((call) => call.operation === "mouse.down")).toHaveLength(
+          scenario === "before" ? 0 : 1,
+        );
+      } finally {
+        state.manager.disconnect();
+      }
     }
   });
 
@@ -195,14 +233,18 @@ describe("owned ordered live input", () => {
     const state = await fixture();
     try {
       await state.begin();
-      state.intercept(async operation => {
+      state.intercept(async (operation) => {
         if (operation !== "mouse.down") return;
         state.changeUrl("https://fixture.invalid/after");
         state.manager.setBridgeEpoch(2);
       });
-      await expect(state.update({kind:"down",button:"left",clickCount:1,point:point()},true)).rejects.toThrow("bridge");
-      expect(state.calls.filter(call => call.operation === "mouse.down")).toHaveLength(1);
-    } finally { state.manager.disconnect(); }
+      await expect(
+        state.update({ kind: "down", button: "left", clickCount: 1, point: point() }, true),
+      ).rejects.toThrow("bridge");
+      expect(state.calls.filter((call) => call.operation === "mouse.down")).toHaveLength(1);
+    } finally {
+      state.manager.disconnect();
+    }
   });
 
   it("refuses target replacement after a successful native input acknowledgment", async () => {
@@ -210,14 +252,18 @@ describe("owned ordered live input", () => {
     try {
       await state.begin();
       let published = false;
-      state.intercept(async operation => {
+      state.intercept(async (operation) => {
         if (operation === "mouse.down") published = true;
         if (operation === "input.check" && published) state.replaceTarget();
       });
-      await expect(state.update({kind:"down",button:"left",clickCount:1,point:point()},true)).rejects.toThrow("attachment");
-      expect(state.calls.filter(call => call.operation === "mouse.down")).toHaveLength(1);
-      expect(state.calls.filter(call => call.operation === "input.end")).toHaveLength(1);
-    } finally { state.manager.disconnect(); }
+      await expect(
+        state.update({ kind: "down", button: "left", clickCount: 1, point: point() }, true),
+      ).rejects.toThrow("attachment");
+      expect(state.calls.filter((call) => call.operation === "mouse.down")).toHaveLength(1);
+      expect(state.calls.filter((call) => call.operation === "input.end")).toHaveLength(1);
+    } finally {
+      state.manager.disconnect();
+    }
   });
 
   it("retains a bounded decoded frame after hover, then streams every pressed drag move without requiring new frames", async () => {
@@ -243,16 +289,26 @@ describe("owned ordered live input", () => {
     await state.begin();
     await state.update({ kind: "scroll", point: point(), deltaX: 0, deltaY: 40 });
     const before = state.calls.length;
-    const reply = await state.manager.beginGesture({ ...state.context, target: state.target, pointerKind: "mouse" });
+    const reply = await state.manager.beginGesture({
+      ...state.context,
+      target: state.target,
+      pointerKind: "mouse",
+    });
     expect(reply).toHaveProperty("admission", "stale-frame");
     expect(reply).not.toHaveProperty("gestureId");
-    expect(state.calls.slice(before).map(call => call.operation)).not.toContain("input.begin");
-    expect(state.calls.slice(before).map(call => call.operation)).not.toContain("input.end");
+    expect(state.calls.slice(before).map((call) => call.operation)).not.toContain("input.begin");
+    expect(state.calls.slice(before).map((call) => call.operation)).not.toContain("input.end");
     await state.update({ kind: "scroll", point: point(), deltaX: 0, deltaY: 40 });
-    await expect(state.manager.beginGesture({ ...state.context, controlToken: "wrong", target: state.target, pointerKind: "mouse" })).rejects.toThrow();
+    await expect(
+      state.manager.beginGesture({
+        ...state.context,
+        controlToken: "wrong",
+        target: state.target,
+        pointerKind: "mouse",
+      }),
+    ).rejects.toThrow();
     state.manager.disconnect();
   });
-
 
   it("does not return stale admission if its final metadata read fails or discovers replacement navigation", async () => {
     for (const failure of ["runtime", "navigation"] as const) {
@@ -261,15 +317,25 @@ describe("owned ordered live input", () => {
         await state.begin();
         await state.update({ kind: "scroll", point: point(), deltaX: 0, deltaY: 40 });
         let reads = 0;
-        state.intercept(async operation => {
+        state.intercept(async (operation) => {
           if (operation !== "state" || ++reads !== 2) return;
           if (failure === "runtime") throw new Error("Runtime read unavailable");
           state.changeUrl("https://replacement.invalid/");
         });
         const before = state.calls.length;
-        await expect(state.manager.beginGesture({ ...state.context, target: state.target, pointerKind: "mouse" })).rejects.toThrow(failure === "runtime" ? "Runtime read unavailable" : "navigation");
-        expect(state.calls.slice(before).map(call => call.operation)).not.toContain("input.begin");
-      } finally { state.manager.disconnect(); }
+        await expect(
+          state.manager.beginGesture({
+            ...state.context,
+            target: state.target,
+            pointerKind: "mouse",
+          }),
+        ).rejects.toThrow(failure === "runtime" ? "Runtime read unavailable" : "navigation");
+        expect(state.calls.slice(before).map((call) => call.operation)).not.toContain(
+          "input.begin",
+        );
+      } finally {
+        state.manager.disconnect();
+      }
     }
   });
 
@@ -399,7 +465,10 @@ describe("owned ordered live input", () => {
     state.intercept(async (op) => {
       if (op === "mouse.down") state.reloadSameUrl();
     });
-    const reply = await state.update({ kind: "down", button: "left", clickCount: 1, point: point() }, true);
+    const reply = await state.update(
+      { kind: "down", button: "left", clickCount: 1, point: point() },
+      true,
+    );
     expect(reply.state.navigationGeneration).toBe(state.context.expected.navigationGeneration + 1);
     await expect(state.update({ kind: "move", point: point() })).rejects.toThrow("unavailable");
     expect(state.calls.filter((call) => call.operation === "input.end")).toHaveLength(1);
@@ -443,24 +512,45 @@ describe("owned ordered live input", () => {
 it("streams keyboard edges and committed text without a fresh frame per keystroke", async () => {
   const state = await fixture();
   await state.begin();
-  const key = { kind: "key", type: "down", key: "a", code: "KeyA", modifiers: 0, repeat: false } as const;
+  const key = {
+    kind: "key",
+    type: "down",
+    key: "a",
+    code: "KeyA",
+    modifiers: 0,
+    repeat: false,
+  } as const;
   await state.update(key);
   await state.update({ ...key, repeat: true });
   await state.update({ ...key, type: "up" });
   await state.update({ kind: "text", text: "漢字\n😀" });
   await state.end();
   expect(state.calls.filter((call) => call.operation === "input.key")).toHaveLength(3);
-  expect(state.calls.filter((call) => call.operation === "input.text")).toEqual([{ operation: "input.text", input: expect.objectContaining({ text: "漢字\n😀" }) }]);
+  expect(state.calls.filter((call) => call.operation === "input.text")).toEqual([
+    { operation: "input.text", input: expect.objectContaining({ text: "漢字\n😀" }) },
+  ]);
 });
 
 it("cancels a held gesture on device mode changes without reloading or inventing navigation", async () => {
   const state = await fixture();
   await state.begin();
-  await state.update({ kind: "key", type: "down", key: "Control", code: "ControlLeft", modifiers: 2, repeat: false });
+  await state.update({
+    kind: "key",
+    type: "down",
+    key: "Control",
+    code: "ControlLeft",
+    modifiers: 2,
+    repeat: false,
+  });
   const reply = await state.manager.applyDevicePreset({ ...state.context, presetId: "pixel-7" });
   expect(reply.state.navigationGeneration).toBe(state.context.expected.navigationGeneration);
   expect(reply.state.viewportGeneration).toBe(state.context.expected.viewportGeneration + 1);
   expect(state.calls.filter((call) => call.operation === "input.end")).toHaveLength(1);
-  expect(state.calls.filter((call) => call.operation === "reload" || call.operation === "navigate")).toEqual([]);
-  expect(state.calls.filter((call) => call.operation === "emulate").at(-1)?.input).toMatchObject({ mobile: true, touch: true });
+  expect(
+    state.calls.filter((call) => call.operation === "reload" || call.operation === "navigate"),
+  ).toEqual([]);
+  expect(state.calls.filter((call) => call.operation === "emulate").at(-1)?.input).toMatchObject({
+    mobile: true,
+    touch: true,
+  });
 });

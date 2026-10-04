@@ -13,12 +13,14 @@ export function isExpiredBrowserViewerError(error: unknown): boolean {
   if (value.code !== undefined && value.code !== "handler_error") return false;
   // Daemon session.js applies this exact prefix before the client appends
   // requestType/code. Arbitrary error text never grants automatic recovery.
-  const message = value.code === "handler_error" && value.message.startsWith("Request failed: ")
-    ? value.message.slice("Request failed: ".length)
-    : value.message;
+  const message =
+    value.code === "handler_error" && value.message.startsWith("Request failed: ")
+      ? value.message.slice("Request failed: ".length)
+      : value.message;
   if (message === VIEWER_EXPIRED_MESSAGE) return true;
-  return value.code === "handler_error" &&
-    message.startsWith(`${VIEWER_EXPIRED_MESSAGE} requestType=`);
+  return (
+    value.code === "handler_error" && message.startsWith(`${VIEWER_EXPIRED_MESSAGE} requestType=`)
+  );
 }
 
 export interface BrowserViewerRecoveryObservation {

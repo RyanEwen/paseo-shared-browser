@@ -45,7 +45,14 @@ function fixture(hierarchy?: Parameters<typeof bindBrowserToolbarMenuWeb>[5]) {
   const overlay = { contains: (node: unknown) => node === backdrop || menu.contains(node) };
   const close = vi.fn();
   let restore = true;
-  const dispose = bindBrowserToolbarMenuWeb(menu, trigger, close, () => restore, overlay, hierarchy);
+  const dispose = bindBrowserToolbarMenuWeb(
+    menu,
+    trigger,
+    close,
+    () => restore,
+    overlay,
+    hierarchy,
+  );
   const event = (key: string, target = doc.activeElement) => ({
     key,
     target,
@@ -138,7 +145,6 @@ describe("local toolbar menu keyboard and dismissal", () => {
   });
 });
 
-
 describe("root-owned submenu Tab exit", () => {
   it("Tab and Shift+Tab from a descendant skip the whole popup", () => {
     for (const backwards of [false, true]) {
@@ -150,7 +156,7 @@ describe("root-owned submenu Tab exit", () => {
         closest: () => childMenu,
       };
       const originalContains = f.menu.contains;
-      f.menu.contains = node => node === child || originalContains(node);
+      f.menu.contains = (node) => node === child || originalContains(node);
       const before = { focus: vi.fn(), getAttribute: () => null };
       const after = { focus: vi.fn(), getAttribute: () => null };
       Object.assign(f.doc, {

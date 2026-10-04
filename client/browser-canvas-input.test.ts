@@ -59,11 +59,7 @@ describe("natural canvas input", () => {
     f.input.mouseMove({ ...point, x: 60 });
     f.input.mouseMove({ ...point, x: 100 });
     expect(f.ended()).toBe(0);
-    expect(f.events.map((event) => event.kind)).toEqual([
-      "down",
-      "move",
-      "move",
-    ]);
+    expect(f.events.map((event) => event.kind)).toEqual(["down", "move", "move"]);
     f.input.mouseUp({ ...point, x: 100 }, "left", 1);
     expect(f.ended()).toBe(1);
   });
@@ -73,9 +69,7 @@ describe("natural canvas input", () => {
     const first = { ...point, id: 7 };
     const second = { ...point, x: 200, id: 9 };
     f.input.touch("start", [first]);
-    expect(f.events).toEqual([
-      { kind: "touch", type: "start", points: [first] },
-    ]);
+    expect(f.events).toEqual([{ kind: "touch", type: "start", points: [first] }]);
     expect(f.ended()).toBe(0);
     f.input.touch("start", [first, second]);
     f.input.touch("move", [

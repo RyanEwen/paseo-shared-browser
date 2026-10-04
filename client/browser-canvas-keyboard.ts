@@ -99,7 +99,11 @@ export function createBrowserCanvasKeyboard(options: KeyboardOptions) {
       admitted.add(id);
       // AltGraph can report Ctrl+Alt on international layouts. The real host
       // qualifier permits one text commit without rewriting a genuine shortcut.
-      if (event.getModifierState?.("AltGraph") && (modifiers & 7) !== 0 && Array.from(event.key).length === 1) {
+      if (
+        event.getModifierState?.("AltGraph") &&
+        (modifiers & 7) !== 0 &&
+        Array.from(event.key).length === 1
+      ) {
         options.enqueue({ kind: "text", text: event.key });
       }
     }

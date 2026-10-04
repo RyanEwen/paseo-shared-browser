@@ -4,37 +4,27 @@
  * do not. Cursor replies are consumed only by the queue incarnation that sent
  * them. The existing capture polling keeps playback running during a drag.
  */
-import {
-  useCallback,
-  useEffect,
-  useLayoutEffect,
-  useRef,
-  useState,
-} from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   AppState,
+  type GestureResponderEvent,
   PanResponder,
   Platform,
-  type GestureResponderEvent,
   type View,
 } from "react-native";
 import type { BrowserCursor, BrowserState } from "../shared/browser";
+import { createBrowserCanvasInput } from "./browser-canvas-input";
+import type { CanvasKeyboardEvent } from "./browser-canvas-keyboard";
+import { bindBrowserCanvasKeyboard, type KeyboardCanvasNode } from "./browser-canvas-keyboard-web";
 import {
-  createBrowserInputQueue,
   type BrowserGestureAuthority,
   type BrowserGesturePoint,
   type BrowserGestureTransport,
   type BrowserTouchPoint,
+  createBrowserInputQueue,
 } from "./browser-input-queue";
-import { createBrowserCanvasInput } from "./browser-canvas-input";
-import { bindBrowserCanvasKeyboard, type KeyboardCanvasNode } from "./browser-canvas-keyboard-web";
-import type { CanvasKeyboardEvent } from "./browser-canvas-keyboard";
 import { useBrowserNativeKeyboard } from "./use-browser-native-keyboard";
-import {
-  bindBrowserCanvasWeb,
-  setBrowserCanvasCursor,
-  type BrowserCanvasNode,
-} from "./web";
+import { type BrowserCanvasNode, bindBrowserCanvasWeb, setBrowserCanvasCursor } from "./web";
 
 interface CanvasOptions {
   authority(): BrowserGestureAuthority | null;
@@ -83,9 +73,7 @@ export function useBrowserCanvasInput(options: CanvasOptions) {
   const nodeRef = useRef<unknown>(null);
   const [node, setNode] = useState<unknown>(null);
   const alive = useRef(true);
-  const inputModel = useRef<ReturnType<typeof createBrowserCanvasInput> | null>(
-    null,
-  );
+  const inputModel = useRef<ReturnType<typeof createBrowserCanvasInput> | null>(null);
   const keyboard = useRef<ReturnType<typeof bindBrowserCanvasKeyboard> | null>(null);
   const nativeRelay = useRef<{ reset(): void } | null>(null);
   const cursorVisible = useRef(false);
@@ -113,8 +101,7 @@ export function useBrowserCanvasInput(options: CanvasOptions) {
         if (alive.current) current.current.onState(state);
       },
       onCursor: (cursor: BrowserCursor | null) => {
-        if (cursorVisible.current)
-          setBrowserCanvasCursor(nodeRef.current, cursor);
+        if (cursorVisible.current) setBrowserCanvasCursor(nodeRef.current, cursor);
       },
       onError: (error) => {
         // Queue owns cleanup; reset local contacts without recursively cancelling.
@@ -182,10 +169,7 @@ export function useBrowserCanvasInput(options: CanvasOptions) {
       viewport: () => current.current.viewport,
       enqueue(event) {
         clearIdle();
-        if (
-          event.kind === "down" ||
-          (event.kind === "touch" && event.type === "start")
-        ) {
+        if (event.kind === "down" || (event.kind === "touch" && event.type === "start")) {
           nativeRelay.current?.reset();
           current.current.onInputBoundary();
         }
@@ -223,17 +207,20 @@ export function useBrowserCanvasInput(options: CanvasOptions) {
 
   inputModel.current = input;
 
-  const enqueueKeyboard = useCallback((event: CanvasKeyboardEvent) => {
-    clearIdle();
-    const accepted = queue.enqueue(event);
-    if (accepted) {
-      if (event.kind === "text" || (event.type === "down" && !event.repeat)) {
-        current.current.onInputBoundary();
+  const enqueueKeyboard = useCallback(
+    (event: CanvasKeyboardEvent) => {
+      clearIdle();
+      const accepted = queue.enqueue(event);
+      if (accepted) {
+        if (event.kind === "text" || (event.type === "down" && !event.repeat)) {
+          current.current.onInputBoundary();
+        }
+        current.current.onActivity(true);
       }
-      current.current.onActivity(true);
-    }
-    return accepted;
-  }, [queue]);
+      return accepted;
+    },
+    [queue],
+  );
   const finishKeyboard = useCallback(() => {
     current.current.onActivity(false);
     // Keep one channel through ordinary inter-key gaps. New typing clears this
@@ -247,7 +234,9 @@ export function useBrowserCanvasInput(options: CanvasOptions) {
     enqueue: enqueueKeyboard,
     finish: finishKeyboard,
     cancel: input.cancel,
-    onError: error => { if (alive.current) current.current.onError(error); },
+    onError: (error) => {
+      if (alive.current) current.current.onError(error);
+    },
   });
   nativeRelay.current = nativeKeyboard;
 
@@ -259,10 +248,7 @@ export function useBrowserCanvasInput(options: CanvasOptions) {
   }, [input, options.ownershipKey]);
   useLayoutEffect(() => {
     for (const waiter of frameWaiters.current) {
-      if (
-        options.decodedFrameId &&
-        options.decodedFrameId !== waiter.afterFrameId
-      )
+      if (options.decodedFrameId && options.decodedFrameId !== waiter.afterFrameId)
         waiter.resolve();
     }
   }, [options.decodedFrameId]);
@@ -278,12 +264,7 @@ export function useBrowserCanvasInput(options: CanvasOptions) {
     };
   }, [input]);
   useEffect(() => {
-    if (
-      Platform.OS !== "web" ||
-      !node ||
-      typeof node !== "object" ||
-      !("addEventListener" in node)
-    )
+    if (Platform.OS !== "web" || !node || typeof node !== "object" || !("addEventListener" in node))
       return;
     return bindBrowserCanvasWeb(
       node as BrowserCanvasNode,
@@ -297,7 +278,8 @@ export function useBrowserCanvasInput(options: CanvasOptions) {
   }, [input, node]);
 
   useEffect(() => {
-    if (Platform.OS !== "web" || !node || typeof node !== "object" || !("ownerDocument" in node)) return;
+    if (Platform.OS !== "web" || !node || typeof node !== "object" || !("ownerDocument" in node))
+      return;
     const binding = bindBrowserCanvasKeyboard(node as KeyboardCanvasNode, {
       enabled: () => alive.current && current.current.enabled,
       enqueue: enqueueKeyboard,
@@ -322,41 +304,25 @@ export function useBrowserCanvasInput(options: CanvasOptions) {
         // A newly granted responder must contain only genuinely new contacts.
         // A second finger cannot import a first contact that began observe-only.
         const changed = new Set(
-          (event.nativeEvent.changedTouches ?? []).map(
-            (touch) => touch.identifier,
-          ),
+          (event.nativeEvent.changedTouches ?? []).map((touch) => touch.identifier),
         );
         return (
           event.nativeEvent.touches.length > 0 &&
-          event.nativeEvent.touches.every((touch) =>
-            changed.has(touch.identifier),
-          )
+          event.nativeEvent.touches.every((touch) => changed.has(touch.identifier))
         );
       },
       // Moving a contact after lease acquisition is not a fresh start edge.
       onMoveShouldSetPanResponder: () => false,
       onPanResponderGrant: (event) => {
         ids.current.clear();
-        input.touch(
-          "start",
-          nativePoints(event, current.current.displaySize, ids.current),
-        );
+        input.touch("start", nativePoints(event, current.current.displaySize, ids.current));
       },
       onPanResponderStart: (event) =>
-        input.touch(
-          "start",
-          nativePoints(event, current.current.displaySize, ids.current),
-        ),
+        input.touch("start", nativePoints(event, current.current.displaySize, ids.current)),
       onPanResponderMove: (event) =>
-        input.touch(
-          "move",
-          nativePoints(event, current.current.displaySize, ids.current),
-        ),
+        input.touch("move", nativePoints(event, current.current.displaySize, ids.current)),
       onPanResponderEnd: (event) =>
-        input.touch(
-          "end",
-          nativePoints(event, current.current.displaySize, ids.current),
-        ),
+        input.touch("end", nativePoints(event, current.current.displaySize, ids.current)),
       onPanResponderRelease: () => {
         input.touch("end", []);
         ids.current.clear();

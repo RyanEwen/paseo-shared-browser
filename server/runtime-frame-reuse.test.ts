@@ -1,7 +1,7 @@
 /** Exact fresh runtime receipts avoid resending cached JPEGs without reviving invalidated input. */
 import { describe, expect, it } from "vitest";
-import { SessionManager, type BrowserRuntimeClient } from "./browser-policy";
 import type { BrowserFrame, BrowserState } from "../shared/browser";
+import { type BrowserRuntimeClient, SessionManager } from "./browser-policy";
 import type { JsonValue } from "./runtime-protocol";
 
 async function fixture() {

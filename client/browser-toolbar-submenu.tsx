@@ -1,6 +1,6 @@
 /** Desktop flyouts remain descendants of the root menu and share its one backdrop. */
 import type { PluginHostProps } from "@getpaseo/plugin/client";
-import { useLayoutEffect, useRef, useState, type ReactNode, type RefObject } from "react";
+import { type ReactNode, type RefObject, useLayoutEffect, useRef, useState } from "react";
 import { ScrollView, View } from "react-native";
 import { browserSubmenuPlacement, type MenuRect } from "./browser-menu-placement";
 import { bindBrowserToolbarMenuWeb } from "./browser-toolbar-menu-web";

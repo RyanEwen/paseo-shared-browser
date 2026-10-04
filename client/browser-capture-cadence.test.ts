@@ -1,5 +1,6 @@
 import { expect, it } from "vitest";
 import { browserCaptureInterval } from "./browser-capture-cadence";
+
 it("keeps idle/hover polling bounded and only accelerates actual ready input", () => {
   expect(browserCaptureInterval("ready", false)).toBe(250);
   expect(browserCaptureInterval("ready", true)).toBe(100);

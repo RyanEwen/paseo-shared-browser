@@ -22,7 +22,13 @@ const observation = {
 describe("expired browser viewing recovery", () => {
   it("matches the actual SDK handler-error suffix but not transport, control or arbitrary failures", () => {
     expect(isExpiredBrowserViewerError(expired)).toBe(true);
-    expect(isExpiredBrowserViewerError(Object.assign(new Error("Request failed: Viewer token is invalid or expired"), { code: "handler_error" }))).toBe(true);
+    expect(
+      isExpiredBrowserViewerError(
+        Object.assign(new Error("Request failed: Viewer token is invalid or expired"), {
+          code: "handler_error",
+        }),
+      ),
+    ).toBe(true);
     expect(isExpiredBrowserViewerError(new Error("Viewer token is invalid or expired"))).toBe(true);
     for (const error of [
       new Error("Control lease is invalid or expired"),
@@ -61,13 +67,14 @@ describe("expired browser viewing recovery", () => {
   });
 });
 
-
 it("the actual capture query observer discards old token errors when its token key changes", async () => {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } });
   const replacement = Promise.withResolvers<string>();
   const observer = new QueryObserver(client, {
     queryKey: ["shared-browser", "capture", "old-viewer"],
-    queryFn: async (): Promise<string> => { throw expired; },
+    queryFn: async (): Promise<string> => {
+      throw expired;
+    },
   });
   const unsubscribe = observer.subscribe(() => {});
   try {
