@@ -1,3 +1,7 @@
+import { captureDensitySchema } from "./capture-density";
+
+export { type CaptureDensity, canUseCaptureDensity, captureDensitySchema } from "./capture-density";
+
 import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
 import {
@@ -114,7 +118,7 @@ export const captureBrowserRpc = defineRpc({
   name: "shared-browser.capture",
   input: z.object({
     viewerToken: opaqueTokenSchema,
-    quality: z.enum(["low", "medium", "high"]).default(DEFAULT_CAPTURE_QUALITY),
+    quality: z.enum(["low", "medium", "high", "maximum"]).default(DEFAULT_CAPTURE_QUALITY),
     knownFrameId: opaqueTokenSchema.nullable().default(null),
   }),
   output: z.object({
@@ -178,6 +182,18 @@ export const resizeBrowserRpc = defineRpc({
     controlToken: opaqueTokenSchema,
     expected: expectedStateSchema,
     viewport: viewportSchema,
+  }),
+  output: z.object({ state: browserStateSchema }),
+});
+
+/** Independent, controller-authorized density selection; no page navigation or preset substitution. */
+export const setCaptureDensityRpc = defineRpc({
+  name: "shared-browser.capture.density",
+  input: z.object({
+    viewerToken: opaqueTokenSchema,
+    controlToken: opaqueTokenSchema,
+    expected: expectedStateSchema,
+    density: captureDensitySchema,
   }),
   output: z.object({ state: browserStateSchema }),
 });
@@ -311,6 +327,9 @@ const touchPointSchema = displayedPointSchema.extend({
   id: z.number().int().min(0).max(2_147_483_647),
 });
 /** Native keyboard modifiers use CDP's bits: Alt 1, Control 2, Meta 4, Shift 8. */
+/** Bound simultaneous physical-key cleanup work without restricting layout codes. */
+export const MAX_HELD_BROWSER_KEYS = 32;
+
 export const browserGestureKeySchema = z
   .object({
     kind: z.literal("key"),
@@ -340,26 +359,36 @@ export type BrowserGestureKeyEvent = z.output<typeof browserGestureKeySchema>;
  * the complete active ID set; removing contacts in move releases those contacts.
  * End/cancel contain no points. Wheel deltas are bounded browser CSS pixels.
  */
+// Pointer snapshots use the same CDP modifier bits as key events. Omission
+// preserves native/older callers' held-key inference; explicit zero means none.
+const pointerModifiersSchema = z.number().int().min(0).max(15).optional();
 export const browserGestureEventSchema = z.discriminatedUnion("kind", [
   browserGestureKeySchema,
   z.object({ kind: z.literal("text"), text: z.string().min(1).max(16_000) }),
   z.object({ kind: z.literal("leave") }),
-  z.object({ kind: z.literal("move"), point: displayedPointSchema }),
+  z.object({
+    kind: z.literal("move"),
+    point: displayedPointSchema,
+    modifiers: pointerModifiersSchema,
+  }),
   z.object({
     kind: z.literal("down"),
     point: displayedPointSchema,
+    modifiers: pointerModifiersSchema,
     button: z.enum(["left", "right", "middle"]).default("left"),
     clickCount: z.union([z.literal(1), z.literal(2)]).default(1),
   }),
   z.object({
     kind: z.literal("up"),
     point: displayedPointSchema,
+    modifiers: pointerModifiersSchema,
     button: z.enum(["left", "right", "middle"]).default("left"),
     clickCount: z.union([z.literal(1), z.literal(2)]).default(1),
   }),
   z.object({
     kind: z.literal("scroll"),
     point: displayedPointSchema,
+    modifiers: pointerModifiersSchema,
     deltaX: z.number().finite().min(-4_000).max(4_000),
     deltaY: z.number().finite().min(-4_000).max(4_000),
   }),
@@ -392,7 +421,11 @@ const gestureContinuationSchema = gestureContextSchema.extend({
   gestureId: opaqueTokenSchema,
   sequence: z.number().int().positive().max(100_000),
 });
-/** Begin pins a decoded recent frame but sends no physical input. One live channel per controller. Keyboard events may share either pointer channel. */
+/**
+ * Admit one human channel from decoded geometry without publishing physical input.
+ * The server can reuse an acknowledged admission for the same controller, native
+ * document and geometry after normal idle closure. Keyboard shares the channel.
+ */
 export const beginBrowserGestureRpc = defineRpc({
   name: "shared-browser.gesture.begin",
   input: gestureContextSchema.extend({
@@ -410,9 +443,10 @@ export const beginBrowserGestureRpc = defineRpc({
   ]),
 });
 /**
- * Strict sequence continues the original frame context despite this channel's
- * input invalidations. Independent mouse down/initial touch start require target;
- * additional contacts in a held touch gesture continue its pinned geometry.
+ * Strict sequence continues the admitted human geometry independently of video
+ * refresh. Each update checks the exact controller and native document/attachment.
+ * The optional target is retained for compatibility, not required for a new press.
+ * Discrete agent input retains its separate strict frame-targeting contract.
  */
 export const updateBrowserGestureRpc = defineRpc({
   name: "shared-browser.gesture.update",

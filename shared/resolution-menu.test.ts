@@ -71,6 +71,8 @@ describe("resolution choices and host preferences", () => {
     expect(browserDisplayPreferencesSchema.parse({})).toEqual({
       favoritePresetIds: [],
       captureQuality: "high",
+      videoBitrate: 12_000_000,
+      videoFps: 30,
     });
     expect(
       browserDisplayPreferencesSchema.parse({ favoritePresetIds: ["retired"] }).favoritePresetIds,
