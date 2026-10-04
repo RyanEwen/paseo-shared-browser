@@ -301,23 +301,83 @@ try {
       "PASS newer ownership observations fence delayed acquire even after release to none",
     );
 
-    f.deferAcquire = false;
     const take = Array.from(document.querySelectorAll("button")).find((node) =>
       node.textContent.includes("Take control"),
     );
     await React.act(async () => take.click());
+    await flush(20);
+    f.state = { ...f.state, controller: "self", controllerLabel: "This viewer" };
+    await React.act(async () =>
+      f.reads
+        .at(-1)
+        .resolve({ status: "ready", state: { ...f.state }, streamId: null, packets: [] }),
+    );
+    await flush(60);
+    assert(document.body.textContent.includes("Control token unavailable"));
+    await React.act(async () =>
+      f.acquireReplies[2]({ state: { ...f.state }, controlToken: "c".repeat(32) }),
+    );
     await flush(30);
     assert(
       document.body.textContent.includes("You have control"),
-      "current acquisition still settles",
+      "own acquisition observed before its RPC reply still publishes the control token",
     );
-    console.log("PASS current acquisition still publishes its control receipt");
+    assert.equal(
+      f.calls.filter((call) => call.name === "shared-browser.control.acquire").length,
+      3,
+      "observed acquisition not replayed",
+    );
+    console.log("PASS own acquisition observation preserves its delayed control receipt");
+
+    // Explicit takeover has the same media-before-token ordering, but starts
+    // from a competing controller rather than an unowned session.
+    f.state = { ...f.state, controller: "other", controllerLabel: "Another controller" };
+    await React.act(async () =>
+      f.reads
+        .at(-1)
+        .resolve({ status: "ready", state: { ...f.state }, streamId: null, packets: [] }),
+    );
+    await flush(60);
+    const takeover = Array.from(document.querySelectorAll("button")).find((node) =>
+      node.textContent.includes("Take over"),
+    );
+    assert(takeover);
+    await React.act(async () => takeover.click());
+    await flush(20);
+    assert.equal(
+      f.calls.findLast((call) => call.name === "shared-browser.control.acquire").input.takeover,
+      true,
+    );
+    f.state = { ...f.state, controller: "self", controllerLabel: "This viewer" };
+    await React.act(async () =>
+      f.reads
+        .at(-1)
+        .resolve({ status: "ready", state: { ...f.state }, streamId: null, packets: [] }),
+    );
+    await flush(60);
+    assert(document.body.textContent.includes("Control token unavailable"));
+    await React.act(async () =>
+      f.acquireReplies[3]({ state: { ...f.state }, controlToken: "c".repeat(32) }),
+    );
+    await flush(30);
+    assert(document.body.textContent.includes("You have control"));
+    assert.equal(
+      f.calls.filter((call) => call.name === "shared-browser.control.acquire").length,
+      4,
+      "takeover not replayed",
+    );
+    console.log("PASS own takeover observation preserves its delayed control receipt");
 
     f.deferNavigation = true;
     const reload = document.querySelector('button[aria-label="Reload"]');
     await React.act(async () => reload.click());
     await flush(20);
     assert.equal(f.deferredNavigations.length, 1);
+    assert.equal(
+      f.calls.findLast((call) => call.name === "shared-browser.navigate").input.controlToken,
+      "c".repeat(32),
+      "delayed acquisition token authorizes the next explicit navigation",
+    );
     const oldNavigation = f.deferredNavigations[0];
     const menu = document.querySelector('button[aria-label="Browser menu"]');
     await React.act(async () => menu.click());
@@ -342,7 +402,7 @@ try {
       "navigation not replayed",
     );
     console.log("PASS old navigation error cannot settle into reattached viewer");
-    console.log("RESULT 4 full-panel mutation settlement cases passed");
+    console.log("RESULT 5 full-panel mutation settlement cases passed");
   } else {
     await React.act(async () =>
       f.reads[1].resolve({

@@ -272,8 +272,14 @@ export function SharedBrowserPanel({
     (next: BrowserState) => {
       const previous = stateRef.current;
       if (previous && !isBrowserStateCurrent(previous, next)) return false;
+      // Server state projects "self" against this exact viewer token. Media can
+      // observe our acquisition before its RPC returns the control token, so
+      // that transition must not revoke its own still-pending settlement.
+      // Competing ownership and subsequent release still advance the fence.
+      const observesOwnAcquisition = previous?.controller !== "self" && next.controller === "self";
       if (
         previous &&
+        !observesOwnAcquisition &&
         (previous.controller !== next.controller ||
           previous.controllerLabel !== next.controllerLabel)
       ) {
