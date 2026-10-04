@@ -32,6 +32,7 @@ let clock = 10_000;
 beforeEach(() => {
   clock = 10_000;
   vi.spyOn(performance, "now").mockImplementation(() => clock);
+  vi.spyOn(Date, "now").mockImplementation(() => 1_800_000_000_000 + clock);
 });
 afterEach(() => vi.restoreAllMocks());
 
@@ -71,7 +72,11 @@ function fixture() {
   const emit = (timestamp: number, source = page) =>
     control.onScreencastFrame(source, {
       data: jpeg(2),
-      metadata: { deviceWidth: 1280, deviceHeight: 800, timestamp },
+      metadata: {
+        deviceWidth: 1280,
+        deviceHeight: 800,
+        timestamp: (Date.now() + timestamp / 1000) / 1000,
+      },
       sessionId: 17,
     });
   return {

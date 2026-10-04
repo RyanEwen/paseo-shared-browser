@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { browserGestureKeySchema } from "../shared/browser";
+import { videoBitrateSchema, videoFrameRateSchema } from "../shared/video-settings";
 import { AgentBrowserRuntime, type BrowserViewport } from "./agent-browser-runtime";
 import { resolveBrowserRuntimeRoot } from "./runtime-path";
 import type { JsonValue } from "./runtime-protocol";
@@ -22,6 +23,13 @@ interface RuntimeOwnerOptions {
 
 function paseoHome(): string {
   return process.env.PASEO_HOME ?? join(homedir(), ".paseo");
+}
+
+/** Retain omission for legacy/native held-key inference; reject malformed explicit masks. */
+function optionalMouseModifiers(data: Record<string, JsonValue>): [] | [number] {
+  return data.modifiers === undefined
+    ? []
+    : [browserGestureKeySchema.shape.modifiers.parse(data.modifiers)];
 }
 
 export async function createRuntimeOwner(
@@ -100,7 +108,10 @@ export async function createRuntimeOwner(
         case "identity":
           return owned.runtime.identity() as unknown as JsonValue;
         case "state":
-          return owned.runtime.state() as unknown as JsonValue;
+          if (data.timeoutMs === undefined) return owned.runtime.state() as unknown as JsonValue;
+          if (typeof data.timeoutMs !== "number")
+            throw new Error("Invalid browser metadata timeout");
+          return owned.runtime.state({ timeoutMs: data.timeoutMs }) as unknown as JsonValue;
         case "navigate":
           await owned.runtime.navigate(String(data.url));
           return null;
@@ -116,11 +127,35 @@ export async function createRuntimeOwner(
         case "emulate":
           await owned.runtime.emulate(data as unknown as BrowserViewport);
           return null;
+        case "capture.density":
+          await owned.runtime.setCaptureDensity(
+            Number(data.density),
+            Number(data.deviceScaleFactor),
+          );
+          return null;
         case "screencast.start":
           await owned.runtime.startScreencast(Number(data.quality));
           return null;
         case "screencast.stop":
           await owned.runtime.stopScreencast();
+          return null;
+        case "video.read":
+          return (await owned.runtime.readVideo({
+            quality: data.quality === "low" || data.quality === "medium" ? data.quality : "high",
+            streamId: typeof data.streamId === "string" ? data.streamId : null,
+            requestKeyFrame: data.requestKeyFrame === true,
+            ...(data.bitrate === undefined
+              ? {}
+              : { bitrate: videoBitrateSchema.parse(data.bitrate) }),
+            ...(data.fps === undefined ? {} : { fps: videoFrameRateSchema.parse(data.fps) }),
+            afterSequence: Number(data.afterSequence ?? 0),
+            waitMs: Number(data.waitMs ?? 250),
+          })) as unknown as JsonValue;
+        case "video.stop":
+          await owned.runtime.stopVideo();
+          return null;
+        case "video.invalidate":
+          owned.runtime.invalidateQueuedVideoFrames();
           return null;
         case "frame":
           return (await owned.runtime.frame(
@@ -129,7 +164,12 @@ export async function createRuntimeOwner(
             Number(data.waitMs),
           )) as unknown as JsonValue;
         case "mouse.move":
-          await owned.runtime.mouseMove(Number(data.x), Number(data.y), gestureId);
+          await owned.runtime.mouseMove(
+            Number(data.x),
+            Number(data.y),
+            gestureId,
+            ...optionalMouseModifiers(data),
+          );
           return null;
         case "mouse.down":
           await owned.runtime.mouseDown(
@@ -138,6 +178,7 @@ export async function createRuntimeOwner(
             String(data.button) as "left" | "middle" | "right",
             Number(data.clickCount),
             gestureId,
+            ...optionalMouseModifiers(data),
           );
           return null;
         case "mouse.up":
@@ -147,6 +188,7 @@ export async function createRuntimeOwner(
             String(data.button) as "left" | "middle" | "right",
             Number(data.clickCount),
             gestureId,
+            ...optionalMouseModifiers(data),
           );
           return null;
         case "mouse.wheel":
@@ -156,6 +198,7 @@ export async function createRuntimeOwner(
             Number(data.deltaX),
             Number(data.deltaY),
             gestureId,
+            ...optionalMouseModifiers(data),
           );
           return null;
         case "mouse.leave":
@@ -164,7 +207,10 @@ export async function createRuntimeOwner(
           return null;
         case "input.begin":
           if (!gestureId) throw new Error("Gesture identity is required");
-          await owned.runtime.beginLiveInput(gestureId);
+          if (typeof data.expectedInputGeneration !== "string") {
+            throw new Error("Expected native input generation is required");
+          }
+          await owned.runtime.beginLiveInput(gestureId, data.expectedInputGeneration);
           return null;
         case "input.check":
           if (!gestureId) throw new Error("Gesture identity is required");

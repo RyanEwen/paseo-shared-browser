@@ -4,7 +4,7 @@
  * authority checks and transport cleanup; this module never grants a lease.
  */
 import type { BrowserGestureEvent, Viewport } from "../shared/browser";
-import { mapDisplayedPoint } from "../shared/browser";
+import { MAX_HELD_BROWSER_KEYS, mapDisplayedPoint } from "../shared/browser";
 
 export const GESTURE_IDLE_MS = 5_000;
 export const GESTURE_LIFETIME_MS = 5 * 60_000;
@@ -69,6 +69,13 @@ export class BrowserGesture {
       }
       if (event.type === "up" && !this.keys.has(event.code)) {
         throw new Error("Key release has no matching press");
+      }
+      if (
+        event.type === "down" &&
+        !this.keys.has(event.code) &&
+        this.keys.size >= MAX_HELD_BROWSER_KEYS
+      ) {
+        throw new Error("Too many simultaneously held browser keys");
       }
       return;
     }

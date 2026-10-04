@@ -6,7 +6,7 @@ import {
 } from "../client/browser-input-queue";
 import { type BrowserRuntimeClient, SessionManager } from "./browser-policy";
 
-it("recovers a captured-before-wheel frame that decodes after invalidation without repeating the first wheel", async () => {
+it("reopens admitted human geometry despite a late pre-wheel decoded frame without waiting or repeating input", async () => {
   // No native process or profile: actual queue + policy, with delayed decoder and deterministic clock.
   let token = 0;
   let now = 1_000;
@@ -124,7 +124,7 @@ it("recovers a captured-before-wheel frame that decodes after invalidation witho
       deltaY: 40,
     });
     await flush();
-    assert.equal(waited, 1);
+    assert.equal(waited, 0);
     assert.equal(errors.length, 0);
     assert.equal(calls.filter((call) => call === "mouse.wheel").length, 2);
     assert.equal(calls.filter((call) => call === "input.begin").length, 2);

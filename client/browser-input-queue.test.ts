@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { BrowserGestureEvent, BrowserState } from "../shared/browser";
 import {
   type BrowserGestureAuthority,
+  type BrowserGestureControl,
   type BrowserGestureTransport,
   createBrowserInputQueue,
 } from "./browser-input-queue";
@@ -43,8 +44,12 @@ function deferred<T>() {
 async function flush() {
   for (let i = 0; i < 12; i++) await Promise.resolve();
 }
-function fixture(waitForFrame?: (afterFrameId: string, maxWaitMs?: number) => Promise<void>) {
+function fixture(
+  waitForFrame?: (afterFrameId: string, maxWaitMs?: number) => Promise<void>,
+  separateControl = false,
+) {
   let current: BrowserGestureAuthority | null = authority;
+  let control: BrowserGestureControl | null = authority;
   const sent: Parameters<BrowserGestureTransport["update"]>[0][] = [];
   const ended: Parameters<BrowserGestureTransport["end"]>[0][] = [];
   const errors: unknown[] = [];
@@ -73,6 +78,7 @@ function fixture(waitForFrame?: (afterFrameId: string, maxWaitMs?: number) => Pr
   const queue = createBrowserInputQueue({
     transport,
     authority: () => current,
+    ...(separateControl ? { controlAuthority: () => control } : {}),
     onState: (next) => {
       states.push(next);
       projectState?.(next);
@@ -98,6 +104,9 @@ function fixture(waitForFrame?: (afterFrameId: string, maxWaitMs?: number) => Pr
     finishes: () => finished,
     projectState(callback: (state: BrowserState) => void) {
       projectState = callback;
+    },
+    changeControl(next: BrowserGestureControl | null) {
+      control = next;
     },
     changeAuthority(next: BrowserGestureAuthority | null) {
       current = next;
@@ -336,7 +345,7 @@ describe("bounded browser input queue", () => {
       "up",
     ]);
     expect(f.sent.map((input) => input.sequence)).toEqual([1, 2, 3, 4, 5]);
-    expect(f.sent[2]?.target).toEqual(authority.target);
+    expect(f.sent[2]?.target).toBeUndefined();
     expect(f.sent[0]?.target).toBeUndefined();
     expect(f.sent[3]?.event).toMatchObject({ deltaX: 5, deltaY: 12 });
     expect(f.ended[0]).toMatchObject({ sequence: 6, cancel: false });
@@ -375,7 +384,7 @@ describe("bounded browser input queue", () => {
       ["move", [1]],
       ["end", []],
     ]);
-    expect(f.sent[0]?.target).toEqual(authority.target);
+    expect(f.sent[0]?.target).toBeUndefined();
     expect(f.sent[1]?.target).toBeUndefined();
     expect(f.errors).toEqual([]);
   });
@@ -469,48 +478,38 @@ describe("bounded browser input queue", () => {
     });
     await flush();
     expect(began).toEqual(["mouse", "touch"]);
-    expect(f.ended[0]).toMatchObject({ gestureId: "channel-1", cancel: true });
+    expect(f.ended[0]).toMatchObject({ gestureId: "channel-1", cancel: false });
     expect(f.sent[1]).toMatchObject({
       gestureId: "channel-2",
       event: { type: "start" },
-      target: authority.target,
     });
     expect(f.errors).toEqual([]);
   });
 
-  it("waits for actual decoded pixels between independent presses, never for a held second finger", async () => {
-    const frame = deferred<void>();
+  it("continues independent presses and wheel without new pixels on admitted control", async () => {
     const waited: string[] = [];
     const f = fixture(async (id) => {
       waited.push(id);
-      await frame.promise;
-    });
+    }, true);
     f.beginGate.resolve({ state, gestureId: "owned", nextSequence: 1 });
     f.queue.enqueue({ kind: "scroll", point: point(1), deltaX: 0, deltaY: 20 });
     await flush();
-    f.queue.enqueue({
-      kind: "down",
-      point: point(1),
-      button: "left",
-      clickCount: 1,
-    });
-    f.queue.enqueue({
-      kind: "up",
-      point: point(1),
-      button: "left",
-      clickCount: 1,
-    });
-    await flush();
-    expect(f.sent.map((input) => input.event.kind)).toEqual(["scroll"]);
-    expect(waited).toEqual(["decoded-front"]);
-    f.changeAuthority({
-      ...authority,
-      target: { ...authority.target, frameId: "new-front" },
-    });
-    frame.resolve();
-    await flush();
-    expect(f.sent[1]?.target?.frameId).toBe("new-front");
-    expect(f.sent.map((input) => input.event.kind)).toEqual(["scroll", "down", "up"]);
+    f.changeAuthority(null);
+    for (let i = 0; i < 5; i++) {
+      expect(
+        f.queue.enqueue({ kind: "down", point: point(i), button: "left", clickCount: 1 }),
+      ).toBe(true);
+      expect(f.queue.enqueue({ kind: "up", point: point(i), button: "left", clickCount: 1 })).toBe(
+        true,
+      );
+      await flush();
+    }
+    expect(f.sent.map((input) => input.event.kind)).toEqual([
+      "scroll",
+      ...Array(5).fill(["down", "up"]).flat(),
+    ]);
+    expect(f.sent.every((input) => input.target === undefined)).toBe(true);
+    expect(waited).toEqual([]);
     expect(f.errors).toEqual([]);
   });
 
@@ -648,10 +647,8 @@ describe("bounded browser input queue", () => {
     }
   });
 
-  it("does not begin under replacement control after the initial invalidated-frame wait", async () => {
-    const f = fixture(async () => {
-      f.changeAuthority({ ...authority, controlToken: "replacement" });
-    });
+  it("does not reopen admitted geometry under replacement control", async () => {
+    const f = fixture(undefined, true);
     let begins = 0;
     f.transport.begin = async () => {
       begins += 1;
@@ -661,7 +658,9 @@ describe("bounded browser input queue", () => {
     await flush();
     f.queue.finish();
     await flush();
-    f.queue.enqueue(move(1));
+    f.changeAuthority(null);
+    f.changeControl({ ...authority, controlToken: "replacement" });
+    expect(f.queue.enqueue(move(1))).toBe(false);
     await flush();
     expect(begins).toBe(1);
     expect(f.sent).toHaveLength(1);
@@ -720,4 +719,212 @@ it("keeps keyboard repeat/Unicode edges ordered and a held modifier alive across
   expect(f.sent.map((input) => input.sequence)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
   expect(f.ended).toHaveLength(1);
   expect(f.errors).toEqual([]);
+});
+
+it("never merges normal scrolling with a differently modified wheel gesture", async () => {
+  const f = fixture();
+  f.queue.enqueue({ kind: "scroll", point: point(1), deltaX: 0, deltaY: 10, modifiers: 0 });
+  f.queue.enqueue({ kind: "scroll", point: point(1), deltaX: 0, deltaY: 20, modifiers: 2 });
+  f.queue.enqueue({ kind: "scroll", point: point(1), deltaX: 0, deltaY: 30, modifiers: 2 });
+  f.beginGate.resolve({ state, gestureId: "owned", nextSequence: 1 });
+  await flush();
+  expect(f.sent.map((input) => input.event)).toEqual([
+    { kind: "scroll", point: point(1), deltaX: 0, deltaY: 10, modifiers: 0 },
+    { kind: "scroll", point: point(1), deltaX: 0, deltaY: 50, modifiers: 2 },
+  ]);
+  f.queue.cancel();
+  await flush();
+});
+
+it("keeps admitted held drag/release/end when video input receipts are revoked", async () => {
+  const f = fixture(undefined, true);
+  f.queue.enqueue({ kind: "down", button: "left", point: point(1), clickCount: 1 });
+  f.beginGate.resolve({ state, gestureId: "opaque", nextSequence: 1 });
+  await flush();
+  f.changeAuthority(null);
+  expect(f.queue.enqueue(move(50))).toBe(true);
+  expect(f.queue.enqueue({ kind: "up", button: "left", point: point(50), clickCount: 1 })).toBe(
+    true,
+  );
+  f.queue.finish();
+  await flush();
+  expect(f.sent.map((value) => value.event.kind)).toEqual(["down", "move", "up"]);
+  expect(f.sent.slice(1).every((value) => value.target === undefined)).toBe(true);
+  expect(f.ended).toEqual([expect.objectContaining({ gestureId: "opaque", cancel: false })]);
+  expect(f.errors).toEqual([]);
+  expect(f.queue.enqueue({ kind: "down", button: "left", point: point(50), clickCount: 1 })).toBe(
+    true,
+  );
+  await flush();
+  expect(f.sent.at(-1)?.event.kind).toBe("down");
+  f.queue.cancel();
+});
+
+it("keeps admitted keyup and a new physical press without fresh pixels", async () => {
+  const f = fixture(undefined, true);
+  f.queue.enqueue({
+    kind: "key",
+    type: "down",
+    key: "Control",
+    code: "ControlLeft",
+    modifiers: 2,
+    repeat: false,
+  });
+  f.beginGate.resolve({ state, gestureId: "opaque", nextSequence: 1 });
+  await flush();
+  f.changeAuthority(null);
+  expect(
+    f.queue.enqueue({
+      kind: "key",
+      type: "up",
+      key: "Control",
+      code: "ControlLeft",
+      modifiers: 0,
+      repeat: false,
+    }),
+  ).toBe(true);
+  await flush();
+  f.queue.enqueue({ kind: "down", button: "left", point: point(2), clickCount: 1 });
+  await flush();
+  expect(f.sent.map((value) => value.event.kind)).toEqual(["key", "key", "down"]);
+  expect(f.errors).toEqual([]);
+  expect(f.sent.every((value) => value.target === undefined)).toBe(true);
+  f.queue.cancel();
+});
+
+it("control incarnation replacement still cancels an admitted continuation before publication", async () => {
+  const f = fixture(undefined, true);
+  f.queue.enqueue({ kind: "down", button: "left", point: point(1), clickCount: 1 });
+  f.beginGate.resolve({ state, gestureId: "opaque", nextSequence: 1 });
+  await flush();
+  const gate = deferred<Awaited<ReturnType<BrowserGestureTransport["update"]>>>();
+  f.transport.update = async (input) => {
+    f.sent.push(input);
+    return await gate.promise;
+  };
+  f.queue.enqueue(move(2));
+  f.queue.enqueue(move(3));
+  f.changeAuthority(null);
+  f.changeControl({ ...authority, expected: { ...authority.expected, runtimeId: "replacement" } });
+  gate.resolve({ state, gestureId: "opaque", nextSequence: 3, cursor: null });
+  await flush();
+  expect(f.sent.map((value) => value.event.kind)).toEqual(["down", "move"]);
+  expect(f.ended.at(-1)?.cancel).toBe(true);
+});
+
+it("reopens only ACKed same-context geometry after idle closure with no new frame", async () => {
+  const f = fixture(undefined, true);
+  const beginnings: BrowserGestureAuthority[] = [];
+  f.transport.begin = async (input) => {
+    beginnings.push(input);
+    return { state, gestureId: `opaque-${beginnings.length}`, nextSequence: 1 };
+  };
+  f.queue.enqueue({ kind: "down", button: "left", point: point(1), clickCount: 1 });
+  f.queue.enqueue({ kind: "up", button: "left", point: point(1), clickCount: 1 });
+  await flush();
+  f.changeAuthority(null);
+  f.queue.finish();
+  await flush();
+  expect(f.queue.enqueue({ kind: "down", button: "left", point: point(2), clickCount: 1 })).toBe(
+    true,
+  );
+  await flush();
+  expect(beginnings).toHaveLength(2);
+  expect(beginnings[1]?.target).toEqual(authority.target);
+  expect(f.sent.at(-1)?.gestureId).toBe("opaque-2");
+  expect(f.errors).toEqual([]);
+  f.queue.cancel();
+  await flush();
+  expect(f.queue.enqueue(move(3))).toBe(false);
+});
+
+it("does not create geometry admission from an unknown begin or visual-only frame", async () => {
+  const f = fixture(undefined, true);
+  f.changeAuthority(null);
+  expect(f.queue.enqueue(move(1))).toBe(false);
+  f.changeAuthority(authority);
+  f.transport.begin = async () => {
+    throw new Error("Unknown publication");
+  };
+  f.queue.enqueue(move(1));
+  await flush();
+  expect(f.errors).toHaveLength(1);
+  f.changeAuthority(null);
+  expect(f.queue.enqueue(move(2))).toBe(false);
+  expect(f.sent).toEqual([]);
+});
+
+it("does not retain admitted geometry after an uncertain update", async () => {
+  const f = fixture(undefined, true);
+  f.transport.begin = async () => ({ state, gestureId: "opaque", nextSequence: 1 });
+  f.transport.update = async () => {
+    throw new Error("Lost published update reply");
+  };
+  f.queue.enqueue({ kind: "down", button: "left", point: point(1), clickCount: 1 });
+  await flush();
+  f.changeAuthority(null);
+  expect(f.queue.enqueue(move(2))).toBe(false);
+  expect(f.errors).toHaveLength(1);
+  expect(f.ended).toEqual([expect.objectContaining({ cancel: true })]);
+});
+
+it.each(["viewer", "controller", "session", "runtime", "bridge", "document", "viewport"])(
+  "discards idle geometry across %s replacement without a decoded replacement basis",
+  async (field) => {
+    const f = fixture(undefined, true);
+    let begins = 0;
+    f.transport.begin = async () => ({ state, gestureId: `opaque-${++begins}`, nextSequence: 1 });
+    f.queue.enqueue({ kind: "scroll", point: point(1), deltaX: 0, deltaY: 10 });
+    await flush();
+    f.queue.finish();
+    await flush();
+    f.changeAuthority(null);
+    const replacement = structuredClone(authority);
+    if (field === "viewer") replacement.viewerToken = "new-viewer";
+    if (field === "controller") replacement.controlToken = "new-control";
+    if (field === "session") replacement.expected.sessionId = "new-session";
+    if (field === "runtime") replacement.expected.runtimeId = "new-runtime";
+    if (field === "bridge") replacement.expected.bridgeEpoch = 2;
+    if (field === "document") replacement.expected.navigationGeneration = 2;
+    if (field === "viewport") replacement.expected.viewportGeneration = 2;
+    f.changeControl(replacement);
+    expect(f.queue.enqueue({ kind: "down", button: "left", point: point(2), clickCount: 1 })).toBe(
+      false,
+    );
+    expect(begins).toBe(1);
+    expect(f.sent).toHaveLength(1);
+  },
+);
+
+it("reuses acknowledged empty geometry for separate touch contacts and committed text", async () => {
+  const f = fixture(undefined, true);
+  const touch = (type: "start" | "move" | "end", ids: number[]): BrowserGestureEvent => ({
+    kind: "touch",
+    type,
+    points: ids.map((id) => ({ ...point(id + 1), id })),
+  });
+  f.queue.enqueue(touch("start", [0]));
+  f.beginGate.resolve({ state, gestureId: "opaque", nextSequence: 1 });
+  await flush();
+  f.changeAuthority(null);
+  f.queue.enqueue(touch("start", [0, 1]));
+  f.queue.enqueue(touch("move", [1]));
+  f.queue.enqueue(touch("end", []));
+  f.queue.enqueue(touch("start", [2]));
+  f.queue.enqueue(touch("end", []));
+  f.queue.enqueue({ kind: "text", text: "Unicode π" });
+  await flush();
+  expect(f.sent.map((input) => input.event.kind)).toEqual([
+    "touch",
+    "touch",
+    "touch",
+    "touch",
+    "touch",
+    "touch",
+    "text",
+  ]);
+  expect(f.sent.map((input) => input.sequence)).toEqual([1, 2, 3, 4, 5, 6, 7]);
+  expect(f.sent.every((input) => !input.target)).toBe(true);
+  expect(f.errors).toEqual([]);
+  f.queue.cancel();
 });

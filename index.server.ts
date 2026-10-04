@@ -14,9 +14,11 @@ import {
   handleEndBrowserGesture,
   handleListOpenBrowserWorkspaces,
   handleNavigateBrowser,
+  handleReadBrowserVideo,
   handleReleaseControl,
   handleResizeBrowser,
   handleSendBrowserInput,
+  handleSetCaptureDensity,
   handleUpdateBrowserGesture,
   handleWorkspaceArchived,
   issueAgentTicket,
@@ -36,10 +38,11 @@ import {
   releaseControlRpc,
   resizeBrowserRpc,
   sendBrowserInputRpc,
+  setCaptureDensityRpc,
   updateBrowserGestureRpc,
 } from "./shared/browser";
-
 import { browserDisplayPreferences } from "./shared/browser-display-preferences";
+import { readBrowserVideoRpc } from "./shared/browser-video";
 
 const TICKET_ENV = "PASEO_SHARED_BROWSER_TICKET";
 const MCP_SERVER_ID = "shared-browser";
@@ -79,6 +82,8 @@ export default function contribute(server: PluginServerContext) {
   server.handle(attachBrowserRpc, handleAttachBrowser);
   server.handle(detachBrowserRpc, handleDetachBrowser);
   server.handle(captureBrowserRpc, handleCaptureBrowser);
+  server.handle(setCaptureDensityRpc, handleSetCaptureDensity);
+  server.handle(readBrowserVideoRpc, handleReadBrowserVideo);
   server.handle(listOpenBrowserWorkspacesRpc, handleListOpenBrowserWorkspaces);
   server.handle(acquireControlRpc, handleAcquireControl);
   server.handle(releaseControlRpc, handleReleaseControl);

@@ -23,6 +23,8 @@ const browserMocks = vi.hoisted(() => ({
   handleApplyDevicePreset: vi.fn(),
   handleAttachBrowser: vi.fn(),
   handleCaptureBrowser: vi.fn(),
+  handleSetCaptureDensity: vi.fn(),
+  handleReadBrowserVideo: vi.fn(),
   handleDetachBrowser: vi.fn(),
   handleListOpenBrowserWorkspaces: vi.fn(),
   handleNavigateBrowser: vi.fn(),

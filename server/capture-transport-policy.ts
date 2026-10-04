@@ -97,14 +97,15 @@ export function createCaptureTransportPolicy() {
 
   /** Reuse only identical quality/budget requests; larger budgets deserve a new quality decision. */
   function readScreenshot(now: number, quality: number, maxBytes: number): RuntimeFrame | null {
+    const cached = screenshot;
     if (
-      !screenshot ||
-      now - screenshot.receivedAt > CAPTURE_MAX_AGE_MS ||
-      screenshot.quality !== quality ||
-      screenshot.maxBytes !== maxBytes
+      !cached ||
+      now - cached.receivedAt > CAPTURE_MAX_AGE_MS ||
+      cached.quality !== quality ||
+      cached.maxBytes !== maxBytes
     )
       return null;
-    return screenshot.frame;
+    return cached.frame;
   }
 
   /**

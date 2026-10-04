@@ -2,6 +2,8 @@ import { execFile } from "node:child_process";
 import { chmod, mkdir, readFile, rm } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
 import { promisify } from "node:util";
+import { canUseCaptureDensity, captureDensitySchema } from "../shared/capture-density";
+
 import { captureDimensions, DEFAULT_JPEG_QUALITY } from "../shared/capture-settings";
 import { MAX_VIEWPORT } from "../shared/viewport-limits";
 import {
@@ -23,11 +25,28 @@ import {
   type BrowserGestureKeyEvent,
   browserCursorSchema,
   browserGestureKeySchema,
+  MAX_HELD_BROWSER_KEYS,
 } from "../shared/browser";
+import { resolveVideoEncoderSettings } from "../shared/video-settings";
 import { GESTURE_IDLE_MS, GESTURE_LIFETIME_MS } from "./browser-gesture";
 import { CAPTURE_MAX_AGE_MS, createCaptureTransportPolicy } from "./capture-transport-policy";
 import { formatRuntimeInputGeneration } from "./input-generation";
+import { createJpegCaptureDemand } from "./jpeg-capture-demand";
 import { heldKeyModifiers, nativeKeyEvent } from "./keyboard-input";
+import {
+  NativeVideoCapture,
+  type NativeVideoQuality,
+  type NativeVideoRead,
+} from "./native-video-capture";
+import { NATIVE_VIDEO_EXTENSION_ID, prepareNativeVideoExtension } from "./native-video-extension";
+import {
+  NAVIGATION_ACK_TIMEOUT_MS,
+  NAVIGATION_COMMIT_TIMEOUT_MS,
+  NAVIGATION_METADATA_TIMEOUT_MS,
+} from "./navigation-budget";
+import { waitForNavigationCommit } from "./navigation-commit";
+import { createScreencastSourceTime } from "./screencast-source-time";
+import { createVideoSourceRecovery } from "./video-source-recovery";
 
 const execFileAsync = promisify(execFile);
 export const AGENT_BROWSER_VERSION = "0.37.1";
@@ -35,6 +54,9 @@ const PRIVATE_DIRECTORY_MODE = 0o700;
 const PRIVATE_FILE_MODE = 0o600;
 const DEFAULT_TIMEOUT_MS = 15_000;
 const SCREENCAST_SETUP_RETRY_MS = 25;
+// Cursor decoration must not hold the serialized input/video fence while page
+// scripts are busy. A missed sample leaves input and its cleanup unchanged.
+const CURSOR_SAMPLE_TIMEOUT_MS = 250;
 
 export class AgentBrowserUnavailableError extends Error {
   override readonly name = "AgentBrowserUnavailableError";
@@ -129,10 +151,6 @@ interface VersionResult {
 interface NavigationHistory {
   currentIndex: number;
   entries: Array<{ id: number; url: string; title: string }>;
-}
-interface PageLifecycleEvent {
-  name: string;
-  loaderId: string;
 }
 
 interface ScreencastFrame {
@@ -245,12 +263,18 @@ export class AgentBrowserRuntime {
   private emulationAppliedPage: CdpSession | null = null;
   private attachmentGeneration = 0;
   private readonly capturePolicy = createCaptureTransportPolicy();
-  private streamEventSequence = 0;
+  private readonly screencastSourceTime = createScreencastSourceTime();
   private screencastFrame: RuntimeFrame | null = null;
   private screencastFrameReceivedAt: number | null = null;
   private screencastWaiters = new Set<(frame: RuntimeFrame | null) => void>();
   private screencastActive = false;
   private screencastQuality: number = DEFAULT_JPEG_QUALITY;
+  private screencastStartFailed = false;
+  private readonly jpegDemand = createJpegCaptureDemand({
+    now: () => performance.now(),
+    retire: () => this.stopScreencastSession(),
+    onError: () => console.warn("Shared Browser could not retire unused JPEG capture"),
+  });
   private heldButtons = new Set<MouseButton>();
   private heldKeys = new Map<string, { key: string; code: string }>();
   private heldTouches = false;
@@ -266,6 +290,10 @@ export class AgentBrowserRuntime {
     timer: ReturnType<typeof setTimeout> | null;
   } | null = null;
   private stopping = false;
+  private video: NativeVideoCapture | null = null;
+  private readonly videoRecovery = createVideoSourceRecovery();
+  private videoTransitionDepth = 0;
+  private videoTransitionEpoch = 0;
 
   constructor(options: AgentBrowserRuntimeOptions) {
     this.binaryPath = requireAbsolute(options.binaryPath, "agent-browser binary path");
@@ -283,17 +311,27 @@ export class AgentBrowserRuntime {
   }
 
   async launch(): Promise<void> {
+    this.assertRuntimeOpen();
     if (this.connection?.isOpen) return;
     this.invalidateScreencastFrame();
-    this.stopping = false;
     await mkdir(this.profilePath, { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
     await mkdir(this.ipcDirectory, { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
     await Promise.all([
       chmod(this.profilePath, PRIVATE_DIRECTORY_MODE),
       chmod(this.ipcDirectory, PRIVATE_DIRECTORY_MODE),
     ]);
+    this.assertRuntimeOpen();
     await this.assertVersion();
-    const chromiumArguments = process.env.PASEO_SHARED_BROWSER_CHROMIUM_ARGS;
+    this.assertRuntimeOpen();
+    const videoExtension = await prepareNativeVideoExtension(this.ipcDirectory);
+    this.assertRuntimeOpen();
+    const existingArguments = process.env.PASEO_SHARED_BROWSER_CHROMIUM_ARGS;
+    const chromiumArguments = [
+      existingArguments,
+      `--allowlisted-extension-id=${NATIVE_VIDEO_EXTENSION_ID}`,
+    ]
+      .filter(Boolean)
+      .join(",");
     const opened = await this.invoke([
       "--session",
       this.session,
@@ -301,6 +339,8 @@ export class AgentBrowserRuntime {
       this.profilePath,
       "--executable-path",
       this.executablePath,
+      "--extension",
+      videoExtension,
       "--hide-scrollbars",
       "false",
       ...(this.headed ? ["--headed"] : []),
@@ -309,20 +349,26 @@ export class AgentBrowserRuntime {
       "open",
       this.initialUrl,
     ]);
+    this.assertRuntimeOpen();
     const targetId = findString(opened, ["targetId", "target_id"]);
     await this.protectIpcMetadata();
+    this.assertRuntimeOpen();
     await this.connectCdp(targetId);
   }
 
   async reconnect(): Promise<void> {
-    const targetId = this.targetId;
-    this.attachmentGeneration += 1;
-    this.invalidateScreencastFrame();
-    this.connection?.close();
-    this.connection = null;
-    this.page = null;
-    await this.assertVersion();
-    await this.connectCdp(targetId);
+    this.assertRuntimeOpen();
+    await this.withVideoTransition(async () => {
+      const targetId = this.targetId;
+      this.attachmentGeneration += 1;
+      this.invalidateScreencastFrame();
+      this.connection?.close();
+      this.connection = null;
+      this.page = null;
+      await this.assertVersion();
+      this.assertRuntimeOpen();
+      await this.connectCdp(targetId);
+    });
   }
 
   async health(): Promise<RuntimeHealth> {
@@ -366,57 +412,71 @@ export class AgentBrowserRuntime {
   }
 
   async targets(): Promise<RuntimeTarget[]> {
-    return listPageTargets(this.requireConnection());
+    return (await listPageTargets(this.requireConnection())).filter(
+      (target) => !target.url.startsWith(`chrome-extension://${NATIVE_VIDEO_EXTENSION_ID}/`),
+    );
   }
 
   async selectTarget(targetId: string): Promise<void> {
-    const attachmentGeneration = ++this.attachmentGeneration;
-    const connection = this.requireConnection();
-    const target = (await this.targets()).find((candidate) => candidate.targetId === targetId);
-    this.assertAttachmentCurrent(connection, attachmentGeneration);
-    if (!target) throw new CdpUnavailableError(`Unknown page target: ${targetId}`);
-    this.invalidateScreencastFrame();
-    const previous = this.page;
-    if (previous) {
-      if (this.screencastActive) {
-        await previous.send("Page.stopScreencast", {}, { mutation: true });
+    await this.withVideoTransition(async () => {
+      const attachmentGeneration = ++this.attachmentGeneration;
+      const connection = this.requireConnection();
+      const target = (await this.targets()).find((candidate) => candidate.targetId === targetId);
+      this.assertAttachmentCurrent(connection, attachmentGeneration);
+      if (!target) throw new CdpUnavailableError(`Unknown page target: ${targetId}`);
+      this.invalidateScreencastFrame();
+      const previous = this.page;
+      if (previous) {
+        if (this.screencastActive) {
+          await previous.send("Page.stopScreencast", {}, { mutation: true });
+          this.assertAttachmentCurrent(connection, attachmentGeneration);
+        }
+        await previous.detach();
         this.assertAttachmentCurrent(connection, attachmentGeneration);
       }
-      await previous.detach();
-      this.assertAttachmentCurrent(connection, attachmentGeneration);
-    }
-    this.invalidateScreencastFrame();
-    await connection.send("Target.activateTarget", { targetId }, { mutation: true });
-    this.assertAttachmentCurrent(connection, attachmentGeneration);
-    // CDP emulation is session-owned: detaching the former session restores native
-    // window metrics. Publish a replacement only after its retained settings succeed.
-    this.page = null;
-    this.emulationAppliedPage = null;
-    const replacement = await attachToTarget(connection, targetId);
-    try {
-      this.assertAttachmentCurrent(connection, attachmentGeneration);
-      await this.bindPageEvents(replacement);
-      this.assertAttachmentCurrent(connection, attachmentGeneration);
-      await this.restoreConfiguredEmulation(replacement);
-      this.assertAttachmentCurrent(connection, attachmentGeneration);
-      this.page = replacement;
-      this.targetId = targetId;
-    } catch (error) {
-      await replacement.detach().catch(() => undefined);
-      // Detaching a partial emulation can clear target metrics even if a newer
-      // attachment won. Its next access must restore intent before admitting pixels.
-      this.emulationAppliedPage = null;
       this.invalidateScreencastFrame();
-      throw error;
-    }
-    if (this.screencastActive) await this.startScreencastSession(replacement);
+      await connection.send("Target.activateTarget", { targetId }, { mutation: true });
+      this.assertAttachmentCurrent(connection, attachmentGeneration);
+      // CDP emulation is session-owned: detaching the former session restores native
+      // window metrics. Publish a replacement only after its retained settings succeed.
+      this.page = null;
+      this.emulationAppliedPage = null;
+      const replacement = await attachToTarget(connection, targetId);
+      try {
+        this.assertAttachmentCurrent(connection, attachmentGeneration);
+        await this.bindPageEvents(replacement);
+        this.assertAttachmentCurrent(connection, attachmentGeneration);
+        await this.restoreConfiguredEmulation(replacement);
+        this.assertAttachmentCurrent(connection, attachmentGeneration);
+        this.page = replacement;
+        this.targetId = targetId;
+      } catch (error) {
+        await replacement.detach().catch(() => undefined);
+        // Detaching a partial emulation can clear target metrics even if a newer
+        // attachment won. Its next access must restore intent before admitting pixels.
+        this.emulationAppliedPage = null;
+        this.invalidateScreencastFrame();
+        throw error;
+      }
+      if (this.screencastActive) await this.startScreencastSession(replacement);
+    });
   }
 
-  private async navigationHistory(page: CdpSession): Promise<NavigationHistory> {
-    const deadline = Date.now() + this.timeoutMs;
+  private async navigationHistory(
+    page: CdpSession,
+    timeoutMs = this.timeoutMs,
+  ): Promise<NavigationHistory> {
+    const deadline = Date.now() + timeoutMs;
     for (;;) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0)
+        throw new CdpUnavailableError("Browser navigation history observation timed out");
       try {
-        return await page.send<NavigationHistory>("Page.getNavigationHistory");
+        return await page.send<NavigationHistory>(
+          "Page.getNavigationHistory",
+          {},
+          { timeoutMs: remaining },
+        );
       } catch (error) {
         if (!String(error).includes("Not attached to an active page") || Date.now() >= deadline) {
           throw error;
@@ -427,21 +487,36 @@ export class AgentBrowserRuntime {
       }
     }
   }
-  /** Read fresh metadata concurrently; never combine observations across native document changes. */
-  async state(): Promise<RuntimePageState> {
+  /** Read fresh metadata concurrently; never combine observations across document changes.
+   * Internal navigation callers can shorten the per-read budget in milliseconds.
+   * Unavailable metadata rejects; it never becomes a fabricated ready receipt. */
+  async state(options: { timeoutMs?: number } = {}): Promise<RuntimePageState> {
+    if (
+      options.timeoutMs !== undefined &&
+      (!Number.isInteger(options.timeoutMs) ||
+        options.timeoutMs < 1 ||
+        options.timeoutMs > DEFAULT_TIMEOUT_MS)
+    ) {
+      throw new RangeError("Browser metadata timeout must be an integer from 1 to 15000ms");
+    }
+    const timeoutMs = Math.min(options.timeoutMs ?? this.timeoutMs, this.timeoutMs);
     const page = await this.requirePage();
     const attachmentGeneration = this.attachmentGeneration;
     const documentGeneration = this.documentGeneration;
     // Native history and fixed DOM metadata are independent reads. Overlap their
     // CDP round trips without caching metadata or weakening input attachment checks.
     const [history, evaluated] = await Promise.all([
-      this.navigationHistory(page),
+      this.navigationHistory(page, timeoutMs),
       page.send<{
         result: { value?: { url?: string; title?: string } };
-      }>("Runtime.evaluate", {
-        expression: "({url: location.href, title: document.title})",
-        returnByValue: true,
-      }),
+      }>(
+        "Runtime.evaluate",
+        {
+          expression: "({url: location.href, title: document.title})",
+          returnByValue: true,
+        },
+        { timeoutMs },
+      ),
     ]);
     if (
       page !== this.page ||
@@ -462,85 +537,172 @@ export class AgentBrowserRuntime {
     };
   }
 
+  /** Await native ACK and its main-frame commit, without waiting for scripts or
+   * DOMContentLoaded. A missing commit remains uncertain and is never replayed. */
   async navigate(url: string): Promise<void> {
-    await this.withInvalidatedScreencast(async (page) => {
-      await page.send("Page.setLifecycleEventsEnabled", { enabled: true });
-      const observedLoaders = new Set<string>();
-      const loaded = Promise.withResolvers<void>();
-      let expectedLoaderId: string | undefined;
-      const onLifecycle = (event: PageLifecycleEvent) => {
-        if (event.name !== "DOMContentLoaded") return;
-        if (expectedLoaderId === undefined) {
-          observedLoaders.add(event.loaderId);
-          return;
-        }
-        if (event.loaderId === expectedLoaderId) loaded.resolve();
-      };
-      page.on("Page.lifecycleEvent", onLifecycle);
-      let timer: NodeJS.Timeout | undefined;
-      try {
-        const result = await page.send<{ errorText?: string; loaderId?: string }>(
-          "Page.navigate",
-          { url },
-          { mutation: true, timeoutMs: 30_000 },
+    await this.withInvalidatedScreencast(
+      async (page) => {
+        const assertCurrent = this.navigationAttachmentGuard(page);
+        await waitForNavigationCommit(
+          page,
+          async () => {
+            const result = await page.send<{
+              frameId: string;
+              errorText?: string;
+              loaderId?: string;
+              isDownload?: boolean;
+            }>(
+              "Page.navigate",
+              { url },
+              { mutation: true, timeoutMs: Math.min(this.timeoutMs, NAVIGATION_ACK_TIMEOUT_MS) },
+            );
+            // Chromium can abort document navigation because the accepted
+            // response is a download. This does not replace the current page.
+            if (result.errorText && !result.isDownload) {
+              throw new Error(`Navigation failed: ${result.errorText}`);
+            }
+            return {
+              frameId: result.frameId,
+              ...(result.loaderId ? { loaderId: result.loaderId } : {}),
+              url,
+              ...(result.isDownload ? { download: true } : {}),
+            };
+          },
+          assertCurrent,
+          Math.min(this.timeoutMs, NAVIGATION_COMMIT_TIMEOUT_MS),
         );
-        if (result.errorText) throw new Error(`Navigation failed: ${result.errorText}`);
-        if (!result.loaderId) return;
-        expectedLoaderId = result.loaderId;
-        if (observedLoaders.has(expectedLoaderId)) return;
-        timer = setTimeout(
-          () =>
-            loaded.reject(
-              new CdpUnknownOutcomeError(
-                "Page.navigate did not reach DOMContentLoaded; mutation outcome is unknown",
-              ),
-            ),
-          30_000,
-        );
-        timer.unref();
-        await loaded.promise;
-      } finally {
-        clearTimeout(timer);
-        page.off("Page.lifecycleEvent", onLifecycle);
-      }
-    });
+      },
+      { preserveStream: true },
+    );
   }
 
   async back(): Promise<void> {
-    await this.withInvalidatedScreencast(async (page) => {
-      const history = await this.navigationHistory(page);
-      const entry = history.entries[history.currentIndex - 1];
-      if (!entry) throw new Error("Browser cannot go back");
-      await page.send("Page.navigateToHistoryEntry", { entryId: entry.id }, { mutation: true });
-    });
+    await this.navigateHistory(-1);
   }
 
   async forward(): Promise<void> {
-    await this.withInvalidatedScreencast(async (page) => {
-      const history = await this.navigationHistory(page);
-      const entry = history.entries[history.currentIndex + 1];
-      if (!entry) throw new Error("Browser cannot go forward");
-      await page.send("Page.navigateToHistoryEntry", { entryId: entry.id }, { mutation: true });
-    });
+    await this.navigateHistory(1);
+  }
+
+  /** History's ACK has no loader receipt. Capture its root loader and target URL
+   * in one parallel bounded preflight, then admit only the matching new commit. */
+  private async navigateHistory(direction: -1 | 1): Promise<void> {
+    await this.withInvalidatedScreencast(
+      async (page) => {
+        const assertCurrent = this.navigationAttachmentGuard(page);
+        const [history, root] = await Promise.all([
+          this.navigationHistory(page, Math.min(this.timeoutMs, NAVIGATION_METADATA_TIMEOUT_MS)),
+          this.navigationRoot(page),
+        ]);
+        assertCurrent();
+        const entry = history.entries[history.currentIndex + direction];
+        if (!entry)
+          throw new Error(
+            direction === -1 ? "Browser cannot go back" : "Browser cannot go forward",
+          );
+        await waitForNavigationCommit(
+          page,
+          async () => {
+            await page.send(
+              "Page.navigateToHistoryEntry",
+              { entryId: entry.id },
+              {
+                mutation: true,
+                timeoutMs: Math.min(this.timeoutMs, NAVIGATION_ACK_TIMEOUT_MS),
+              },
+            );
+            return { frameId: root.id, previousLoaderId: root.loaderId, url: entry.url };
+          },
+          assertCurrent,
+          Math.min(this.timeoutMs, NAVIGATION_COMMIT_TIMEOUT_MS),
+        );
+      },
+      { preserveStream: true },
+    );
   }
 
   async reload(ignoreCache = false): Promise<void> {
-    await this.withInvalidatedScreencast((page) =>
-      page.send("Page.reload", { ignoreCache }, { mutation: true }),
+    await this.withInvalidatedScreencast(
+      async (page) => {
+        const assertCurrent = this.navigationAttachmentGuard(page);
+        const root = await this.navigationRoot(page);
+        assertCurrent();
+        await waitForNavigationCommit(
+          page,
+          async () => {
+            await page.send(
+              "Page.reload",
+              { ignoreCache },
+              {
+                mutation: true,
+                timeoutMs: Math.min(this.timeoutMs, NAVIGATION_ACK_TIMEOUT_MS),
+              },
+            );
+            return { frameId: root.id, previousLoaderId: root.loaderId };
+          },
+          assertCurrent,
+          Math.min(this.timeoutMs, NAVIGATION_COMMIT_TIMEOUT_MS),
+        );
+      },
+      { preserveStream: true },
     );
+  }
+
+  /** A root snapshot is observation only, bounded before mutation publication. */
+  private async navigationRoot(page: CdpSession): Promise<{ id: string; loaderId: string }> {
+    const result = await page.send<{ frameTree: { frame: { id: string; loaderId: string } } }>(
+      "Page.getFrameTree",
+      {},
+      { timeoutMs: Math.min(this.timeoutMs, NAVIGATION_METADATA_TIMEOUT_MS) },
+    );
+    const root = result.frameTree.frame;
+    if (!root.id || !root.loaderId)
+      throw new CdpUnavailableError("Browser main frame is unavailable");
+    return root;
+  }
+
+  /** Keep commit observation on the original attachment, including shutdown. */
+  private navigationAttachmentGuard(page: CdpSession): () => void {
+    const attachmentGeneration = this.attachmentGeneration;
+    return () => {
+      this.assertAttachmentCurrent(page.connection, attachmentGeneration);
+      if (this.page !== page)
+        throw new CdpUnavailableError("Browser page changed during navigation");
+    };
   }
 
   async emulate(device: DeviceEmulation): Promise<void> {
     this.assertViewport(device);
-    await this.withInvalidatedScreencast(async (page) => {
-      const attachmentGeneration = this.attachmentGeneration;
-      this.emulationAppliedPage = null;
-      await this.applyEmulation(page, device);
-      this.assertAttachmentCurrent(page.connection, attachmentGeneration);
-      if (this.page !== page)
-        throw new CdpUnavailableError("Browser page changed during emulation");
-      this.viewport = { ...device };
-      this.emulationAppliedPage = page;
+    await this.withVideoTransition(async () => {
+      await this.withInvalidatedScreencast(async (page) => {
+        const attachmentGeneration = this.attachmentGeneration;
+        this.emulationAppliedPage = null;
+        await this.applyEmulation(page, device);
+        this.assertAttachmentCurrent(page.connection, attachmentGeneration);
+        if (this.page !== page)
+          throw new CdpUnavailableError("Browser page changed during emulation");
+        this.viewport = { ...device };
+        this.emulationAppliedPage = page;
+      });
+    });
+  }
+
+  /** Retain the full mode/UA/screen intent while rendering enough real source pixels for the chosen density. */
+  async setCaptureDensity(density: number, baseDeviceScaleFactor: number): Promise<void> {
+    const scale = captureDensitySchema.parse(density);
+    const viewport = this.requireViewport();
+    if (!canUseCaptureDensity(viewport, scale))
+      throw new RangeError("Capture density exceeds the supported image bounds");
+    if (
+      !Number.isFinite(baseDeviceScaleFactor) ||
+      baseDeviceScaleFactor < 1 ||
+      baseDeviceScaleFactor > 4
+    )
+      throw new RangeError("Invalid device pixel ratio");
+    await this.emulate({
+      ...viewport,
+      captureScale: scale,
+      deviceScaleFactor: Math.max(baseDeviceScaleFactor, scale),
     });
   }
 
@@ -580,20 +742,23 @@ export class AgentBrowserRuntime {
   private async restoreConfiguredEmulation(page: CdpSession): Promise<void> {
     const device = this.viewport;
     if (!device || this.emulationAppliedPage === page) return;
-    const attachmentGeneration = this.attachmentGeneration;
-    this.invalidateScreencastFrame();
-    this.emulationAppliedPage = null;
-    await this.applyEmulation(page, device);
-    this.assertAttachmentCurrent(page.connection, attachmentGeneration);
-    if (device !== this.viewport) {
-      throw new CdpUnavailableError("Browser device settings changed during restoration");
-    }
-    this.emulationAppliedPage = page;
-    this.invalidateScreencastFrame();
+    await this.withVideoTransition(async () => {
+      const attachmentGeneration = this.attachmentGeneration;
+      this.invalidateScreencastFrame();
+      this.emulationAppliedPage = null;
+      await this.applyEmulation(page, device);
+      this.assertAttachmentCurrent(page.connection, attachmentGeneration);
+      if (device !== this.viewport) {
+        throw new CdpUnavailableError("Browser device settings changed during restoration");
+      }
+      this.emulationAppliedPage = page;
+      this.invalidateScreencastFrame();
+    });
   }
 
   /** Reject late configuration completions after a disconnect or newer target selection. */
   private assertAttachmentCurrent(connection: CdpConnection, generation: number): void {
+    this.assertRuntimeOpen();
     if (
       connection !== this.connection ||
       !connection.isOpen ||
@@ -603,20 +768,197 @@ export class AgentBrowserRuntime {
     }
   }
 
+  /** Starts only exact restored native tab capture, lazily adding this viewer's quality encoder. */
+  async startVideo(quality: NativeVideoQuality = "high"): Promise<NativeVideoRead> {
+    return this.readVideo({ quality, waitMs: 0 });
+  }
+
+  /** Long-poll outside the input queue. The caller must fence returned inputGeneration before publication. */
+  async readVideo(input: {
+    quality: NativeVideoQuality;
+    bitrate?: number;
+    fps?: number;
+    streamId?: string | null;
+    afterSequence?: number;
+    waitMs?: number;
+    requestKeyFrame?: boolean;
+  }): Promise<NativeVideoRead & { inputGeneration: string }> {
+    const settings = resolveVideoEncoderSettings(input);
+    const transitionEpoch = this.videoTransitionEpoch;
+    if (!this.videoMayStart(transitionEpoch)) return this.videoReset();
+
+    // Retirement uses the same stop barrier as viewport changes. The next read
+    // resumes from current configuration instead of treating idle expiry as a
+    // permanent codec failure or creating a replacement while the old track closes.
+    if (this.video?.idleExpired) {
+      await this.stopVideo();
+      return this.videoReset();
+    }
+
+    const page = await this.requirePage();
+    // requirePage can itself restore or reconnect. Retry on the next read rather
+    // than creating a helper from a configuration that changed across its await.
+    if (!this.videoMayStart(transitionEpoch)) return this.videoReset();
+    const connection = this.requireConnection();
+    const generation = this.attachmentGeneration;
+    const viewport = this.requireViewport();
+    const recoveryContext = { connection, page, viewport, attachmentGeneration: generation };
+    const blocked = this.videoRecovery.blocked(recoveryContext);
+    if (blocked === "source-dimensions") {
+      return {
+        ...this.videoReset(),
+        status: "unsupported",
+        reason: "Native video dimensions do not match the configured viewport",
+      };
+    }
+    if (blocked) {
+      return this.videoReset();
+    }
+    if (!this.video) {
+      const pixels = captureDimensions(viewport, viewport.captureScale ?? 1);
+      this.video = new NativeVideoCapture({
+        connection,
+        targetId: page.targetId,
+        width: pixels.width,
+        height: pixels.height,
+        isCurrent: () =>
+          this.videoMayStart(transitionEpoch) &&
+          connection === this.connection &&
+          page === this.page &&
+          viewport === this.viewport &&
+          generation === this.attachmentGeneration &&
+          this.emulationAppliedPage === page,
+      });
+    }
+    const video = this.video;
+    const documentGeneration = this.documentGeneration;
+    const result = await video.read({ ...input, ...settings });
+    if (
+      !this.videoMayStart(transitionEpoch) ||
+      video.idleExpired ||
+      video !== this.video ||
+      connection !== this.connection ||
+      page !== this.page ||
+      viewport !== this.viewport ||
+      generation !== this.attachmentGeneration ||
+      documentGeneration !== this.documentGeneration
+    ) {
+      return this.videoReset();
+    }
+    if (video.sourceFailure) {
+      // Store failure admission before opening the existing stop barrier. A
+      // concurrent read sees either that barrier or the cooldown, never a second
+      // track while the failed source/helper is still being retired.
+      this.videoRecovery.failed(recoveryContext, video.sourceFailure);
+      const permanent = video.sourceFailure === "source-dimensions";
+      await this.stopVideo();
+      if (
+        this.stopping ||
+        connection !== this.connection ||
+        page !== this.page ||
+        viewport !== this.viewport ||
+        generation !== this.attachmentGeneration
+      ) {
+        return this.videoReset();
+      }
+      if (permanent) {
+        return {
+          ...this.videoReset(),
+          status: "unsupported",
+          reason: "Native video dimensions do not match the configured viewport",
+        };
+      }
+      return this.videoReset();
+    }
+    return {
+      ...result,
+      inputGeneration: formatRuntimeInputGeneration(
+        this.attachmentGeneration,
+        this.documentGeneration,
+      ),
+    };
+  }
+
+  /** Explicit action barrier; pointer samples preserve the native track and encoder continuity. */
+  invalidateQueuedVideoFrames(): void {
+    this.video?.invalidateQueuedFrames();
+  }
+
+  /** Stop admission too: a concurrent reader cannot replace a source still closing. */
+  async stopVideo(): Promise<void> {
+    await this.withVideoTransition(async () => {});
+  }
+
+  /** Nested device/attachment phases keep one continuous barrier until all phases finish. */
+  private async withVideoTransition<T>(transition: () => Promise<T>): Promise<T> {
+    const releaseJpeg = this.stopping ? () => {} : this.jpegDemand.pin(false);
+    this.videoTransitionDepth += 1;
+    this.videoTransitionEpoch += 1;
+    const video = this.video;
+    this.video = null;
+    try {
+      if (video) await video.stop();
+      return await transition();
+    } finally {
+      this.videoTransitionDepth -= 1;
+      releaseJpeg();
+    }
+  }
+
+  private videoMayStart(epoch: number): boolean {
+    return !this.stopping && this.videoTransitionDepth === 0 && epoch === this.videoTransitionEpoch;
+  }
+
+  private videoReset(): NativeVideoRead & { inputGeneration: string } {
+    return {
+      status: "reset",
+      streamId: null,
+      packets: [],
+      inputGeneration: formatRuntimeInputGeneration(
+        this.attachmentGeneration,
+        this.documentGeneration,
+      ),
+    };
+  }
+
+  /** Explicit viewing start remains supported, but does not keep unused JPEG work alive. */
   async startScreencast(quality: number = DEFAULT_JPEG_QUALITY): Promise<void> {
     if (!Number.isInteger(quality) || quality < 1 || quality > 100) {
       throw new RangeError("Screencast quality must be an integer from 1 to 100");
     }
-    this.screencastActive = true;
-    this.screencastQuality = quality;
-    const page = await this.requirePage();
-    await this.startScreencastSession(page);
+    const release = this.jpegDemand.pin();
+    try {
+      await this.jpegDemand.serialize(async () => {
+        const page = await this.requirePage();
+        if (this.screencastActive && this.screencastQuality === quality) return;
+        this.screencastQuality = quality;
+        this.screencastStartFailed = false;
+        this.screencastActive = true;
+        try {
+          await this.startScreencastSession(page);
+        } catch (error) {
+          this.screencastActive = false;
+          this.screencastStartFailed = true;
+          throw error;
+        }
+      });
+    } finally {
+      release();
+    }
   }
 
+  /** Explicit detach cleanup and idle retirement use the same native transition FIFO. */
   async stopScreencast(): Promise<void> {
+    this.jpegDemand.cancel();
+    await this.jpegDemand.serialize(() => this.stopScreencastSession());
+  }
+
+  private async stopScreencastSession(): Promise<void> {
+    const wasActive = this.screencastActive;
     this.screencastActive = false;
+    this.screencastStartFailed = false;
     this.invalidateScreencastFrame();
-    if (!this.page) return;
+    if (!wasActive || !this.page) return;
     try {
       await this.page.send("Page.stopScreencast", {}, { mutation: true });
     } finally {
@@ -634,42 +976,80 @@ export class AgentBrowserRuntime {
       throw new RangeError("maxBytes must be positive");
     }
     if (!Number.isFinite(quality)) throw new RangeError("JPEG quality must be finite");
-    await this.requirePage();
     const requestedQuality = Math.max(1, Math.min(100, Math.round(quality)));
-    if (requestedQuality !== this.screencastQuality) {
-      // Viewers choose their own quality; never restart the shared stream or
-      // classify its health from another viewer's screenshot preference.
+    // All reads protect in-flight pixels, but screenshot-only qualities do not
+    // renew the shared JPEG stream when a viewer changes their preference.
+    const release = this.jpegDemand.pin(requestedQuality === this.screencastQuality);
+    try {
+      await this.jpegDemand.serialize(async () => {
+        const page = await this.requirePage();
+        // Nonmatching quality keeps the existing screenshot-only path. A video
+        // viewer choosing JPEG100 must not start an unused JPEG95 stream.
+        if (
+          requestedQuality !== this.screencastQuality ||
+          this.screencastActive ||
+          this.screencastStartFailed
+        ) {
+          return;
+        }
+        this.screencastActive = true;
+        try {
+          await this.startScreencastSession(page);
+        } catch {
+          // Shutdown is terminal, not an optional stream failure to fall back from.
+          this.assertRuntimeOpen();
+          // Stream support is optional. Preserve fresh screenshots, and avoid
+          // retrying a failed setup at every 250ms poll in the same demand period.
+          console.warn("Shared Browser JPEG screencast is unavailable; using screenshot fallback");
+          this.screencastActive = false;
+          this.screencastStartFailed = true;
+        }
+      });
+      this.assertRuntimeOpen();
+      if (requestedQuality !== this.screencastQuality) {
+        // Viewers choose their own quality; never restart the shared stream or
+        // classify its health from another viewer's screenshot preference.
+        const cached = this.capturePolicy.readScreenshot(
+          performance.now(),
+          requestedQuality,
+          maxBytes,
+        );
+        return cached ?? (await this.captureScreenshot(maxBytes, requestedQuality, true));
+      }
+      // Expiry discards pixels without resetting fallback dwell/recovery evidence.
+      // Mutations and connection changes use the stronger invalidation below.
+      const generation = this.capturePolicy.currentGeneration();
+      const receivedAt = this.screencastFrameReceivedAt;
+      if (receivedAt === null || performance.now() - receivedAt > CAPTURE_MAX_AGE_MS) {
+        this.screencastFrame = null;
+        this.screencastFrameReceivedAt = null;
+      }
+      if (this.screencastActive && this.capturePolicy.canUseStream(performance.now())) {
+        const streamed = this.screencastFrame ?? (await this.waitForFrame(waitMs));
+        this.assertRuntimeOpen();
+        if (!this.capturePolicy.isCurrent(generation)) {
+          throw new CdpUnavailableError(
+            "Browser capture was invalidated while waiting for a frame",
+          );
+        }
+        if (streamed && streamed.byteLength <= maxBytes) {
+          return streamed;
+        }
+      }
+
+      this.capturePolicy.enterFallback(performance.now());
       const cached = this.capturePolicy.readScreenshot(
         performance.now(),
         requestedQuality,
         maxBytes,
       );
-      return cached ?? (await this.captureScreenshot(maxBytes, requestedQuality, true));
-    }
-    // Expiry discards pixels without resetting fallback dwell/recovery evidence.
-    // Mutations and connection changes use the stronger invalidation below.
-    const generation = this.capturePolicy.currentGeneration();
-    const receivedAt = this.screencastFrameReceivedAt;
-    if (receivedAt === null || performance.now() - receivedAt > CAPTURE_MAX_AGE_MS) {
-      this.screencastFrame = null;
-      this.screencastFrameReceivedAt = null;
-    }
-    if (this.capturePolicy.canUseStream(performance.now())) {
-      const streamed = this.screencastFrame ?? (await this.waitForFrame(waitMs));
-      if (!this.capturePolicy.isCurrent(generation)) {
-        throw new CdpUnavailableError("Browser capture was invalidated while waiting for a frame");
+      if (cached) {
+        return cached;
       }
-      if (streamed && streamed.byteLength <= maxBytes) {
-        return streamed;
-      }
+      return await this.captureScreenshot(maxBytes, requestedQuality);
+    } finally {
+      release();
     }
-
-    this.capturePolicy.enterFallback(performance.now());
-    const cached = this.capturePolicy.readScreenshot(performance.now(), requestedQuality, maxBytes);
-    if (cached) {
-      return cached;
-    }
-    return this.captureScreenshot(maxBytes, requestedQuality);
   }
 
   /** Capture the configured viewport and cache only an unchanged-session/mutation completion. */
@@ -779,6 +1159,7 @@ export class AgentBrowserRuntime {
 
   /** Refuse async pixels from a superseded session or mutation, without silently replaying capture. */
   private assertCaptureCurrent(page: CdpSession, generation: number): void {
+    this.assertRuntimeOpen();
     if (page !== this.page || !this.capturePolicy.isCurrent(generation)) {
       throw new CdpUnavailableError("Browser capture was invalidated while taking a screenshot");
     }
@@ -789,14 +1170,19 @@ export class AgentBrowserRuntime {
     method: string,
     params: Record<string, unknown>,
     gestureId?: string,
+    mouseModifiers?: number,
   ): Promise<void> {
     try {
       const page = await this.requirePage();
       if (gestureId) await this.assertLiveInput(gestureId);
       const originalInput = gestureId ? this.liveInput : null;
-      const modifiers = heldKeyModifiers(this.heldKeys.values());
+      // A physical DOM mouse event may arrive after Control/Shift was pressed
+      // outside this canvas. Explicit zero also overrides a prior held-key mask.
+      const modifiers = mouseModifiers ?? heldKeyModifiers(this.heldKeys.values());
       const nativeParams =
-        method === "Input.dispatchMouseEvent" && modifiers ? { ...params, modifiers } : params;
+        method === "Input.dispatchMouseEvent" && (mouseModifiers !== undefined || modifiers !== 0)
+          ? { ...params, modifiers }
+          : params;
       await page.send(method, nativeParams, { mutation: true });
       if (gestureId) {
         // An input can synchronously activate a link or submit a form. Its CDP
@@ -819,8 +1205,9 @@ export class AgentBrowserRuntime {
     }
   }
 
-  async mouseMove(x: number, y: number, gestureId?: string): Promise<void> {
+  async mouseMove(x: number, y: number, gestureId?: string, modifiers?: number): Promise<void> {
     this.assertPoint(x, y);
+    this.assertMouseModifiers(modifiers);
     await this.dispatchInput(
       "Input.dispatchMouseEvent",
       {
@@ -832,6 +1219,7 @@ export class AgentBrowserRuntime {
         buttons: this.buttonMask(),
       },
       gestureId,
+      modifiers,
     );
   }
 
@@ -857,8 +1245,10 @@ export class AgentBrowserRuntime {
     button: MouseButton = "left",
     clickCount = 1,
     gestureId?: string,
+    modifiers?: number,
   ): Promise<void> {
     this.assertPoint(x, y);
+    this.assertMouseModifiers(modifiers);
     // Publication may succeed before an acknowledgement is lost. Track intent
     // first so cleanup still releases a possibly held button.
     if (gestureId) await this.assertLiveInput(gestureId);
@@ -874,6 +1264,7 @@ export class AgentBrowserRuntime {
         clickCount,
       },
       gestureId,
+      modifiers,
     );
   }
 
@@ -883,8 +1274,10 @@ export class AgentBrowserRuntime {
     button: MouseButton = "left",
     clickCount = 1,
     gestureId?: string,
+    modifiers?: number,
   ): Promise<void> {
     this.assertPoint(x, y);
+    this.assertMouseModifiers(modifiers);
     await this.dispatchInput(
       "Input.dispatchMouseEvent",
       {
@@ -896,6 +1289,7 @@ export class AgentBrowserRuntime {
         clickCount,
       },
       gestureId,
+      modifiers,
     );
     this.heldButtons.delete(button);
   }
@@ -906,8 +1300,10 @@ export class AgentBrowserRuntime {
     deltaX: number,
     deltaY: number,
     gestureId?: string,
+    modifiers?: number,
   ): Promise<void> {
     this.assertPoint(x, y);
+    this.assertMouseModifiers(modifiers);
     await this.dispatchInput(
       "Input.dispatchMouseEvent",
       {
@@ -920,6 +1316,7 @@ export class AgentBrowserRuntime {
         buttons: this.buttonMask(),
       },
       gestureId,
+      modifiers,
     );
   }
 
@@ -939,13 +1336,16 @@ export class AgentBrowserRuntime {
       );
     }
     if (parsed.type === "up" && !held) throw new Error("Key release has no matching press");
-    if (parsed.type === "down")
+    if (parsed.type === "down") {
+      this.assertHeldKeyCapacity(parsed.code);
       this.heldKeys.set(parsed.code, { key: parsed.key, code: parsed.code });
+    }
     await this.dispatchInput("Input.dispatchKeyEvent", nativeKeyEvent(parsed), gestureId);
     if (parsed.type === "up") this.heldKeys.delete(parsed.code);
   }
 
   async keyDown(key: string, code = key): Promise<void> {
+    this.assertHeldKeyCapacity(code);
     this.heldKeys.set(code, { key, code });
     await this.dispatchInput("Input.dispatchKeyEvent", {
       type: "keyDown",
@@ -1001,10 +1401,22 @@ export class AgentBrowserRuntime {
     this.heldTouches = this.activeTouches.size > 0;
   }
 
-  /** Pin this channel to one CDP attachment. Reconnects never replay held input on a replacement. */
-  async beginLiveInput(id: string): Promise<void> {
+  /**
+   * Bind decoded geometry to its exact native attachment and document. Compare
+   * after cleanup/reattach awaits so a same-URL reload cannot silently admit a
+   * press against a replacement page. A mismatch publishes no physical input.
+   */
+  async beginLiveInput(id: string, expectedInputGeneration: string): Promise<void> {
     if (this.liveInput) await this.endLiveInput(this.liveInput.id);
     const page = await this.requirePage();
+    const actualInputGeneration = formatRuntimeInputGeneration(
+      this.attachmentGeneration,
+      this.documentGeneration,
+    );
+    if (expectedInputGeneration !== actualInputGeneration) {
+      throw new CdpUnavailableError("Live browser input attachment changed before admission");
+    }
+    // No asynchronous boundary may separate this comparison from the binding.
     const now = Date.now();
     this.liveInput = {
       id,
@@ -1073,10 +1485,14 @@ export class AgentBrowserRuntime {
       this.assertPoint(x, y);
       await this.assertLiveInput(gestureId);
       const page = this.liveInput!.page;
-      const result = await page.send<{ result: { value?: unknown } }>("Runtime.evaluate", {
-        expression: `(() => { const e = document.elementFromPoint(${x}, ${y}); return e ? getComputedStyle(e).cursor : null; })()`,
-        returnByValue: true,
-      });
+      const result = await page.send<{ result: { value?: unknown } }>(
+        "Runtime.evaluate",
+        {
+          expression: `(() => { const e = document.elementFromPoint(${x}, ${y}); return e ? getComputedStyle(e).cursor : null; })()`,
+          returnByValue: true,
+        },
+        { timeoutMs: Math.min(this.timeoutMs, CURSOR_SAMPLE_TIMEOUT_MS) },
+      );
       await this.assertLiveInput(gestureId);
       const parsed = browserCursorSchema.safeParse(result.result.value);
       return parsed.success ? parsed.data : null;
@@ -1141,33 +1557,38 @@ export class AgentBrowserRuntime {
   async shutdown(force = false): Promise<void> {
     if (this.stopping) return;
     this.stopping = true;
-    if (this.liveInput) await this.endLiveInput(this.liveInput.id);
-    await this.releaseHeldInput();
+    this.jpegDemand.close();
+    this.screencastActive = false;
     this.invalidateScreencastFrame();
-    if (!force) {
-      try {
-        await this.invoke(["--session", this.session, "--json", "close"]);
-      } catch {
-        this.stopping = false;
-        await this.shutdown(true);
-        return;
-      }
-    } else {
-      const pid = await this.daemonPid();
-      if (pid !== null) {
+    await this.withVideoTransition(async () => {
+      if (this.liveInput) await this.endLiveInput(this.liveInput.id);
+      await this.releaseHeldInput();
+      this.invalidateScreencastFrame();
+      if (!force) {
         try {
-          process.kill(pid, "SIGKILL");
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+          await this.invoke(["--session", this.session, "--json", "close"]);
+        } catch {
+          this.stopping = false;
+          await this.shutdown(true);
+          return;
         }
+      } else {
+        const pid = await this.daemonPid();
+        if (pid !== null) {
+          try {
+            process.kill(pid, "SIGKILL");
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+          }
+        }
+        await this.removeIpcMetadata();
       }
-      await this.removeIpcMetadata();
-    }
-    this.connection?.close();
-    this.connection = null;
-    this.page = null;
-    this.targetId = null;
-    this.invalidateScreencastFrame();
+      this.connection?.close();
+      this.connection = null;
+      this.page = null;
+      this.targetId = null;
+      this.invalidateScreencastFrame();
+    });
   }
 
   private async assertVersion(): Promise<void> {
@@ -1218,7 +1639,14 @@ export class AgentBrowserRuntime {
   }
 
   private async connectCdp(preferredTargetId: string | null = null): Promise<void> {
+    this.assertRuntimeOpen();
+    // A launch-selected page remains the intended target even if its first
+    // attachment fails. Otherwise a retry could silently adopt another tab.
+    if (this.targetId === null && preferredTargetId !== null) {
+      this.targetId = preferredTargetId;
+    }
     const response = await this.invoke(["--session", this.session, "--json", "get", "cdp-url"]);
+    this.assertRuntimeOpen();
     const url = findString(response, ["cdpUrl", "cdp_url", "url"]);
     if (!url) throw new AgentBrowserIncompatibleError("agent-browser did not return a CDP URL");
     const endpoint = new URL(url);
@@ -1229,39 +1657,60 @@ export class AgentBrowserRuntime {
       commandTimeoutMs: this.timeoutMs,
       connectTimeoutMs: this.timeoutMs,
     });
+    if (this.stopping) {
+      connection.close();
+      this.assertRuntimeOpen();
+    }
     this.connection = connection;
     connection.once("disconnect", () => {
       if (this.connection !== connection) return;
       this.page = null;
-      this.targetId = null;
+      // Keep the selected page identity. A transport loss does not authorize
+      // adopting another tab, even when the original page still exists.
       this.emulationAppliedPage = null;
       this.attachmentGeneration += 1;
       this.invalidateScreencastFrame();
     });
     const targets = await listPageTargets(this.connection);
+    this.assertRuntimeOpen();
+    const expectedTargetId = preferredTargetId ?? this.targetId;
     const target =
-      targets.find((candidate) => candidate.targetId === preferredTargetId) ?? targets[0];
+      expectedTargetId === null
+        ? targets[0]
+        : targets.find((candidate) => candidate.targetId === expectedTargetId);
+    if (expectedTargetId !== null && !target) {
+      throw new CdpUnavailableError("The selected browser page is no longer available");
+    }
     if (!target) throw new CdpUnavailableError("Chromium has no page target");
     await this.selectTarget(target.targetId);
   }
 
   private async requirePage(): Promise<CdpSession> {
+    this.assertRuntimeOpen();
     if (this.page && this.connection?.isOpen) {
       const page = this.page;
       await this.restoreConfiguredEmulation(page);
+      this.assertRuntimeOpen();
       if (this.page !== page || !this.connection?.isOpen) {
         throw new CdpUnavailableError("Browser page changed during emulation restoration");
       }
       return page;
     }
     await this.reconnect();
+    this.assertRuntimeOpen();
     if (!this.page) throw new CdpUnavailableError("No page target is attached");
     return this.page;
   }
 
   private requireConnection(): CdpConnection {
+    this.assertRuntimeOpen();
     if (!this.connection?.isOpen) throw new CdpUnavailableError("Browser runtime is disconnected");
     return this.connection;
+  }
+
+  /** Shutdown cleanup uses captured attachments directly; acquisition cannot revive them. */
+  private assertRuntimeOpen(): void {
+    if (this.stopping) throw new CdpUnavailableError("Browser runtime is shutting down");
   }
 
   private requireViewport(): BrowserViewport {
@@ -1277,11 +1726,15 @@ export class AgentBrowserRuntime {
       if (page !== this.page || event.frame.parentId) return;
       rootFrameId = event.frame.id;
       this.documentGeneration += 1;
+      this.invalidateScreencastFrame();
+      this.video?.invalidateQueuedFrames();
       void this.endLiveInput(this.liveInput?.id ?? "").catch(() => undefined);
     });
     page.on("Page.navigatedWithinDocument", (event: { frameId: string }) => {
       if (page !== this.page || event.frameId !== rootFrameId) return;
       this.documentGeneration += 1;
+      this.invalidateScreencastFrame();
+      this.video?.invalidateQueuedFrames();
       void this.endLiveInput(this.liveInput?.id ?? "").catch(() => undefined);
     });
     page.on("Page.screencastFrame", (event: ScreencastFrame) =>
@@ -1290,6 +1743,7 @@ export class AgentBrowserRuntime {
     page.on("event", (event: CdpEvent) => {
       if (event.method === "Inspector.targetCrashed" && this.page === page) {
         this.documentGeneration += 1;
+        void this.stopVideo();
         void this.endLiveInput(this.liveInput?.id ?? "").catch(() => undefined);
         this.emulationAppliedPage = null;
         this.invalidateScreencastFrame();
@@ -1306,13 +1760,17 @@ export class AgentBrowserRuntime {
     let candidate = page;
     for (;;) {
       try {
+        this.assertRuntimeOpen();
         await Promise.all([candidate.send("Page.enable"), candidate.send("Runtime.enable")]);
+        this.assertRuntimeOpen();
         await this.navigationHistory(candidate);
+        this.assertRuntimeOpen();
         if (this.page !== candidate) {
           candidate = await this.requirePage();
           continue;
         }
         await this.restoreConfiguredEmulation(candidate);
+        this.assertRuntimeOpen();
         if (this.page !== candidate) {
           throw new CdpUnavailableError("Browser page changed before screencast start");
         }
@@ -1321,12 +1779,15 @@ export class AgentBrowserRuntime {
           { format: "jpeg", quality: this.screencastQuality, everyNthFrame: 1 },
           { mutation: true },
         );
+        this.assertRuntimeOpen();
         return;
       } catch (error) {
+        this.assertRuntimeOpen();
         if (Date.now() >= deadline) throw error;
         try {
           candidate = await this.reattachPageForScreencast(candidate);
         } catch (reattachError) {
+          this.assertRuntimeOpen();
           if (Date.now() >= deadline) throw reattachError;
         }
         const { promise, resolve } = Promise.withResolvers<void>();
@@ -1337,79 +1798,95 @@ export class AgentBrowserRuntime {
   }
 
   private async reattachPageForScreencast(previous: CdpSession): Promise<CdpSession> {
+    this.assertRuntimeOpen();
     if (this.page !== previous) {
       if (!this.page) throw new CdpUnavailableError("Browser page changed during reattachment");
       return this.page;
     }
-    const attachmentGeneration = ++this.attachmentGeneration;
-    const connection = this.requireConnection();
-    const targets = await listPageTargets(connection);
-    this.assertAttachmentCurrent(connection, attachmentGeneration);
-    const target = targets.find((candidate) => candidate.targetId === this.targetId) ?? targets[0];
-    if (!target) throw new CdpUnavailableError("Chromium has no page target");
-    await connection.send(
-      "Target.activateTarget",
-      { targetId: target.targetId },
-      { mutation: true },
-    );
-    this.assertAttachmentCurrent(connection, attachmentGeneration);
-    const replacement = await attachToTarget(connection, target.targetId);
-    if (this.page !== previous || attachmentGeneration !== this.attachmentGeneration) {
-      await replacement.detach().catch(() => undefined);
-      // The losing controller's detach may clear target overrides. Repair the
-      // current controller on its next access rather than trust earlier pixels.
-      this.emulationAppliedPage = null;
-      this.invalidateScreencastFrame();
-      if (!this.page) throw new CdpUnavailableError("Browser page changed during reattachment");
-      return this.page;
-    }
-    this.assertAttachmentCurrent(connection, attachmentGeneration);
+    return this.withVideoTransition(async () => {
+      const attachmentGeneration = ++this.attachmentGeneration;
+      const connection = this.requireConnection();
+      const targets = await listPageTargets(connection);
+      this.assertAttachmentCurrent(connection, attachmentGeneration);
+      const target = targets.find((candidate) => candidate.targetId === previous.targetId);
+      if (!target)
+        throw new CdpUnavailableError("The selected browser page is no longer available");
+      await connection.send(
+        "Target.activateTarget",
+        { targetId: target.targetId },
+        { mutation: true },
+      );
+      this.assertAttachmentCurrent(connection, attachmentGeneration);
+      const replacement = await attachToTarget(connection, target.targetId);
+      if (this.page !== previous || attachmentGeneration !== this.attachmentGeneration) {
+        await replacement.detach().catch(() => undefined);
+        // The losing controller's detach may clear target overrides. Repair the
+        // current controller on its next access rather than trust earlier pixels.
+        this.emulationAppliedPage = null;
+        this.invalidateScreencastFrame();
+        if (!this.page) throw new CdpUnavailableError("Browser page changed during reattachment");
+        return this.page;
+      }
+      this.assertAttachmentCurrent(connection, attachmentGeneration);
 
-    this.invalidateScreencastFrame();
-    this.page = null;
-    this.emulationAppliedPage = null;
-    // Detach first: the former session can otherwise clear the newly applied override.
-    try {
-      await previous.detach();
-      this.assertAttachmentCurrent(connection, attachmentGeneration);
-      await this.bindPageEvents(replacement);
-      this.assertAttachmentCurrent(connection, attachmentGeneration);
-      await this.restoreConfiguredEmulation(replacement);
-      this.assertAttachmentCurrent(connection, attachmentGeneration);
-      this.page = replacement;
-      this.targetId = target.targetId;
-      return replacement;
-    } catch (error) {
-      await replacement.detach().catch(() => undefined);
-      // Detaching a partial emulation can clear target metrics even if a newer
-      // attachment won. Its next access must restore intent before admitting pixels.
-      this.emulationAppliedPage = null;
       this.invalidateScreencastFrame();
-      throw error;
-    }
+      this.page = null;
+      this.emulationAppliedPage = null;
+      // Detach first: the former session can otherwise clear the newly applied override.
+      try {
+        await previous.detach();
+        this.assertAttachmentCurrent(connection, attachmentGeneration);
+        await this.bindPageEvents(replacement);
+        this.assertAttachmentCurrent(connection, attachmentGeneration);
+        await this.restoreConfiguredEmulation(replacement);
+        this.assertAttachmentCurrent(connection, attachmentGeneration);
+        this.page = replacement;
+        this.targetId = target.targetId;
+        return replacement;
+      } catch (error) {
+        await replacement.detach().catch(() => undefined);
+        // Detaching a partial emulation can clear target metrics even if a newer
+        // attachment won. Its next access must restore intent before admitting pixels.
+        this.emulationAppliedPage = null;
+        this.invalidateScreencastFrame();
+        throw error;
+      }
+    });
   }
 
   private async withInvalidatedScreencast(
     mutation: (page: CdpSession) => Promise<unknown>,
+    options: { preserveStream?: boolean } = {},
   ): Promise<void> {
-    const page = await this.requirePage();
-    const restart = this.screencastActive;
-    this.invalidateScreencastFrame();
-    if (restart) await page.send("Page.stopScreencast", {}, { mutation: true });
+    const releaseJpeg = this.jpegDemand.pin(false);
     try {
-      await mutation(page);
-    } finally {
+      const page = await this.requirePage();
+      // Ordinary navigation is observed by the same native stream. Optional
+      // capture teardown/setup must not consume the navigation ACK budget.
+      const restart = this.screencastActive && !options.preserveStream;
       this.invalidateScreencastFrame();
-      if (restart && this.page === page) {
-        await this.restoreConfiguredEmulation(page);
-        await this.startScreencastSession(page);
+      if (restart) await page.send("Page.stopScreencast", {}, { mutation: true });
+      this.assertRuntimeOpen();
+      try {
+        await mutation(page);
+        this.invalidateQueuedVideoFrames();
+      } finally {
+        this.invalidateScreencastFrame();
+        if (restart && this.page === page) {
+          this.assertRuntimeOpen();
+          await this.restoreConfiguredEmulation(page);
+          await this.startScreencastSession(page);
+        }
       }
+    } finally {
+      releaseJpeg();
     }
   }
 
-  /** Clear both sources and revoke every in-flight capture after input or transport changes. */
+  /** Clear JPEG stream/screenshot receipts after input or transport changes. */
   private invalidateScreencastFrame(): void {
     this.capturePolicy.invalidate();
+    this.screencastSourceTime.invalidate(Date.now());
     this.screencastFrame = null;
     this.screencastFrameReceivedAt = null;
     this.resolveFrameWaiters(null);
@@ -1420,7 +1897,13 @@ export class AgentBrowserRuntime {
     void page
       .send("Page.screencastFrameAck", { sessionId: event.sessionId })
       .catch(() => undefined);
-    if (page !== this.page || !this.screencastActive || this.emulationAppliedPage !== page) return;
+    if (
+      this.stopping ||
+      page !== this.page ||
+      !this.screencastActive ||
+      this.emulationAppliedPage !== page
+    )
+      return;
     const dimensions = readJpegFrameDimensions(event.data);
     const viewport = this.viewport;
     // Chromium can report the new device dimensions while emitting a clipped transition image.
@@ -1429,6 +1912,9 @@ export class AgentBrowserRuntime {
     const expectedPixels = captureDimensions(viewport, viewport.captureScale);
     if (dimensions.width !== expectedPixels.width || dimensions.height !== expectedPixels.height)
       return;
+    const now = performance.now();
+    const source = this.screencastSourceTime.accept(event.metadata.timestamp, Date.now(), now);
+    if (!source) return;
     const { width, height } = dimensions;
     const frame: RuntimeFrame = {
       dataBase64: event.data,
@@ -1436,17 +1922,11 @@ export class AgentBrowserRuntime {
       width,
       height,
       transport: "cdp-screencast",
-      capturedAt: new Date().toISOString(),
+      capturedAt: source.capturedAt,
     };
-    const now = performance.now();
-    const timestamp = event.metadata.timestamp;
-    const identity =
-      typeof timestamp === "number" && Number.isFinite(timestamp)
-        ? `provider:${timestamp}`
-        : `event:${++this.streamEventSequence}`;
-    this.capturePolicy.observeStream(identity, now);
+    this.capturePolicy.observeStream(`provider:${event.metadata.timestamp}`, now);
     this.screencastFrame = frame;
-    this.screencastFrameReceivedAt = now;
+    this.screencastFrameReceivedAt = source.receivedAt;
     this.resolveFrameWaiters(frame);
   }
 
@@ -1520,6 +2000,23 @@ export class AgentBrowserRuntime {
       }
     }
     return "none";
+  }
+
+  /** Validate before recording held-button intent or sending a native packet. */
+  private assertMouseModifiers(modifiers: number | undefined): void {
+    if (
+      modifiers !== undefined &&
+      (!Number.isInteger(modifiers) || modifiers < 0 || modifiers > 15)
+    ) {
+      throw new RangeError("Mouse modifiers must be an integer from 0 to 15");
+    }
+  }
+
+  /** Both live and discrete keyboard paths must bound release fanout before sending. */
+  private assertHeldKeyCapacity(code: string): void {
+    if (!this.heldKeys.has(code) && this.heldKeys.size >= MAX_HELD_BROWSER_KEYS) {
+      throw new Error("Too many simultaneously held browser keys");
+    }
   }
 
   private buttonMask(add?: MouseButton, remove?: MouseButton): number {

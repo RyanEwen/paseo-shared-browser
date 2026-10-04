@@ -1,4 +1,4 @@
-import type { BrowserFrame } from "../shared/browser";
+import type { BrowserFrameAuthority as BrowserFrame } from "../shared/browser-video";
 
 /**
  * Tracks actionable captures across discrete input settlement. The decoded

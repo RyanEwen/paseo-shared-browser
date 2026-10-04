@@ -12,9 +12,12 @@ import type {
 } from "../shared/browser";
 import {
   beginBrowserGestureRpc,
+  captureBrowserRpc,
   endBrowserGestureRpc,
+  setCaptureDensityRpc,
   updateBrowserGestureRpc,
 } from "../shared/browser";
+import { readBrowserVideoRpc } from "../shared/browser-video";
 import { DEFAULT_CAPTURE_QUALITY } from "../shared/capture-settings";
 import { SessionManager } from "./browser-policy";
 import { CdpUnknownOutcomeError } from "./cdp";
@@ -40,6 +43,13 @@ const MAX_MESSAGE_BYTES = 1024 * 1024;
 const MAX_SUPERVISOR_WORKSPACES = 8;
 const MAX_SOCKET_IN_FLIGHT = 16;
 const MAX_GLOBAL_IN_FLIGHT = 64;
+// Optional pixels must leave bounded headroom for ordered input and cleanup.
+// JPEG fallback shares the media budget instead of filling those same slots.
+const MAX_SOCKET_MEDIA_IN_FLIGHT = 12;
+const MAX_GLOBAL_MEDIA_IN_FLIGHT = 48;
+// The one active bridge needs maintenance capacity even when normal reads fill
+// both limits. Duplicate maintenance remains bounded independently of work.
+const MAX_HEARTBEATS_IN_FLIGHT = 1;
 const AGENT_TICKET_TTL_MS = 10 * 60_000;
 const MAX_UNBOUND_AGENT_TICKETS = 256;
 type SupervisorTimer = NodeJS.Timeout;
@@ -165,6 +175,17 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
     return this.bridgeLease(bridge);
   }
 
+  /** Read-only admission for the reserved lane; dispatch still verifies the lease again. */
+  isCurrentBridgeLease(bridgeId: string, epoch: number): boolean {
+    const bridge = this.activeBridge;
+    return Boolean(
+      bridge &&
+        bridge.bridgeId === bridgeId &&
+        bridge.epoch === epoch &&
+        bridge.expiresAt > this.now(),
+    );
+  }
+
   bridgeDisconnected(bridgeId: string, epoch: number): void {
     if (this.activeBridge?.bridgeId !== bridgeId || this.activeBridge.epoch !== epoch) return;
     this.activeBridge = null;
@@ -241,7 +262,7 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
     operation: string,
     input: JsonValue,
   ): Promise<JsonValue> {
-    return this.runWorkspaceOperation(workspaceId, async () => {
+    const execute = async () => {
       if (this.archived.has(workspaceId)) this.workspaceArchived(workspaceId);
       const entry = this.workspaces.get(workspaceId);
       if (!entry)
@@ -252,6 +273,8 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
       try {
         const result = await this.owner.request(entry.runtime, operation, input);
         if (this.archived.has(workspaceId)) this.workspaceArchived(workspaceId);
+        if (this.workspaces.get(workspaceId) !== entry)
+          throw new RuntimeProtocolError("RUNTIME_FAILURE", "Video runtime was replaced");
         return result;
       } catch (error) {
         if (error instanceof RuntimeProtocolError) throw error;
@@ -265,7 +288,10 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
           `Workspace runtime ${operation} failed: ${error instanceof Error ? error.message : String(error)}`,
         );
       }
-    });
+    };
+    return operation === "video.read"
+      ? execute()
+      : this.runWorkspaceOperation(workspaceId, execute);
   }
 
   private archiveWorkspaceLocal(workspaceId: string): Promise<{ archived: true }> {
@@ -306,14 +332,20 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
       case "status":
         result = await this.browserPolicy.status(requireText(data, "viewerToken"));
         break;
-      case "capture":
+      case "video.read":
+        result = await this.browserPolicy.readVideo(readBrowserVideoRpc.input.parse(data));
+        break;
+      case "capture": {
+        const capture = captureBrowserRpc.input.parse(data);
         result = await this.browserPolicy.capture(
-          requireText(data, "viewerToken"),
-          data.quality === "low" || data.quality === "medium"
-            ? data.quality
-            : DEFAULT_CAPTURE_QUALITY,
-          typeof data.knownFrameId === "string" ? data.knownFrameId : null,
+          capture.viewerToken,
+          capture.quality,
+          capture.knownFrameId,
         );
+        break;
+      }
+      case "capture.density":
+        result = await this.browserPolicy.setCaptureDensity(setCaptureDensityRpc.input.parse(data));
         break;
       case "acquire-control": {
         result = await this.browserPolicy.acquireControl(
@@ -906,13 +938,18 @@ export async function startSupervisorServer<Runtime extends RuntimeInstance>(
   const supervisor = new RuntimeSupervisor({ owner });
   const sockets = new Set<Socket>();
   let globalInFlight = 0;
+  let globalMediaInFlight = 0;
+  let globalHeartbeatsInFlight = 0;
   const token = randomBytes(32).toString("base64url");
   const server = createServer((socket) => {
     sockets.add(socket);
     let buffer = "";
     let claimed: { bridgeId: string; epoch: number } | null = null;
     let socketInFlight = 0;
+    let socketMediaInFlight = 0;
+    let socketHeartbeatsInFlight = 0;
     let processing = Promise.resolve();
+    let busyResponsePending = false;
     socket.setEncoding("utf8");
 
     const rejectBusy = (line: string): boolean => {
@@ -925,6 +962,7 @@ export async function startSupervisorServer<Runtime extends RuntimeInstance>(
         socket.destroy();
         return false;
       }
+      busyResponsePending = true;
       socket.pause();
       socket.write(
         `${JSON.stringify({
@@ -936,19 +974,44 @@ export async function startSupervisorServer<Runtime extends RuntimeInstance>(
           },
         })}\n`,
         (error) => {
+          busyResponsePending = false;
           if (error) socket.destroy();
-          else socket.resume();
+          else drainBufferedLines();
         },
       );
       return false;
     };
 
     const enqueue = (line: string): boolean => {
-      if (socketInFlight >= MAX_SOCKET_IN_FLIGHT || globalInFlight >= MAX_GLOBAL_IN_FLIGHT)
-        return rejectBusy(line);
-      socketInFlight += 1;
-      globalInFlight += 1;
-      processing = processing
+      const concurrent = classifyConcurrentRequest(line, token);
+      const maintenance = concurrent === "heartbeat" && isCurrentHeartbeat(line, supervisor);
+      const media = !maintenance && isMediaRequest(line, token);
+      if (maintenance) {
+        if (
+          socketHeartbeatsInFlight >= MAX_HEARTBEATS_IN_FLIGHT ||
+          globalHeartbeatsInFlight >= MAX_HEARTBEATS_IN_FLIGHT
+        )
+          return rejectBusy(line);
+        socketHeartbeatsInFlight += 1;
+        globalHeartbeatsInFlight += 1;
+      } else {
+        if (socketInFlight >= MAX_SOCKET_IN_FLIGHT || globalInFlight >= MAX_GLOBAL_IN_FLIGHT)
+          return rejectBusy(line);
+        if (
+          media &&
+          (socketMediaInFlight >= MAX_SOCKET_MEDIA_IN_FLIGHT ||
+            globalMediaInFlight >= MAX_GLOBAL_MEDIA_IN_FLIGHT)
+        )
+          return rejectBusy(line);
+        socketInFlight += 1;
+        globalInFlight += 1;
+        if (media) {
+          socketMediaInFlight += 1;
+          globalMediaInFlight += 1;
+        }
+      }
+      const before = concurrent === "heartbeat" ? Promise.resolve() : processing;
+      const execution = before
         .then(async () => {
           const { response, lease } = await handleLine(line, token, supervisor);
           if (lease) claimed = lease;
@@ -962,19 +1025,32 @@ export async function startSupervisorServer<Runtime extends RuntimeInstance>(
         })
         .catch(() => undefined)
         .finally(() => {
-          socketInFlight -= 1;
-          globalInFlight -= 1;
-          socket.resume();
+          if (maintenance) {
+            socketHeartbeatsInFlight -= 1;
+            globalHeartbeatsInFlight -= 1;
+          } else {
+            socketInFlight -= 1;
+            globalInFlight -= 1;
+            if (media) {
+              socketMediaInFlight -= 1;
+              globalMediaInFlight -= 1;
+            }
+          }
+          drainBufferedLines();
         });
+      // Heartbeats must pass slow page operations, otherwise a healthy bridge
+      // expires and its browser is stopped. Video waits also leave the command
+      // tail. Only the authenticated current lease uses the separately bounded
+      // maintenance lane. Auth, epoch checks and whole ID-keyed writes still apply.
+      if (concurrent === null) processing = execution;
       return true;
     };
 
-    socket.on("data", (chunk: string) => {
-      buffer += chunk;
-      if (Buffer.byteLength(buffer) > MAX_MESSAGE_BYTES) {
-        socket.destroy();
-        return;
-      }
+    // Pausing transport does not consume lines already delivered in its current
+    // chunk. Drain those after each bounded busy response, without replaying a
+    // refused line or creating an unbounded queue of busy-response writes.
+    function drainBufferedLines(): void {
+      if (socket.destroyed || busyResponsePending) return;
       let newline = buffer.indexOf("\n");
       while (newline >= 0) {
         const line = buffer.slice(0, newline);
@@ -982,6 +1058,16 @@ export async function startSupervisorServer<Runtime extends RuntimeInstance>(
         if (line.length > 0 && !enqueue(line)) return;
         newline = buffer.indexOf("\n");
       }
+      socket.resume();
+    }
+
+    socket.on("data", (chunk: string) => {
+      buffer += chunk;
+      if (Buffer.byteLength(buffer) > MAX_MESSAGE_BYTES) {
+        socket.destroy();
+        return;
+      }
+      drainBufferedLines();
     });
     socket.once("close", () => {
       sockets.delete(socket);
@@ -1058,6 +1144,48 @@ export async function startSupervisorServer<Runtime extends RuntimeInstance>(
     },
   };
 }
+/** Classification already verified the token; stale leases cannot consume reserved capacity. */
+function isCurrentHeartbeat(line: string, supervisor: RuntimeSupervisor): boolean {
+  const request = parseRuntimeRequest(JSON.parse(line));
+  return (
+    request.method === "bridge.heartbeat" &&
+    supervisor.isCurrentBridgeLease(request.bridgeId, request.epoch)
+  );
+}
+/** Capacity-only classification, never an authorization or command-tail bypass. */
+function isMediaRequest(line: string, token: string): boolean {
+  try {
+    const request = parseRuntimeRequest(JSON.parse(line));
+    if (request.method === "agent.request") return request.operation === "capture";
+    if (!tokensEqual(request.token, token)) return false;
+    if (request.method !== "browser.request" && request.method !== "workspace.request")
+      return false;
+    return (
+      request.operation === "video.read" ||
+      request.operation === (request.method === "browser.request" ? "capture" : "frame")
+    );
+  } catch {
+    return false;
+  }
+}
+/** Classify authenticated maintenance/media calls without weakening command ordering. */
+function classifyConcurrentRequest(line: string, token: string): "heartbeat" | "video" | null {
+  try {
+    const request = parseRuntimeRequest(JSON.parse(line));
+    if (request.method === "agent.request" || !tokensEqual(request.token, token)) return null;
+    if (request.method === "bridge.heartbeat") return "heartbeat";
+    if (request.method !== "browser.request" && request.method !== "workspace.request") return null;
+    if (request.operation !== "video.read") return null;
+    const schema =
+      request.method === "browser.request"
+        ? readBrowserVideoRpc.input
+        : readBrowserVideoRpc.input.omit({ viewerToken: true });
+    return schema.safeParse(request.input).success ? "video" : null;
+  } catch {
+    return null;
+  }
+}
+
 async function handleLine<Runtime extends RuntimeInstance>(
   line: string,
   token: string,

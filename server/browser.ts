@@ -18,8 +18,11 @@ import type {
   releaseControlRpc,
   resizeBrowserRpc,
   sendBrowserInputRpc,
+  setCaptureDensityRpc,
   updateBrowserGestureRpc,
 } from "../shared/browser";
+import type { BrowserVideoReadInput, BrowserVideoReadReply } from "../shared/browser-video";
+import { createBrowserOperationDiagnostics } from "./browser-operation-diagnostics";
 import { resolveBrowserRuntimeRoot } from "./runtime-path";
 import type { JsonValue } from "./runtime-protocol";
 import { resolveSupervisorPaths } from "./supervisor";
@@ -36,6 +39,8 @@ type AttachInput = RpcInput<typeof attachBrowserRpc>;
 type AttachOutput = RpcOutput<typeof attachBrowserRpc>;
 type DetachInput = RpcInput<typeof detachBrowserRpc>;
 type DetachOutput = RpcOutput<typeof detachBrowserRpc>;
+type DensityInput = RpcInput<typeof setCaptureDensityRpc>;
+type DensityOutput = RpcOutput<typeof setCaptureDensityRpc>;
 type CaptureInput = RpcInput<typeof captureBrowserRpc>;
 type CaptureOutput = RpcOutput<typeof captureBrowserRpc>;
 type AcquireControlInput = RpcInput<typeof acquireControlRpc>;
@@ -63,6 +68,12 @@ function paseoHome(): string {
 }
 
 class RemoteBrowserManager {
+  private readonly diagnose = createBrowserOperationDiagnostics();
+
+  private requestBrowser<Result = JsonValue>(operation: string, input: JsonValue): Promise<Result> {
+    return this.diagnose(operation, () => this.client.requestBrowser<Result>(operation, input));
+  }
+
   constructor(private readonly client: SupervisorClient) {}
 
   async connect(): Promise<void> {
@@ -70,11 +81,11 @@ class RemoteBrowserManager {
   }
 
   attach(workspaceId: string, viewerLabel: string): Promise<AttachOutput> {
-    return this.client.requestBrowser<AttachOutput>("attach", { workspaceId, viewerLabel });
+    return this.requestBrowser<AttachOutput>("attach", { workspaceId, viewerLabel });
   }
 
   detach(viewerToken: string): Promise<DetachOutput> {
-    return this.client.requestBrowser<DetachOutput>("detach", { viewerToken });
+    return this.requestBrowser<DetachOutput>("detach", { viewerToken });
   }
 
   capture(
@@ -82,60 +93,65 @@ class RemoteBrowserManager {
     quality: CaptureInput["quality"],
     knownFrameId: string | null,
   ): Promise<CaptureOutput> {
-    return this.client.requestBrowser<CaptureOutput>("capture", {
+    return this.requestBrowser<CaptureOutput>("capture", {
       viewerToken,
       quality,
       knownFrameId,
     });
   }
 
+  readVideo(input: BrowserVideoReadInput): Promise<BrowserVideoReadReply> {
+    return this.requestBrowser<BrowserVideoReadReply>("video.read", input as unknown as JsonValue);
+  }
+
   acquireControl(viewerToken: string, takeover: boolean): Promise<AcquireControlOutput> {
-    return this.client.requestBrowser<AcquireControlOutput>("acquire-control", {
+    return this.requestBrowser<AcquireControlOutput>("acquire-control", {
       viewerToken,
       takeover,
     });
   }
 
   releaseControl(viewerToken: string, controlToken: string): Promise<ReleaseControlOutput> {
-    return this.client.requestBrowser<ReleaseControlOutput>("release-control", {
+    return this.requestBrowser<ReleaseControlOutput>("release-control", {
       viewerToken,
       controlToken,
     });
   }
 
   navigate(input: NavigateInput): Promise<NavigateOutput> {
-    return this.client.requestBrowser<NavigateOutput>("navigate", input as unknown as JsonValue);
+    return this.requestBrowser<NavigateOutput>("navigate", input as unknown as JsonValue);
   }
 
   resize(input: ResizeInput): Promise<ResizeOutput> {
-    return this.client.requestBrowser<ResizeOutput>("viewport", input as unknown as JsonValue);
+    return this.requestBrowser<ResizeOutput>("viewport", input as unknown as JsonValue);
+  }
+
+  setCaptureDensity(input: DensityInput): Promise<DensityOutput> {
+    return this.requestBrowser<DensityOutput>("capture.density", input as unknown as JsonValue);
   }
 
   applyDevicePreset(input: ApplyDevicePresetInput): Promise<ApplyDevicePresetOutput> {
-    return this.client.requestBrowser<ApplyDevicePresetOutput>(
-      "device",
-      input as unknown as JsonValue,
-    );
+    return this.requestBrowser<ApplyDevicePresetOutput>("device", input as unknown as JsonValue);
   }
 
   sendInput(input: SendInput): Promise<SendOutput> {
-    return this.client.requestBrowser<SendOutput>("input", input as unknown as JsonValue);
+    return this.requestBrowser<SendOutput>("input", input as unknown as JsonValue);
   }
 
   beginGesture(input: BeginGestureInput): Promise<BeginGestureOutput> {
-    return this.client.requestBrowser("gesture.begin", input as unknown as JsonValue);
+    return this.requestBrowser("gesture.begin", input as unknown as JsonValue);
   }
 
   updateGesture(input: UpdateGestureInput): Promise<UpdateGestureOutput> {
-    return this.client.requestBrowser("gesture.update", input as unknown as JsonValue);
+    return this.requestBrowser("gesture.update", input as unknown as JsonValue);
   }
 
   endGesture(input: EndGestureInput): Promise<EndGestureOutput> {
-    return this.client.requestBrowser("gesture.end", input as unknown as JsonValue);
+    return this.requestBrowser("gesture.end", input as unknown as JsonValue);
   }
 
   async listOpenWorkspaceIds(): Promise<string[]> {
-    const result = await this.client.requestBrowser("list", {});
+    const result = await this.requestBrowser("list", {});
     if (
       !result ||
       typeof result !== "object" ||
@@ -153,7 +169,7 @@ class RemoteBrowserManager {
   }
 
   async archiveWorkspace(workspaceId: string): Promise<void> {
-    await this.client.requestBrowser("archive", { workspaceId });
+    await this.requestBrowser("archive", { workspaceId });
   }
 
   issueAgentTicket(ticket: string): Promise<void> {
@@ -304,6 +320,10 @@ export async function handleResizeBrowser(input: ResizeInput): Promise<ResizeOut
   return (await getProductionManager()).resize(input);
 }
 
+export async function handleSetCaptureDensity(input: DensityInput): Promise<DensityOutput> {
+  return (await getProductionManager()).setCaptureDensity(input);
+}
+
 export async function handleApplyDevicePreset(
   input: ApplyDevicePresetInput,
 ): Promise<ApplyDevicePresetOutput> {
@@ -336,4 +356,11 @@ export async function cleanupBrowserServer(): Promise<void> {
   if (productionStart) await productionStart.catch(() => undefined);
   productionManager?.disconnect();
   productionManager = null;
+}
+
+/** Read bounded native video without acquiring control or exposing another transport. */
+export async function handleReadBrowserVideo(
+  input: BrowserVideoReadInput,
+): Promise<BrowserVideoReadReply> {
+  return (await getProductionManager()).readVideo(input);
 }

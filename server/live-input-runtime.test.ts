@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { MAX_HELD_BROWSER_KEYS } from "../shared/browser";
 import { AgentBrowserRuntime } from "./agent-browser-runtime";
 import { createRuntimeOwner } from "./runtime-owner";
 
@@ -11,11 +12,19 @@ function fixture() {
     ipcDirectory: "/tmp/uncreated-ipc",
     session: "test",
   });
-  const calls: { method: string; params: Record<string, unknown> }[] = [];
+  const calls: {
+    method: string;
+    params: Record<string, unknown>;
+    options: { timeoutMs?: number } | undefined;
+  }[] = [];
   let intercept: (method: string) => Promise<void> = async () => {};
   const page = {
-    send: async (method: string, params: Record<string, unknown> = {}) => {
-      calls.push({ method, params });
+    send: async (
+      method: string,
+      params: Record<string, unknown> = {},
+      options?: { timeoutMs?: number },
+    ) => {
+      calls.push({ method, params, options });
       await intercept(method);
       return method === "Runtime.evaluate" ? { result: { value: "pointer" } } : {};
     },
@@ -24,6 +33,7 @@ function fixture() {
     page: typeof page;
     requirePage: () => Promise<typeof page>;
     documentGeneration: number;
+    attachmentGeneration: number;
   };
   Object.assign(runtime, {
     page,
@@ -36,6 +46,8 @@ function fixture() {
     control,
     page,
     calls,
+    begin: (id: string) =>
+      runtime.beginLiveInput(id, `${control.attachmentGeneration}:${control.documentGeneration}`),
     intercept: (next: typeof intercept) => {
       intercept = next;
     },
@@ -47,9 +59,61 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 describe("runtime-owned live input", () => {
+  for (const counter of ["documentGeneration", "attachmentGeneration"] as const) {
+    it(`refuses ${counter} drift during page attachment before admitting input`, async () => {
+      const state = fixture();
+      const expected = `${state.control.attachmentGeneration}:${state.control.documentGeneration}`;
+      state.control.requirePage = async () => {
+        state.control[counter]++;
+        return state.page;
+      };
+
+      await expect(state.runtime.beginLiveInput("new", expected)).rejects.toThrow(
+        "before admission",
+      );
+      await expect(state.runtime.mouseDown(20, 30, "left", 1, "new")).rejects.toThrow("attachment");
+      expect(state.calls).toEqual([]);
+    });
+
+    it(`refuses ${counter} drift while releasing a previous held input channel`, async () => {
+      const state = fixture();
+      await state.begin("old");
+      await state.runtime.mouseDown(20, 30, "left", 1, "old");
+      const expected = `${state.control.attachmentGeneration}:${state.control.documentGeneration}`;
+      state.intercept(async (method) => {
+        if (method === "Input.dispatchMouseEvent") state.control[counter]++;
+      });
+
+      await expect(state.runtime.beginLiveInput("new", expected)).rejects.toThrow(
+        "before admission",
+      );
+      await expect(state.runtime.mouseDown(20, 30, "left", 1, "new")).rejects.toThrow("attachment");
+      expect(state.calls.filter((call) => call.params.type === "mousePressed")).toHaveLength(1);
+      expect(state.calls.filter((call) => call.params.type === "mouseReleased")).toHaveLength(1);
+    });
+  }
+
+  it("bounds optional cursor sampling without cancelling a held mouse or replaying its press", async () => {
+    const state = fixture();
+    await state.begin("owned");
+    await state.runtime.mouseDown(20, 30, "left", 1, "owned");
+    state.intercept(async (method) => {
+      if (method === "Runtime.evaluate") throw new Error("Runtime.evaluate timed out");
+    });
+
+    expect(await state.runtime.cursorAt(20, 30, "owned")).toBeNull();
+    expect(state.calls.find((call) => call.method === "Runtime.evaluate")?.options?.timeoutMs).toBe(
+      250,
+    );
+    await state.runtime.mouseUp(20, 30, "left", 1, "owned");
+    expect(state.calls.filter((call) => call.params.type === "mousePressed")).toHaveLength(1);
+    expect(state.calls.filter((call) => call.params.type === "mouseReleased")).toHaveLength(1);
+    await state.runtime.endLiveInput("owned");
+  });
+
   it("completes acknowledged input that navigates while closing original held-input cleanup", async () => {
     const state = fixture();
-    await state.runtime.beginLiveInput("owned");
+    await state.begin("owned");
     state.intercept(async (method) => {
       if (method !== "Input.dispatchKeyEvent" || state.calls.at(-1)?.params.type !== "keyDown")
         return;
@@ -70,7 +134,7 @@ describe("runtime-owned live input", () => {
   it("does not complete target replacement or an unacknowledged send as successful navigation", async () => {
     for (const scenario of ["replacement", "uncertain"] as const) {
       const state = fixture();
-      await state.runtime.beginLiveInput("owned");
+      await state.begin("owned");
       state.intercept(async (method) => {
         if (method !== "Input.dispatchMouseEvent") return;
         state.control.documentGeneration++;
@@ -87,7 +151,7 @@ describe("runtime-owned live input", () => {
 
   it("does not restore held touches after an acknowledged touch start navigates", async () => {
     const state = fixture();
-    await state.runtime.beginLiveInput("owned");
+    await state.begin("owned");
     state.intercept(async (method) => {
       if (method !== "Input.dispatchTouchEvent" || state.calls.at(-1)?.params.type !== "touchStart")
         return;
@@ -103,7 +167,7 @@ describe("runtime-owned live input", () => {
   it("releases original held mouse after plugin/IPC disappearance without another policy request", async () => {
     vi.useFakeTimers();
     const state = fixture();
-    await state.runtime.beginLiveInput("owned");
+    await state.begin("owned");
     await state.runtime.mouseDown(10, 20, "left", 1, "owned");
     await vi.advanceTimersByTimeAsync(4_000);
     await state.runtime.assertLiveInput("owned");
@@ -116,7 +180,7 @@ describe("runtime-owned live input", () => {
   it("acknowledged moves renew idle expiry but never the absolute five-minute limit", async () => {
     vi.useFakeTimers();
     const state = fixture();
-    await state.runtime.beginLiveInput("owned");
+    await state.begin("owned");
     await state.runtime.mouseDown(10, 20, "left", 1, "owned");
     for (let index = 0; index < 74; index++) {
       await vi.advanceTimersByTimeAsync(4_000);
@@ -128,7 +192,7 @@ describe("runtime-owned live input", () => {
 
   it("cancels possibly published touch after lost acknowledgment and keeps original attachment on replacement", async () => {
     const state = fixture();
-    await state.runtime.beginLiveInput("owned");
+    await state.begin("owned");
     state.intercept(async (method) => {
       if (method === "Input.dispatchTouchEvent") throw new Error("Unknown publication outcome");
     });
@@ -149,7 +213,7 @@ describe("runtime-owned live input", () => {
 
   it("ends removed touch contacts before moving survivors and cancels remaining held contacts", async () => {
     const state = fixture();
-    await state.runtime.beginLiveInput("owned");
+    await state.begin("owned");
     await state.runtime.touch(
       "touchStart",
       [
@@ -180,12 +244,12 @@ describe("runtime-owned live input", () => {
 
   it("same-URL document replacement refuses publication and optional cursor rejects CSS URL values", async () => {
     const state = fixture();
-    await state.runtime.beginLiveInput("owned");
+    await state.begin("owned");
     state.control.documentGeneration++;
     await expect(state.runtime.mouseMove(20, 30, "owned")).rejects.toThrow("attachment");
     expect(state.calls).toEqual([]);
     await state.runtime.endLiveInput("owned");
-    await state.runtime.beginLiveInput("next");
+    await state.begin("next");
     state.control.page.send = async () => ({
       result: { value: "url(https://secret.invalid/cursor), pointer" },
     });
@@ -195,7 +259,7 @@ describe("runtime-owned live input", () => {
 
   it("native leave uses only the fixed outside point and refuses departure while a button is held", async () => {
     const state = fixture();
-    await state.runtime.beginLiveInput("owned");
+    await state.begin("owned");
     await state.runtime.mouseLeave("owned");
     expect(state.calls[0]?.params).toEqual({
       type: "mouseMoved",
@@ -222,14 +286,20 @@ describe("runtime-owned live input", () => {
       insertText: vi.fn(),
     };
     const owned = { runtimeId: "owned", runtime } as unknown as Parameters<typeof owner.request>[0];
-    await owner.request(owned, "input.begin", { gestureId: "gesture" });
+    await owner.request(owned, "input.begin", {
+      gestureId: "gesture",
+      expectedInputGeneration: "0:0",
+    });
     await owner.request(owned, "mouse.move", { gestureId: "gesture", x: 20, y: 30 });
     await owner.request(owned, "touch", {
       gestureId: "gesture",
       type: "start",
       points: [{ id: 7, x: 20, y: 30 }],
     });
-    expect(runtime.beginLiveInput).toHaveBeenCalledWith("gesture");
+    expect(runtime.beginLiveInput).toHaveBeenCalledWith("gesture", "0:0");
+    await expect(owner.request(owned, "input.begin", { gestureId: "gesture" })).rejects.toThrow(
+      "generation is required",
+    );
     expect(runtime.mouseMove).toHaveBeenCalledWith(20, 30, "gesture");
     expect(runtime.touch).toHaveBeenCalledWith("touchStart", [{ id: 7, x: 20, y: 30 }], "gesture");
     for (const points of [
@@ -273,7 +343,7 @@ describe("runtime-owned live input", () => {
 
   it("unpressed movement retains the ordinary no-button packet", async () => {
     const state = fixture();
-    await state.runtime.beginLiveInput("owned");
+    await state.begin("owned");
     await state.runtime.mouseMove(20, 30, "owned");
     expect(state.calls[0]?.params).toEqual({
       type: "mouseMoved",
@@ -292,7 +362,7 @@ describe("runtime-owned live input", () => {
   ] as const) {
     it(`held ${button} movement carries its native button and mask until release`, async () => {
       const state = fixture();
-      await state.runtime.beginLiveInput("owned");
+      await state.begin("owned");
       await state.runtime.mouseDown(10, 20, button, 1, "owned");
       await state.runtime.mouseMove(20, 30, "owned");
       await state.runtime.mouseUp(20, 30, button, 1, "owned");
@@ -309,7 +379,7 @@ describe("runtime-owned live input", () => {
 
   it("multiple held buttons use canonical priority, and cleanup leaves the next gesture unpressed", async () => {
     const state = fixture();
-    await state.runtime.beginLiveInput("owned");
+    await state.begin("owned");
     await state.runtime.mouseDown(10, 20, "middle", 1, "owned");
     await state.runtime.mouseDown(10, 20, "right", 1, "owned");
     await state.runtime.mouseMove(20, 30, "owned");
@@ -320,7 +390,7 @@ describe("runtime-owned live input", () => {
     await state.runtime.mouseUp(10, 20, "right", 1, "owned");
     await state.runtime.mouseMove(20, 30, "owned");
     await state.runtime.endLiveInput("owned");
-    await state.runtime.beginLiveInput("next");
+    await state.begin("next");
     await state.runtime.mouseMove(20, 30, "next");
     expect(
       state.calls
@@ -342,7 +412,7 @@ describe("runtime-owned live input", () => {
 
 it("publishes ordered native Unicode/repeat/shortcut keys and committed text on the pinned attachment", async () => {
   const state = fixture();
-  await state.runtime.beginLiveInput("keys");
+  await state.begin("keys");
   await state.runtime.dispatchKey(
     { kind: "key", type: "down", key: "é", code: "KeyE", modifiers: 0, repeat: false },
     "keys",
@@ -385,7 +455,7 @@ it("publishes ordered native Unicode/repeat/shortcut keys and committed text on 
 
 it("cleans possibly published keys on the original page and rejects unmatched repeat/up", async () => {
   const state = fixture();
-  await state.runtime.beginLiveInput("keys");
+  await state.begin("keys");
   const down = {
     kind: "key",
     type: "down",
@@ -408,7 +478,7 @@ it("cleans possibly published keys on the original page and rejects unmatched re
 it("expires held keyboard modifiers without another client request", async () => {
   vi.useFakeTimers();
   const state = fixture();
-  await state.runtime.beginLiveInput("keys");
+  await state.begin("keys");
   await state.runtime.dispatchKey(
     { kind: "key", type: "down", key: "Alt", code: "AltLeft", modifiers: 1, repeat: false },
     "keys",
@@ -416,4 +486,147 @@ it("expires held keyboard modifiers without another client request", async () =>
   await vi.advanceTimersByTimeAsync(5001);
   expect(state.calls.filter((call) => call.params.type === "keyUp")).toHaveLength(1);
   await expect(state.runtime.insertText("late", "keys")).rejects.toThrow("attachment");
+});
+
+it("forwards first-click physical modifiers on all mouse packets without fabricated key presses", async () => {
+  const state = fixture();
+  await state.begin("mouse");
+  await state.runtime.mouseDown(10, 20, "left", 1, "mouse", 2);
+  await state.runtime.mouseMove(20, 30, "mouse", 10);
+  await state.runtime.wheel(20, 30, 0, 40, "mouse", 1);
+  await state.runtime.mouseUp(20, 30, "left", 1, "mouse", 0);
+  expect(
+    state.calls
+      .filter((call) => call.method === "Input.dispatchMouseEvent")
+      .map((call) => call.params.modifiers),
+  ).toEqual([2, 10, 1, 0]);
+  expect(state.calls.some((call) => call.method === "Input.dispatchKeyEvent")).toBe(false);
+  await state.runtime.endLiveInput("mouse");
+});
+
+it("explicit zero overrides held keyboard inference while omitted mouse masks retain it", async () => {
+  const state = fixture();
+  await state.begin("mouse");
+  await state.runtime.dispatchKey(
+    { kind: "key", type: "down", key: "Control", code: "ControlLeft", modifiers: 2, repeat: false },
+    "mouse",
+  );
+  await state.runtime.mouseMove(20, 30, "mouse", 0);
+  await state.runtime.mouseMove(20, 30, "mouse");
+  expect(
+    state.calls
+      .filter((call) => call.method === "Input.dispatchMouseEvent")
+      .map((call) => call.params.modifiers),
+  ).toEqual([0, 2]);
+  await state.runtime.endLiveInput("mouse");
+});
+
+it("refuses invalid mouse masks before publication or held-button bookkeeping", async () => {
+  const state = fixture();
+  await state.begin("mouse");
+  for (const modifiers of [-1, 16, 1.5, Number.NaN]) {
+    await expect(state.runtime.mouseDown(10, 20, "left", 1, "mouse", modifiers)).rejects.toThrow(
+      "Mouse modifiers",
+    );
+    await expect(state.runtime.mouseMove(10, 20, "mouse", modifiers)).rejects.toThrow(
+      "Mouse modifiers",
+    );
+    await expect(state.runtime.wheel(10, 20, 0, 40, "mouse", modifiers)).rejects.toThrow(
+      "Mouse modifiers",
+    );
+    await expect(state.runtime.mouseUp(10, 20, "left", 1, "mouse", modifiers)).rejects.toThrow(
+      "Mouse modifiers",
+    );
+  }
+  await state.runtime.endLiveInput("mouse");
+  expect(state.calls).toEqual([]);
+});
+
+it("runtime-owner validates physical modifiers and preserves omitted legacy arguments", async () => {
+  const owner = await createRuntimeOwner();
+  const runtime = { mouseDown: vi.fn(), mouseMove: vi.fn(), mouseUp: vi.fn(), wheel: vi.fn() };
+  const owned = { runtimeId: "owned", runtime } as unknown as Parameters<typeof owner.request>[0];
+  const point = {
+    x: 10,
+    y: 20,
+    gestureId: "mouse",
+    button: "left",
+    clickCount: 1,
+    deltaX: 0,
+    deltaY: 40,
+  };
+  await owner.request(owned, "mouse.down", { ...point, modifiers: 2 });
+  await owner.request(owned, "mouse.move", { ...point, modifiers: 0 });
+  await owner.request(owned, "mouse.up", { ...point, modifiers: 8 });
+  await owner.request(owned, "mouse.wheel", { ...point, modifiers: 4 });
+  expect(runtime.mouseDown).toHaveBeenCalledWith(10, 20, "left", 1, "mouse", 2);
+  expect(runtime.mouseMove).toHaveBeenCalledWith(10, 20, "mouse", 0);
+  expect(runtime.mouseUp).toHaveBeenCalledWith(10, 20, "left", 1, "mouse", 8);
+  expect(runtime.wheel).toHaveBeenCalledWith(10, 20, 0, 40, "mouse", 4);
+  for (const modifiers of [null, "2", 16, -1, 1.5]) {
+    await expect(owner.request(owned, "mouse.down", { ...point, modifiers })).rejects.toThrow();
+  }
+  expect(runtime.mouseDown).toHaveBeenCalledTimes(1);
+  await owner.request(owned, "mouse.move", point);
+  expect(runtime.mouseMove).toHaveBeenLastCalledWith(10, 20, "mouse");
+});
+
+it("bounds live held keys before native publication and still permits repeat, release and cancel", async () => {
+  const state = fixture();
+  await state.begin("keys");
+  const key = (code: string, type: "down" | "up" = "down", repeat = false) => ({
+    kind: "key" as const,
+    type,
+    key: "Unidentified",
+    code,
+    modifiers: 0,
+    repeat,
+  });
+  for (let index = 0; index < MAX_HELD_BROWSER_KEYS; index++) {
+    await state.runtime.dispatchKey(key(`Unknown${index}`), "keys");
+  }
+  await expect(state.runtime.dispatchKey(key("UnknownExtra"), "keys")).rejects.toThrow(
+    "Too many simultaneously held",
+  );
+  expect(state.calls.filter((call) => call.params.type === "rawKeyDown")).toHaveLength(
+    MAX_HELD_BROWSER_KEYS,
+  );
+  await state.runtime.dispatchKey(key("Unknown0", "down", true), "keys");
+  await state.runtime.dispatchKey(key("Unknown0", "up"), "keys");
+  await state.runtime.dispatchKey(key("UnknownReplacement"), "keys");
+  await state.runtime.endLiveInput("keys");
+  const releases = state.calls.filter((call) => call.params.type === "keyUp");
+  expect(releases).toHaveLength(MAX_HELD_BROWSER_KEYS + 1);
+  expect(releases.some((call) => call.params.code === "UnknownExtra")).toBe(false);
+});
+
+it("applies the same held-key bound to discrete native key-down commands", async () => {
+  const state = fixture();
+  for (let index = 0; index < MAX_HELD_BROWSER_KEYS; index++) {
+    await state.runtime.keyDown("Unidentified", `Unknown${index}`);
+  }
+  await expect(state.runtime.keyDown("Unidentified", "UnknownExtra")).rejects.toThrow(
+    "Too many simultaneously held",
+  );
+  await state.runtime.keyUp("Unidentified", "Unknown0");
+  await state.runtime.keyDown("Unidentified", "UnknownReplacement");
+  expect(state.calls.some((call) => call.params.code === "UnknownExtra")).toBe(false);
+});
+
+it("runtime-owner validates and forwards encoder controls without changing legacy omission", async () => {
+  const owner = await createRuntimeOwner();
+  const runtime = {
+    readVideo: vi.fn(async (_input: unknown) => ({ status: "waiting", packets: [] })),
+  };
+  const owned = { runtimeId: "owned", runtime } as unknown as Parameters<typeof owner.request>[0];
+  await owner.request(owned, "video.read", { bitrate: 24_000_000, fps: 60 });
+  expect(runtime.readVideo).toHaveBeenLastCalledWith(
+    expect.objectContaining({ bitrate: 24_000_000, fps: 60 }),
+  );
+  await owner.request(owned, "video.read", {});
+  expect(runtime.readVideo.mock.calls[1]?.[0]).not.toHaveProperty("bitrate");
+  expect(runtime.readVideo.mock.calls[1]?.[0]).not.toHaveProperty("fps");
+  await expect(owner.request(owned, "video.read", { bitrate: 1 })).rejects.toThrow();
+  await expect(owner.request(owned, "video.read", { fps: 120 })).rejects.toThrow();
+  expect(runtime.readVideo).toHaveBeenCalledTimes(2);
 });

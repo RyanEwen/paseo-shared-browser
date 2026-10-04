@@ -9,6 +9,8 @@ import {
   type beginBrowserGestureRpc,
   browserCursorSchema,
   browserGestureEventSchema,
+  canUseCaptureDensity,
+  type captureBrowserRpc,
   DEFAULT_VIEWPORT,
   DEVICE_PRESETS,
   type DevicePresetId,
@@ -20,19 +22,33 @@ import {
   type navigateBrowserRpc,
   type resizeBrowserRpc,
   type sendBrowserInputRpc,
+  type setCaptureDensityRpc,
   type updateBrowserGestureRpc,
   type Viewport,
 } from "../shared/browser";
 import {
+  type BrowserFrameAuthority,
+  type BrowserVideoReadInput,
+  type BrowserVideoReadReply,
+  nativeVideoPacketSchema,
+  readBrowserVideoRpc,
+  VIDEO_MAX_BATCH_BYTES,
+  VIDEO_SOURCE_CLOCK_TOLERANCE_MS,
+} from "../shared/browser-video";
+import {
+  type CaptureQuality,
   captureDimensions,
   DEFAULT_CAPTURE_QUALITY,
-  DEFAULT_JPEG_QUALITY,
   JPEG_QUALITY,
 } from "../shared/capture-settings";
 import { BrowserGesture } from "./browser-gesture";
 import { sameRuntimeInputAttachment } from "./input-generation";
+import { NAVIGATION_METADATA_TIMEOUT_MS } from "./navigation-budget";
 import type { JsonValue } from "./runtime-protocol";
+import { createViewerCaptureLifetime, type ViewerCaptureLifetime } from "./viewer-capture-lifetime";
 export type WorkspaceValidator = (workspaceId: string) => Promise<void | boolean>;
+type CaptureReply = Omit<RpcOutput<typeof captureBrowserRpc>, "state"> & { state: BrowserState };
+type DensityInput = RpcInput<typeof setCaptureDensityRpc>;
 type NavigateInput = RpcInput<typeof navigateBrowserRpc>;
 type ResizeInput = RpcInput<typeof resizeBrowserRpc>;
 type ApplyDevicePresetInput = RpcInput<typeof applyDevicePresetRpc>;
@@ -43,14 +59,13 @@ type UpdateGestureReply = Omit<RpcOutput<typeof updateBrowserGestureRpc>, "state
   state: BrowserState;
 };
 type EndGestureInput = RpcInput<typeof endBrowserGestureRpc>;
-type CaptureQuality = "low" | "medium" | "high";
 type InputTarget = SendInput["target"];
 
 const VIEWER_TTL_MS = 45_000;
 const CONTROL_LEASE_MS = 30_000;
 const FRAME_CACHE_MS = 100;
 const FRAME_TOKEN_TTL_MS = 5_000;
-const MAX_RECENT_FRAMES = 32;
+const MAX_RECENT_FRAMES = 512;
 const MAX_VIEWERS_PER_SESSION = 16;
 const MAX_SESSIONS = 8;
 const SCREENCAST_WAIT_MS = 500;
@@ -87,6 +102,11 @@ interface Controller {
   controlToken: string;
   expiresAt: number;
 }
+/** One decoded geometry basis for the current human controller, separate from agent receipts. */
+type HumanInputAdmission = Pick<
+  BrowserGesture,
+  "viewerToken" | "controlToken" | "expected" | "runtimeInputGeneration"
+> & { frameId: string };
 interface BrowserSession {
   workspaceId: string;
   sessionId: string;
@@ -123,7 +143,15 @@ interface BrowserSession {
   error: string | null;
   archived: boolean;
   gesture: BrowserGesture | null;
+  humanInputAdmission: HumanInputAdmission | null;
   inputGeneration: string | null;
+  frameRevision: number;
+  videoNotBefore: number;
+  /** Older native pixels may play, but cannot renew press authority after input. */
+  videoInputNotBefore: number;
+  videoReads: Set<string>;
+  videoLifetime: ViewerCaptureLifetime | null;
+  videoReceipts: Map<string, BrowserFrameAuthority>;
 }
 
 function defaultToken(): string {
@@ -208,7 +236,12 @@ export class SessionManager {
   setBridgeEpoch(epoch: number): void {
     this.bridgeEpoch = epoch;
     for (const session of this.sessions.values()) {
-      if (session.bridgeEpoch !== epoch) void this.cancelGesture(session);
+      if (session.bridgeEpoch !== epoch) {
+        session.humanInputAdmission = null;
+        void this.cancelGesture(session);
+        // A new bridge cannot admit a token issued by the previous attachment.
+        this.invalidateFrames(session);
+      }
       session.bridgeEpoch = epoch;
     }
   }
@@ -231,9 +264,8 @@ export class SessionManager {
       const viewerToken = this.issueUniqueToken();
       session.viewers.set(viewerToken, { label, expiresAt: this.now() + this.viewerTtlMs });
       this.viewerSessions.set(viewerToken, session);
-      await this.request(session, "screencast.start", { quality: DEFAULT_JPEG_QUALITY }).catch(
-        () => undefined,
-      );
+      // Actual image reads lazily own JPEG capture. Attaching a desktop video
+      // viewer or an agent doing status-only work does not start a second stream.
       try {
         return { viewerToken, state: await this.snapshotState(session, viewerToken) };
       } catch (error) {
@@ -252,11 +284,14 @@ export class SessionManager {
       const detached = session.viewers.delete(viewerToken);
       this.viewerSessions.delete(viewerToken);
       if (session.controller?.viewerToken === viewerToken) {
+        session.humanInputAdmission = null;
         await this.cancelGesture(session);
         session.controller = null;
       }
-      if (session.viewers.size === 0)
+      if (session.viewers.size === 0) {
         await this.request(session, "screencast.stop", null).catch(() => undefined);
+        await this.stopUnusedVideo(session);
+      }
       return { detached };
     });
   }
@@ -270,6 +305,7 @@ export class SessionManager {
     const session = this.sessions.get(workspaceId);
     if (!session) return;
     session.archived = true;
+    session.videoLifetime?.cancel();
     await this.cancelGesture(session);
     for (const token of session.viewers.keys()) this.viewerSessions.delete(token);
     session.viewers.clear();
@@ -301,7 +337,7 @@ export class SessionManager {
     viewerToken: string,
     quality: CaptureQuality = DEFAULT_CAPTURE_QUALITY,
     knownFrameId: string | null = null,
-  ): Promise<{ state: BrowserState; frame: BrowserFrame | null }> {
+  ): Promise<CaptureReply> {
     const session = this.requireViewer(viewerToken);
     return this.serialize(session, async () => {
       this.pruneExpired(session);
@@ -315,6 +351,167 @@ export class SessionManager {
     });
   }
 
+  /** Change physical density without navigating, switching input mode, or resizing CSS layout. */
+  async setCaptureDensity(input: DensityInput): Promise<{ state: BrowserState }> {
+    const session = this.requireViewer(input.viewerToken);
+    return this.serialize(session, async () => {
+      this.requireMutationAccess(session, input);
+      if (!canUseCaptureDensity(session.viewport, input.density))
+        throw new RangeError("Capture density exceeds the supported image bounds");
+      if (session.captureScale !== input.density) {
+        session.humanInputAdmission = null;
+        await this.cancelGesture(session);
+        const preset = DEVICE_PRESETS.find(({ id }) => id === session.devicePresetId);
+        await this.request(session, "capture.density", {
+          density: input.density,
+          deviceScaleFactor: preset?.deviceScaleFactor ?? 1,
+        });
+        session.captureScale = input.density;
+        session.viewportGeneration += 1;
+        this.invalidateFrames(session);
+      }
+      this.renewController(session, input.viewerToken);
+      return { state: await this.snapshotState(session, input.viewerToken) };
+    });
+  }
+
+  /**
+   * Wait outside mutation serialization. Normal media reads use cached policy
+   * state and native generation fences. A newly observed native document needs
+   * one bounded reconciliation because video viewers may not request JPEG/status.
+   * The transition read never admits packets, even after reconciliation succeeds.
+   */
+  async readVideo(input: BrowserVideoReadInput): Promise<BrowserVideoReadReply> {
+    input = readBrowserVideoRpc.input.parse(input);
+    const session = this.requireViewer(input.viewerToken);
+    const before = await this.serialize(session, async () => {
+      this.pruneExpired(session);
+      this.heartbeatViewer(session, input.viewerToken);
+      if (session.videoReads.has(input.viewerToken)) {
+        throw new Error("A video read is already pending for this viewer");
+      }
+      const state = this.projectState(session, input.viewerToken);
+      session.videoReads.add(input.viewerToken);
+      this.armVideoLifetime(session);
+      return {
+        state,
+        inputGeneration: session.inputGeneration,
+        frameRevision: session.frameRevision,
+      };
+    });
+
+    try {
+      const raw = asRecord(
+        await this.request(session, "video.read", {
+          quality: input.quality,
+          ...(input.bitrate === undefined ? {} : { bitrate: input.bitrate }),
+          ...(input.fps === undefined ? {} : { fps: input.fps }),
+          streamId: input.streamId,
+          afterSequence: input.afterSequence,
+          waitMs: input.waitMs,
+          requestKeyFrame: input.requestKeyFrame,
+        }),
+      );
+      return await this.serialize(session, async () => {
+        if (this.requireViewer(input.viewerToken) !== session || session.archived) {
+          throw new Error("Video viewer attachment changed");
+        }
+        if (raw.inputGeneration !== session.inputGeneration) {
+          // External/script navigation must not depend on visual fallback to
+          // reconcile policy state. Revoke old receipts first, and discard this
+          // entire read: neither pre-transition nor mixed-document pixels qualify.
+          this.invalidateFrames(session);
+          const state = await this.snapshotState(
+            session,
+            input.viewerToken,
+            NAVIGATION_METADATA_TIMEOUT_MS,
+          );
+          if (this.requireViewer(input.viewerToken) !== session || session.archived) {
+            throw new Error("Video viewer attachment changed");
+          }
+          return { state, status: "reset", streamId: null, packets: [] };
+        }
+        const state = this.projectState(session, input.viewerToken);
+        const changed =
+          session.frameRevision !== before.frameRevision ||
+          state.sessionId !== before.state.sessionId ||
+          state.runtimeId !== before.state.runtimeId ||
+          state.bridgeEpoch !== before.state.bridgeEpoch ||
+          state.navigationGeneration !== before.state.navigationGeneration ||
+          state.viewportGeneration !== before.state.viewportGeneration ||
+          session.inputGeneration !== before.inputGeneration ||
+          raw.inputGeneration !== session.inputGeneration;
+        if (changed || state.status !== "ready") {
+          return { state, status: "reset", streamId: null, packets: [] };
+        }
+        const dimensions = captureDimensions(session.viewport, session.captureScale);
+        const packets: BrowserVideoReadReply["packets"] = [];
+        let bytes = 0;
+        if (Array.isArray(raw.packets)) {
+          for (const value of raw.packets.slice(0, 32)) {
+            const parsed = nativeVideoPacketSchema.safeParse(value);
+            if (!parsed.success) throw new Error("Runtime returned an invalid video packet");
+            const packet = parsed.data;
+            const capturedAtMs = Date.parse(packet.capturedAt);
+            const age = this.now() - capturedAtMs;
+            if (
+              capturedAtMs < session.videoNotBefore ||
+              age < -VIDEO_SOURCE_CLOCK_TOLERANCE_MS ||
+              age > 1000 ||
+              packet.width !== dimensions.width ||
+              packet.height !== dimensions.height
+            ) {
+              return { state, status: "reset", streamId: null, packets: [] };
+            }
+            bytes += Buffer.byteLength(packet.dataBase64, "base64");
+            if (bytes > VIDEO_MAX_BATCH_BYTES)
+              throw new Error("Runtime returned an oversized video batch");
+            if (packet.streamId !== raw.streamId)
+              throw new Error("Video stream identity changed within a batch");
+            const receipt = JSON.stringify([
+              packet.streamId,
+              packet.captureGeneration,
+              packet.sequence,
+              packet.timestampUs,
+            ]);
+            let frame = session.videoReceipts.get(receipt);
+            if (!frame) {
+              frame = {
+                frameId: this.issueUniqueToken(),
+                sessionId: session.sessionId,
+                runtimeId: session.runtimeId,
+                captureEpoch: session.bridgeEpoch,
+                navigationGeneration: session.navigationGeneration,
+                viewportGeneration: session.viewportGeneration,
+                width: packet.width,
+                height: packet.height,
+                capturedAt: packet.capturedAt,
+              };
+              session.videoReceipts.set(receipt, frame);
+            }
+            this.rememberFrame(session, frame, true);
+            packets.push({ ...packet, frame });
+          }
+        }
+        while (session.videoReceipts.size > MAX_RECENT_FRAMES) {
+          const oldest = session.videoReceipts.keys().next().value;
+          if (oldest === undefined) break;
+          session.videoReceipts.delete(oldest);
+        }
+        return readBrowserVideoRpc.output.parse({
+          state,
+          status: raw.status,
+          streamId: raw.streamId,
+          packets,
+          ...(typeof raw.reason === "string" ? { reason: raw.reason } : {}),
+          ...(raw.reasonCode === "encoder-capacity" ? { reasonCode: raw.reasonCode } : {}),
+        });
+      });
+    } finally {
+      session.videoReads.delete(input.viewerToken);
+    }
+  }
+
   async acquireControl(
     viewerToken: string,
     takeover = false,
@@ -325,7 +522,10 @@ export class SessionManager {
       const current = session.controller;
       if (current && current.viewerToken !== viewerToken && !takeover)
         throw new Error("Browser control is held by another viewer");
-      if (current?.viewerToken !== viewerToken) await this.cancelGesture(session);
+      if (current?.viewerToken !== viewerToken) {
+        session.humanInputAdmission = null;
+        await this.cancelGesture(session);
+      }
       const controller =
         current?.viewerToken === viewerToken
           ? current
@@ -346,6 +546,7 @@ export class SessionManager {
     const session = this.requireViewer(viewerToken);
     return this.serialize(session, async () => {
       this.requireController(session, viewerToken, controlToken);
+      session.humanInputAdmission = null;
       await this.cancelGesture(session);
       session.controller = null;
       this.heartbeatViewer(session, viewerToken);
@@ -357,24 +558,27 @@ export class SessionManager {
     const session = this.requireViewer(input.viewerToken);
     return this.serialize(session, async () => {
       this.requireMutationAccess(session, input);
+      session.humanInputAdmission = null;
       await this.cancelGesture(session);
       const navigationGeneration = session.navigationGeneration;
       if (input.action.kind === "goto")
         await this.request(session, "navigate", { url: normalizeBrowserUrl(input.action.url) });
       else if (input.action.kind === "back") {
-        await this.refreshPageMetadata(session);
+        await this.refreshPageMetadata(session, NAVIGATION_METADATA_TIMEOUT_MS);
         if (!session.canGoBack) throw new Error("Browser cannot go back");
         await this.request(session, "back", null);
       } else if (input.action.kind === "forward") {
-        await this.refreshPageMetadata(session);
+        await this.refreshPageMetadata(session, NAVIGATION_METADATA_TIMEOUT_MS);
         if (!session.canGoForward) throw new Error("Browser cannot go forward");
         await this.request(session, "forward", null);
       } else await this.request(session, "reload", null);
-      await this.refreshPageMetadata(session);
+      // One authoritative post-navigation read. Loading is browser-native; an
+      // unavailable observation remains an explicit error state, not cached-ready.
+      await this.snapshotState(session, input.viewerToken, NAVIGATION_METADATA_TIMEOUT_MS);
       if (session.navigationGeneration === navigationGeneration) session.navigationGeneration += 1;
       this.invalidateFrames(session);
       this.renewController(session, input.viewerToken);
-      return { state: await this.snapshotState(session, input.viewerToken) };
+      return { state: this.projectState(session, input.viewerToken) };
     });
   }
 
@@ -389,6 +593,7 @@ export class SessionManager {
         session.viewport.height !== input.viewport.height ||
         session.devicePresetId !== null
       ) {
+        session.humanInputAdmission = null;
         await this.request(session, "emulate", {
           ...input.viewport,
           deviceScaleFactor: 1,
@@ -416,6 +621,7 @@ export class SessionManager {
       await this.cancelGesture(session);
       const preset = DEVICE_PRESETS.find(({ id }) => id === input.presetId);
       if (!preset) throw new Error("Unknown device preset");
+      session.humanInputAdmission = null;
       // Resolve the display under the session lock. A mode toggle must neither
       // replay remembered dimensions nor change the capture's pixel resolution.
       const viewport = input.preserveDisplay ? session.viewport : preset.viewport;
@@ -423,7 +629,7 @@ export class SessionManager {
       await this.request(session, "emulate", {
         width: viewport.width,
         height: viewport.height,
-        deviceScaleFactor: preset.deviceScaleFactor,
+        deviceScaleFactor: Math.max(preset.deviceScaleFactor, captureScale),
         captureScale,
         mobile: preset.isMobile,
         touch: preset.hasTouch,
@@ -449,21 +655,36 @@ export class SessionManager {
       this.requireMutationAccess(session, input);
       this.requireRecentFrame(session, input.target);
       await this.cancelGesture(session);
-      await this.dispatchInput(session, input.event, input.target);
-      this.invalidateFrames(session);
+      try {
+        await this.dispatchInput(session, input.event, input.target);
+      } finally {
+        const hadVideo = session.videoReceipts.size > 0 || session.videoReads.size > 0;
+        // Revoke authority even if auxiliary capture fails. Source-age fencing
+        // rejects buffered pre-action video and never overwrites the input outcome.
+        this.invalidateFrames(session);
+        if (hadVideo) await this.request(session, "video.invalidate", null).catch(() => undefined);
+      }
       this.renewController(session, input.viewerToken);
       return { state: await this.snapshotState(session, input.viewerToken) };
     });
   }
 
-  /** Anchor a live channel to exact frame/control/runtime identity, without pressing anything. */
+  /**
+   * Admit decoded geometry once, then reopen its same human control context
+   * after idle cleanup without requiring new pixels. Native begin/check must
+   * still pin the original attachment/document; this never admits agent input.
+   */
   async beginGesture(input: BeginGestureInput) {
     const session = this.requireViewer(input.viewerToken);
     return this.serialize(session, async () => {
       this.requireMutationAccess(session, input);
-      await this.refreshPageMetadata(session);
-      this.requireMutationAccess(session, input);
-      if (!this.isRecentFrame(session, input.target)) {
+      const retainedAdmission = this.matchesHumanInputAdmission(session, input);
+      if (!retainedAdmission) {
+        await this.refreshPageMetadata(session);
+        session.error = null;
+        this.requireMutationAccess(session, input);
+      }
+      if (!retainedAdmission && !this.isRecentFrame(session, input.target)) {
         // A pre-input capture can decode after scroll revoked its token. Report
         // known non-publication, not an uncertain runtime failure. The client
         // may obtain another decoded frame before admitting its still-unsent input.
@@ -473,6 +694,8 @@ export class SessionManager {
           throw new Error(state.error ?? "Browser runtime is unavailable");
         return { state, admission: "stale-frame" as const };
       }
+      if (session.inputGeneration === null)
+        throw new Error("Browser input identity is unavailable");
       await this.cancelGesture(session);
       const gesture = new BrowserGesture(
         this.issueUniqueToken(),
@@ -486,21 +709,42 @@ export class SessionManager {
       );
       session.gesture = gesture;
       try {
-        await this.request(session, "input.begin", { gestureId: gesture.id });
+        await this.request(session, "input.begin", {
+          gestureId: gesture.id,
+          expectedInputGeneration: gesture.runtimeInputGeneration,
+        });
         await this.assertGestureCurrent(session, gesture);
         this.renewController(session, input.viewerToken);
         this.scheduleGestureTimeout(session, gesture);
-        const state = await this.snapshotState(session, input.viewerToken);
+        // Initial admission reconciles metadata. Retained geometry instead uses
+        // atomic native begin(expectedInputGeneration) plus checks, so idle reopen
+        // cannot adopt a replacement document or block on page metadata catchup.
+        const state = this.projectState(session, input.viewerToken);
         await this.assertGestureCurrent(session, gesture);
+        // Unknown legacy native identity cannot establish a reusable basis.
+        if (gesture.runtimeInputGeneration !== null) {
+          session.humanInputAdmission = {
+            frameId: input.target.frameId,
+            viewerToken: gesture.viewerToken,
+            controlToken: gesture.controlToken,
+            expected: { ...gesture.expected },
+            runtimeInputGeneration: gesture.runtimeInputGeneration,
+          };
+        }
         return { state, gestureId: gesture.id, nextSequence: gesture.nextSequence };
       } catch (error) {
+        session.humanInputAdmission = null;
         await this.cancelGesture(session, gesture);
         throw error;
       }
     });
   }
 
-  /** Deliver one strictly ordered packet; an uncertain failure cancels without retrying its action. */
+  /**
+   * Continue an admitted human channel independently of decoded-frame catchup.
+   * Exact control/document/geometry/native checks still fence every ordered
+   * packet. An uncertain publication revokes observations and is never replayed.
+   */
   async updateGesture(input: UpdateGestureInput): Promise<UpdateGestureReply> {
     const session = this.requireViewer(input.viewerToken);
     return this.serialize(session, async () => {
@@ -513,14 +757,10 @@ export class SessionManager {
         gesture.assertSequence(input.sequence, this.now());
         await this.assertGestureCurrent(session, gesture);
         gesture.validate(event);
-        if (
-          event.kind === "down" ||
-          (event.kind === "touch" && event.type === "start" && gesture.touches.size === 0)
-        ) {
-          if (!input.target) throw new Error("A current frame is required for a new press");
-          this.requireRecentFrame(session, input.target);
-        }
         const hover = gesture.isHover(event);
+        // Admission belongs to this exact human channel, not each painted
+        // receipt. Revoke agent observations before an outcome can become unknown.
+        this.invalidateGestureObservations(session, hover);
         if (event.kind === "key") {
           await this.request(session, "input.key", {
             gestureId: gesture.id,
@@ -558,6 +798,7 @@ export class SessionManager {
           await this.request(session, operation, {
             ...point,
             gestureId: gesture.id,
+            ...(event.modifiers === undefined ? {} : { modifiers: event.modifiers }),
             ...(event.kind === "down" || event.kind === "up"
               ? { button: event.button, clickCount: event.clickCount }
               : {}),
@@ -568,17 +809,19 @@ export class SessionManager {
         await this.assertGestureCurrent(session, gesture);
         gesture.acknowledge(event, this.now());
         eventAcknowledged = true;
-        // Hover may alter pixels but still leaves the bounded decoded-frame token
-        // usable for a subsequent press. Scroll/held input revokes that authority.
-        session.frameCache.clear();
-        if (!hover) session.recentFrames.clear();
+        // Fence captures received during publication as well as earlier ones.
+        this.invalidateGestureObservations(session, hover);
         this.renewController(session, input.viewerToken);
         this.scheduleGestureTimeout(session, gesture);
         const cursor = await this.gestureCursor(session, gesture);
-        const state = await this.snapshotState(session, input.viewerToken);
+        // An ordinary held-input acknowledgement must not block video behind a
+        // page metadata RPC. Native attachment/document checks remain mandatory;
+        // their navigation failure uses the qualified completion path below.
+        const state = this.projectState(session, input.viewerToken);
         await this.assertGestureCurrent(session, gesture);
         return { state, gestureId: gesture.id, nextSequence: gesture.nextSequence, cursor };
       } catch (error) {
+        session.humanInputAdmission = null;
         if (publishedEvent) {
           const completion = await this.completeNavigatingInput(
             session,
@@ -592,6 +835,15 @@ export class SessionManager {
         throw error;
       }
     });
+  }
+
+  /** Revoke observation authority without resetting the continuous video codec. */
+  private invalidateGestureObservations(session: BrowserSession, hover: boolean): void {
+    session.frameCache.clear();
+    if (!hover) {
+      session.recentFrames.clear();
+      session.videoInputNotBefore = this.now();
+    }
   }
 
   /** Return a fresh viewing state after acknowledged input navigated, without admitting another input. */
@@ -644,20 +896,49 @@ export class SessionManager {
       const gesture = session.gesture;
       if (!gesture && input.cancel) {
         this.requireController(session, input.viewerToken, input.controlToken);
-        return { state: await this.snapshotState(session, input.viewerToken), cursor: null };
+        session.humanInputAdmission = null;
+        return { state: this.projectState(session, input.viewerToken), cursor: null };
       }
       const owned = this.requireGesture(session, input);
+      if (input.cancel) session.humanInputAdmission = null;
       try {
         if (!input.cancel) {
           this.assertGesturePacketContext(owned, input.expected);
           owned.assertSequence(input.sequence, this.now());
           await this.assertGestureCurrent(session, owned);
         }
+      } catch (error) {
+        session.humanInputAdmission = null;
+        throw error;
       } finally {
         await this.cancelGesture(session, owned);
       }
-      return { state: await this.snapshotState(session, input.viewerToken), cursor: null };
+      return { state: this.projectState(session, input.viewerToken), cursor: null };
     });
+  }
+
+  /** A caller can only select its original admitted receipt under the exact current native context. */
+  private matchesHumanInputAdmission(session: BrowserSession, input: BeginGestureInput): boolean {
+    const admission = session.humanInputAdmission;
+    if (!admission) return false;
+    const contextMatches =
+      admission.viewerToken === input.viewerToken &&
+      admission.controlToken === input.controlToken &&
+      admission.runtimeInputGeneration !== null &&
+      admission.runtimeInputGeneration === session.inputGeneration &&
+      input.target.navigationGeneration === admission.expected.navigationGeneration &&
+      input.target.viewportGeneration === admission.expected.viewportGeneration &&
+      (
+        [
+          "sessionId",
+          "runtimeId",
+          "bridgeEpoch",
+          "navigationGeneration",
+          "viewportGeneration",
+        ] as const
+      ).every((key) => admission.expected[key] === input.expected[key]);
+    if (!contextMatches) session.humanInputAdmission = null;
+    return contextMatches && admission.frameId === input.target.frameId;
   }
 
   private requireGesture(
@@ -708,7 +989,8 @@ export class SessionManager {
     )
       throw new Error("Browser gesture expired");
     // Runtime check pins the CDP document/attachment without repeating a full
-    // metadata read for every drag point. snapshotState supplies final metadata.
+    // metadata read for every drag point. Status or a media-generation mismatch
+    // reconciles metadata; acknowledged navigation uses its explicit completion.
     await this.request(session, "input.check", { gestureId: gesture.id });
     this.requireMutationAccess(session, {
       viewerToken: gesture.viewerToken,
@@ -766,7 +1048,10 @@ export class SessionManager {
 
   reset(): void {
     this.lifecycleGeneration += 1;
-    for (const session of this.sessions.values()) void this.cancelGesture(session);
+    for (const session of this.sessions.values()) {
+      session.videoLifetime?.cancel();
+      void this.cancelGesture(session);
+    }
     this.sessions.clear();
     this.sessionCreations.clear();
     this.viewerSessions.clear();
@@ -849,6 +1134,12 @@ export class SessionManager {
         mutationTail: Promise.resolve(),
         frameCache: new Map(),
         recentFrames: new Map(),
+        frameRevision: 0,
+        videoNotBefore: 0,
+        videoInputNotBefore: 0,
+        videoReads: new Set(),
+        videoLifetime: null,
+        videoReceipts: new Map(),
         lastUrl: boundedText(String(state.url ?? ""), 8192),
         lastTitle: boundedText(String(state.title ?? ""), 1024),
         canGoBack: Boolean(state.canGoBack),
@@ -856,6 +1147,7 @@ export class SessionManager {
         error: null,
         archived: false,
         gesture: null,
+        humanInputAdmission: null,
         inputGeneration: typeof state.inputGeneration === "string" ? state.inputGeneration : null,
       };
     } catch (error) {
@@ -871,6 +1163,32 @@ export class SessionManager {
   ): Promise<JsonValue> {
     if (session.archived) throw new Error("Workspace was archived");
     return this.client.requestWorkspace(session.workspaceId, operation, input);
+  }
+
+  /** Cleanup depends on viewer ownership, never on whether capture produced pixels. */
+  private async stopUnusedVideo(session: BrowserSession): Promise<void> {
+    if (session.viewers.size !== 0) return;
+    session.videoLifetime?.cancel();
+    await this.request(session, "video.stop", null).catch(() => undefined);
+    this.invalidateFrames(session);
+  }
+
+  /** Recheck leases under the same session queue before stopping optional capture. */
+  private armVideoLifetime(session: BrowserSession): void {
+    session.videoLifetime ??= createViewerCaptureLifetime({
+      now: this.now,
+      latestExpiry: () =>
+        session.viewers.size > 0
+          ? Math.max(...[...session.viewers.values()].map((viewer) => viewer.expiresAt))
+          : null,
+      onExpired: () =>
+        this.serialize(session, async () => {
+          if (this.sessions.get(session.workspaceId) !== session || session.archived) return;
+          this.pruneExpired(session);
+          await this.stopUnusedVideo(session);
+        }),
+    });
+    session.videoLifetime.arm();
   }
 
   private requireViewer(token: string): BrowserSession {
@@ -894,6 +1212,7 @@ export class SessionManager {
     const now = this.now();
     for (const [token, viewer] of session.viewers)
       if (viewer.expiresAt <= now) {
+        if (session.humanInputAdmission?.viewerToken === token) session.humanInputAdmission = null;
         session.viewers.delete(token);
         this.viewerSessions.delete(token);
       }
@@ -901,6 +1220,7 @@ export class SessionManager {
       session.controller &&
       (session.controller.expiresAt <= now || !session.viewers.has(session.controller.viewerToken))
     ) {
+      session.humanInputAdmission = null;
       session.controller = null;
       void this.serialize(session, () => this.cancelGesture(session)).catch(() => undefined);
     }
@@ -987,6 +1307,7 @@ export class SessionManager {
           (session) =>
             session.sessionId === token ||
             session.controller?.controlToken === token ||
+            session.humanInputAdmission?.frameId === token ||
             session.recentFrames.has(token),
         )
       )
@@ -1008,8 +1329,12 @@ export class SessionManager {
     return result;
   }
   private invalidateFrames(session: BrowserSession): void {
+    session.frameRevision += 1;
+    session.videoNotBefore = this.now();
+    session.videoInputNotBefore = session.videoNotBefore;
     session.frameCache.clear();
     session.recentFrames.clear();
+    session.videoReceipts.clear();
   }
 
   private async frameForQuality(
@@ -1099,7 +1424,22 @@ export class SessionManager {
     return frame;
   }
 
-  private rememberFrame(session: BrowserSession, frame: BrowserFrame): void {
+  /** Native source clocks have bounded uncertainty. Displaying a late packet
+   * must never resurrect the press token revoked by acknowledged live input.
+   * JPEG receipts retain the runtime's existing post-input capture-generation fence. */
+  private rememberFrame(
+    session: BrowserSession,
+    frame: BrowserFrameAuthority,
+    nativeVideo = false,
+  ): void {
+    if (nativeVideo && session.videoInputNotBefore > 0) {
+      const capturedAt = Date.parse(frame.capturedAt);
+      const exclusiveFloor = session.videoInputNotBefore + VIDEO_SOURCE_CLOCK_TOLERANCE_MS;
+      if (!Number.isFinite(capturedAt) || capturedAt <= exclusiveFloor) {
+        session.recentFrames.delete(frame.frameId);
+        return;
+      }
+    }
     this.pruneRecentFrames(session);
     session.recentFrames.set(frame.frameId, {
       navigationGeneration: frame.navigationGeneration,
@@ -1185,13 +1525,16 @@ export class SessionManager {
     }
   }
 
-  private async refreshPageMetadata(session: BrowserSession): Promise<void> {
-    const raw = asRecord(await this.request(session, "state", null));
+  private async refreshPageMetadata(session: BrowserSession, timeoutMs?: number): Promise<void> {
+    const raw = asRecord(
+      await this.request(session, "state", timeoutMs === undefined ? null : { timeoutMs }),
+    );
     const url = boundedText(String(raw.url ?? ""), 8192);
     const inputGeneration = typeof raw.inputGeneration === "string" ? raw.inputGeneration : null;
     const documentChanged =
       session.inputGeneration !== null && inputGeneration !== session.inputGeneration;
     if ((session.lastUrl && session.lastUrl !== url) || documentChanged) {
+      session.humanInputAdmission = null;
       await this.cancelGesture(session);
       session.navigationGeneration += 1;
       this.invalidateFrames(session);
@@ -1203,15 +1546,26 @@ export class SessionManager {
     session.canGoForward = Boolean(raw.canGoForward);
   }
 
-  private async snapshotState(session: BrowserSession, viewerToken: string): Promise<BrowserState> {
+  private async snapshotState(
+    session: BrowserSession,
+    viewerToken: string,
+    timeoutMs?: number,
+  ): Promise<BrowserState> {
     this.pruneExpired(session);
     if (!session.viewers.has(viewerToken)) throw new Error("Viewer token is invalid or expired");
     try {
-      await this.refreshPageMetadata(session);
+      await this.refreshPageMetadata(session, timeoutMs);
       session.error = null;
     } catch (error) {
       session.error = boundedText(error instanceof Error ? error.message : String(error), 2048);
     }
+    return this.projectState(session, viewerToken);
+  }
+
+  /** Project the last reconciled state without a page RPC. Media generations independently fence late pixels. */
+  private projectState(session: BrowserSession, viewerToken: string): BrowserState {
+    this.pruneExpired(session);
+    if (!session.viewers.has(viewerToken)) throw new Error("Viewer token is invalid or expired");
     const controller = session.controller;
     const controllerViewer = controller ? session.viewers.get(controller.viewerToken) : null;
     return {

@@ -1,7 +1,9 @@
 /**
  * Ordered, bounded live browser input. A channel starts from decoded front-frame
- * authority; its own motion continues with opaque server identity/sequence. Only
- * replaceable motion with unchanged pressed identities and wheel deltas coalesce.
+ * authority. All subsequent physical edges continue on exact control/document/
+ * geometry with opaque server identity/sequence. A successful admission basis
+ * survives normal idle closure for same-context reopening, never errors or drift.
+ * Only replaceable motion with unchanged pressed identities and wheel deltas coalesce.
  * Press/release and touch identity changes remain ordered. No uncertain mutation is replayed.
  */
 import type { RpcInput, RpcOutput } from "@getpaseo/plugin";
@@ -15,6 +17,8 @@ import type {
 } from "../shared/browser";
 
 export type BrowserGestureAuthority = Omit<RpcInput<typeof beginBrowserGestureRpc>, "pointerKind">;
+/** Control incarnation for an already admitted opaque channel, with no frame receipt. */
+export type BrowserGestureControl = Omit<BrowserGestureAuthority, "target">;
 export type BrowserGesturePoint = Extract<BrowserGestureEvent, { kind: "move" }>["point"];
 export type BrowserTouchPoint = Extract<BrowserGestureEvent, { kind: "touch" }>["points"][number];
 /** Preserve the admission union while using schema-normalized state defaults. */
@@ -39,13 +43,15 @@ export interface BrowserGestureTransport {
 interface QueueOptions {
   transport: BrowserGestureTransport;
   authority(): BrowserGestureAuthority | null;
+  /** Exact channel/grant continuity. First admission requires authority(); only an ACKed same-context basis can reopen. */
+  controlAuthority?(): BrowserGestureControl | null;
   onState(state: BrowserState): void;
   onCursor(cursor: BrowserCursor | null): void;
   onError(error: unknown): void;
   onFinish(): void;
   /** Reset local held contacts after an acknowledged navigation, without cancelling this queue again. */
   onNavigationComplete?(): void;
-  /** Resolves only after a different decoded front frame commits, not after a timer. */
+  /** Resolves only after a different actionable decoded receipt commits, never visual-only pixels or a timer. */
   waitForFrame?(afterFrameId: string, maxWaitMs?: number): Promise<void>;
 }
 type Command = { event: BrowserGestureEvent } | { end: true };
@@ -64,7 +70,7 @@ const MAX_FRAME_ADMISSION_ATTEMPTS = 3;
 const FRAME_ADMISSION_WAIT_MS = 4_000;
 
 /** Compare control/route incarnation, never the changing decoded frame identity. */
-function sameAuthority(a: BrowserGestureAuthority, b: BrowserGestureAuthority | null): boolean {
+function sameAuthority(a: BrowserGestureControl, b: BrowserGestureControl | null): boolean {
   return Boolean(
     b &&
       a.viewerToken === b.viewerToken &&
@@ -83,13 +89,6 @@ function transportContext(authority: BrowserGestureAuthority) {
     expected: authority.expected,
   };
 }
-function needsFreshPress(event: BrowserGestureEvent, channel: Channel): boolean {
-  return (
-    event.kind === "down" ||
-    (event.kind === "touch" && event.type === "start" && channel.touchCount === 0)
-  );
-}
-
 /** A qualified reply completes old input; it never authorizes input on the new page. */
 function isAcknowledgedNavigation(original: BrowserGestureAuthority, state: BrowserState): boolean {
   return (
@@ -109,9 +108,12 @@ export function createBrowserInputQueue(options: QueueOptions) {
   let running = false;
   let channel: Channel | null = null;
   let commands: Command[] = [];
-  let invalidatedFrameId: string | null = null;
+  // Only an acknowledged begin grants this geometry basis. Visual pixels never
+  // renew it; normal idle closure retains it for same-document channel reopening.
+  let admittedBasis: BrowserGestureAuthority | null = null;
 
   const cancelChannel = async (old: Channel) => {
+    admittedBasis = null;
     try {
       await options.transport.end({
         ...transportContext(old.authority),
@@ -127,11 +129,29 @@ export function createBrowserInputQueue(options: QueueOptions) {
   const cancel = () => {
     epoch += 1;
     commands = [];
-    invalidatedFrameId = null;
+    admittedBasis = null;
     const old = channel;
     channel = null;
     options.onCursor(null);
     if (old && !running) void cancelChannel(old);
+  };
+
+  /** Read target-free continuity only when the caller explicitly provides it. */
+  const currentControl = () => {
+    if (options.controlAuthority) return options.controlAuthority();
+    return options.authority();
+  };
+
+  const admissionAuthority = () => {
+    const control = currentControl();
+    if (!control) {
+      admittedBasis = null;
+      return null;
+    }
+    if (admittedBasis && sameAuthority(admittedBasis, control)) return admittedBasis;
+    admittedBasis = null;
+    const decoded = options.authority();
+    return decoded && sameAuthority(decoded, control) ? decoded : null;
   };
 
   const drain = async () => {
@@ -148,6 +168,9 @@ export function createBrowserInputQueue(options: QueueOptions) {
           // A pointer release must not release a still-held keyboard chord.
           if (owned.heldKeys.size || owned.heldButtons.size || owned.touchCount) continue;
           const ending = owned;
+          if (!sameAuthority(ending.authority, currentControl())) {
+            throw new Error("Browser input context changed. Release the gesture and try again.");
+          }
           const result = await options.transport.end({
             ...transportContext(ending.authority),
             gestureId: ending.gestureId,
@@ -156,10 +179,9 @@ export function createBrowserInputQueue(options: QueueOptions) {
           });
           owned = null;
           channel = null;
-          if (currentEpoch !== epoch || !sameAuthority(ending.authority, options.authority()))
-            break;
+          if (currentEpoch !== epoch || !sameAuthority(ending.authority, currentControl())) break;
           options.onState(result.state);
-          if (!sameAuthority(ending.authority, options.authority())) {
+          if (!sameAuthority(ending.authority, currentControl())) {
             throw new Error("Browser input context changed. Release the gesture and try again.");
           }
           // Normal channel completion keeps the last qualified hover cursor.
@@ -169,38 +191,46 @@ export function createBrowserInputQueue(options: QueueOptions) {
           continue;
         }
 
-        let current = options.authority();
-        if (!current) throw new Error("A decoded frame and active browser control are required.");
+        let current = admissionAuthority();
+        const control = currentControl();
+        if (!control) throw new Error("Active browser control is required.");
         const pointerKind =
           command.event.kind === "touch"
             ? "touch"
             : command.event.kind === "key" || command.event.kind === "text"
               ? (owned?.pointerKind ?? "mouse")
               : "mouse";
-        if (owned && !sameAuthority(owned.authority, current)) {
+        if (owned && !sameAuthority(owned.authority, control)) {
           throw new Error("Browser input context changed. Release the gesture and try again.");
         }
         if (owned && owned.pointerKind !== pointerKind) {
           // Changing input devices is ordinary on touch laptops. Close only this
           // exact old channel before sending the still-unsent event on a new one.
-          await cancelChannel(owned);
+          if (owned.heldButtons.size || owned.heldKeys.size || owned.touchCount) {
+            await cancelChannel(owned);
+          } else {
+            // Empty mouse/touch modality changes retain only ACKed same-context
+            // geometry. Unknown closure still clears it through the error path.
+            const result = await options.transport.end({
+              ...transportContext(owned.authority),
+              gestureId: owned.gestureId,
+              sequence: owned.sequence,
+              cancel: false,
+            });
+            if (currentEpoch !== epoch || !sameAuthority(owned.authority, currentControl())) break;
+            options.onState(result.state);
+          }
           owned = null;
           channel = null;
           if (currentEpoch !== epoch) break;
-          if (!sameAuthority(current, options.authority())) {
+          if (!sameAuthority(control, currentControl())) {
             throw new Error("Browser input context changed. Release the gesture and try again.");
           }
         }
         if (!owned) {
+          current = admissionAuthority();
+          if (!current) throw new Error("A decoded frame and active browser control are required.");
           const admissionDeadline = Date.now() + FRAME_ADMISSION_WAIT_MS;
-          if (invalidatedFrameId === current.target.frameId && options.waitForFrame) {
-            const waitingAuthority = current;
-            await options.waitForFrame(current.target.frameId, FRAME_ADMISSION_WAIT_MS);
-            if (currentEpoch !== epoch) break;
-            current = options.authority();
-            if (!sameAuthority(waitingAuthority, current)) break;
-            if (!current) throw new Error("Browser input context changed.");
-          }
           for (let attempt = 0; attempt < MAX_FRAME_ADMISSION_ATTEMPTS; attempt += 1) {
             if (Date.now() >= admissionDeadline) break;
             const sentAuthority = current;
@@ -216,11 +246,12 @@ export function createBrowserInputQueue(options: QueueOptions) {
                 touchCount: 0,
               };
             }
-            if (currentEpoch !== epoch || !sameAuthority(sentAuthority, options.authority())) break;
+            if (currentEpoch !== epoch || !sameAuthority(sentAuthority, currentControl())) break;
             options.onState(result.state);
-            if (!sameAuthority(sentAuthority, options.authority())) break;
+            if (!sameAuthority(sentAuthority, currentControl())) break;
             if (owned) {
               channel = owned;
+              admittedBasis = sentAuthority;
               break;
             }
             // Only this validated non-publication receipt permits another begin.
@@ -229,7 +260,7 @@ export function createBrowserInputQueue(options: QueueOptions) {
             if (attempt === MAX_FRAME_ADMISSION_ATTEMPTS - 1) break;
             options.onFinish();
             const latest = options.authority();
-            if (latest?.target.frameId === sentAuthority.target.frameId) {
+            if (!latest || latest.target.frameId === sentAuthority.target.frameId) {
               if (!options.waitForFrame) throw new Error("Waiting for a current decoded frame.");
               const remaining = admissionDeadline - Date.now();
               if (remaining <= 0) break;
@@ -241,34 +272,18 @@ export function createBrowserInputQueue(options: QueueOptions) {
               throw new Error("Browser input context changed. Release the gesture and try again.");
             }
           }
-          if (currentEpoch !== epoch || !sameAuthority(current, options.authority())) break;
+          if (currentEpoch !== epoch || !sameAuthority(current, currentControl())) break;
           if (!owned)
             throw new Error(
               "Waiting for a current decoded frame. Release the gesture and try again.",
             );
         }
 
-        let fresh = options.authority();
-        if (
-          needsFreshPress(command.event, owned) &&
-          fresh &&
-          invalidatedFrameId === fresh.target.frameId &&
-          options.waitForFrame
-        ) {
-          await options.waitForFrame(fresh.target.frameId);
-          if (currentEpoch !== epoch) break;
-          fresh = options.authority();
-        }
-        if (!sameAuthority(owned.authority, fresh)) {
+        // Initial decoded admission pins this human channel. Subsequent physical
+        // edges use that exact control/document/geometry, without waiting for pixels.
+        if (!sameAuthority(owned.authority, currentControl())) {
           throw new Error("Browser input context changed. Release the gesture and try again.");
         }
-        if (
-          (command.event.kind !== "move" && command.event.kind !== "leave") ||
-          owned.heldButtons.size > 0
-        ) {
-          invalidatedFrameId = fresh?.target.frameId ?? null;
-        }
-        const requiresTarget = needsFreshPress(command.event, owned);
         if (command.event.kind === "key" && command.event.type === "down")
           owned.heldKeys.add(command.event.code);
         if (command.event.kind === "key" && command.event.type === "up")
@@ -282,10 +297,9 @@ export function createBrowserInputQueue(options: QueueOptions) {
           gestureId: owned.gestureId,
           sequence: owned.sequence,
           event: command.event,
-          ...(requiresTarget && fresh ? { target: fresh.target } : {}),
         });
         owned.sequence = result.nextSequence;
-        if (currentEpoch !== epoch || !sameAuthority(owned.authority, options.authority())) break;
+        if (currentEpoch !== epoch || !sameAuthority(owned.authority, currentControl())) break;
         if (result.gestureId !== owned.gestureId)
           throw new Error("Browser gesture identity changed.");
         if (result.completion === "navigation") {
@@ -300,7 +314,7 @@ export function createBrowserInputQueue(options: QueueOptions) {
           // new state, which intentionally invalidates the old decoded frame.
           epoch += 1;
           commands = [];
-          invalidatedFrameId = null;
+          admittedBasis = null;
           channel = null;
           owned = null;
           options.onCursor(null);
@@ -310,7 +324,7 @@ export function createBrowserInputQueue(options: QueueOptions) {
           break;
         }
         options.onState(result.state);
-        if (!sameAuthority(owned.authority, options.authority())) {
+        if (!sameAuthority(owned.authority, currentControl())) {
           throw new Error("Browser input context changed. Release the gesture and try again.");
         }
         options.onCursor(result.cursor);
@@ -320,14 +334,12 @@ export function createBrowserInputQueue(options: QueueOptions) {
         epoch += 1;
         commands = [];
         channel = null;
+        admittedBasis = null;
         options.onCursor(null);
         options.onError(error);
       }
     } finally {
-      if (
-        owned &&
-        (currentEpoch !== epoch || !sameAuthority(owned.authority, options.authority()))
-      ) {
+      if (owned && (currentEpoch !== epoch || !sameAuthority(owned.authority, currentControl()))) {
         if (currentEpoch === epoch) {
           epoch += 1;
           commands = [];
@@ -342,7 +354,10 @@ export function createBrowserInputQueue(options: QueueOptions) {
   };
 
   const enqueue = (event: BrowserGestureEvent) => {
-    if (!options.authority()) return false;
+    if (channel ? !sameAuthority(channel.authority, currentControl()) : !admissionAuthority()) {
+      cancel();
+      return false;
+    }
     // Keep leave behind the queued release, ahead of normal channel cleanup.
     const trailing = commands.at(-1);
     if (event.kind === "leave" && trailing && "end" in trailing) commands.pop();
@@ -367,7 +382,11 @@ export function createBrowserInputQueue(options: QueueOptions) {
         previous.event = event;
         return true;
       }
-      if (event.kind === "scroll" && previous.event.kind === "scroll") {
+      if (
+        event.kind === "scroll" &&
+        previous.event.kind === "scroll" &&
+        event.modifiers === previous.event.modifiers
+      ) {
         const deltaX = previous.event.deltaX + event.deltaX;
         const deltaY = previous.event.deltaY + event.deltaY;
         if (Math.abs(deltaX) <= MAX_WHEEL_DELTA && Math.abs(deltaY) <= MAX_WHEEL_DELTA) {

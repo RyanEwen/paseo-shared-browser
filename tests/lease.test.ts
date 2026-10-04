@@ -164,6 +164,30 @@ function expected(state: {
 }
 
 describe("SessionManager control leases", () => {
+  it("viewer and status-only agent attachment do not start JPEG, but explicit image reads keep the shared frame path", async () => {
+    const { manager, client } = createManager();
+    const desktop = await manager.attach("workspace-one", "Desktop video viewer");
+    const phone = await manager.attach("workspace-one", "Phone image viewer");
+    const agent = await manager.attach("workspace-one", "Agent status viewer");
+    await manager.status(agent.viewerToken);
+    expect(client.operations.filter((call) => call.operation === "screencast.start")).toEqual([]);
+    await manager.capture(phone.viewerToken, "high", null);
+    await manager.capture(agent.viewerToken, "medium", null);
+    expect(
+      client.operations.filter((call) => call.operation === "frame").map((call) => call.input),
+    ).toEqual([
+      { maxBytes: 4 * 1024 * 1024, quality: 95, waitMs: 500 },
+      { maxBytes: 4 * 1024 * 1024, quality: 90, waitMs: 500 },
+    ]);
+    await manager.detach(desktop.viewerToken);
+    expect(client.operations.filter((call) => call.operation === "screencast.stop")).toEqual([]);
+    await manager.detach(phone.viewerToken);
+    await manager.detach(agent.viewerToken);
+    expect(client.operations.filter((call) => call.operation === "screencast.stop")).toHaveLength(
+      1,
+    );
+  });
+
   it("shares one runtime, excludes a second controller, and supports takeover", async () => {
     const { manager, client } = createManager();
     await manager.connect();
