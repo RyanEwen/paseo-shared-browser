@@ -146,9 +146,13 @@ User-supplied `AGENT_BROWSER_*` variables are deliberately ignored.
   with a sharper 824 × 1678 capture.
 - Desktop presets include 1920 × 1080 and 2560 × 1440 (16:9), 1920 × 1200 and
   2560 × 1600 (16:10), and 1920 × 1920 and 2560 × 2560 (1:1).
+- Desktop choices use height names such as 720p, 1080p, 1200p and 1440p, with
+  dimensions shown alongside. Square choices name their width explicitly.
+  The 1440-wide choices are 1440 × 810, 1440 × 900 and 1440 × 1440.
 - The Resolution and quality menu groups desktop choices by 16:9, 16:10 and 1:1,
   then mobile. Each group sorts by width. Filled stars mark favorites; the monitor
-  menu provides favorites and access to the full resolution and quality list.
+  menu provides favorites in that same grouped order and access to the full
+  resolution and quality list.
 - Monitor and browser actions open compact anchored menus rather than dialogs. Menus stay
   within the pane, scroll long lists, and dismiss with an outside press, Escape or native Back.
 - The monitor menu offers **Fit to panel** (default) and **Actual size (100%)**. Actual size
