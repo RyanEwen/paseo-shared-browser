@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { SessionManager } from "../server/browser";
 import type { JsonValue } from "../server/runtime-protocol";
+import { RuntimeProtocolError } from "../server/runtime-protocol";
 import type { SupervisorClient } from "../server/supervisor-client";
 
 interface FakeWorkspace {
@@ -76,6 +77,7 @@ class FakeSupervisorClient {
           title: workspace.title,
           canGoBack: false,
           canGoForward: false,
+          inputGeneration: "0:0",
         };
       case "navigate":
         workspace.url = String(data.url);
@@ -86,6 +88,8 @@ class FakeSupervisorClient {
       case "mouse.move":
       case "mouse.wheel":
       case "text.insert":
+      case "input.begin":
+      case "input.end":
       case "key.down":
       case "key.up":
         return null;
@@ -164,6 +168,93 @@ function expected(state: {
 }
 
 describe("SessionManager control leases", () => {
+  it("cleans an uncertain discrete press without replay and preserves its original error", async () => {
+    const { manager, client } = createManager();
+    const viewer = await manager.attach("workspace-one", "Agent");
+    const control = await manager.acquireControl(viewer.viewerToken);
+    const frame = (await manager.capture(viewer.viewerToken)).frame!;
+    const original = client.requestWorkspace.bind(client);
+    const unknown = new RuntimeProtocolError(
+      "UNKNOWN_OUTCOME",
+      "Original down acknowledgement lost",
+    );
+    client.requestWorkspace = async (workspaceId, operation, input) => {
+      const result = await original(workspaceId, operation, input);
+      if (operation === "key.down") throw unknown;
+      if (operation === "input.end") throw new Error("Cleanup acknowledgement lost");
+      return result;
+    };
+    await expect(
+      manager.sendInput({
+        viewerToken: viewer.viewerToken,
+        controlToken: control.controlToken,
+        expected: expected(control.state),
+        target: frame,
+        event: { kind: "key", key: "Enter" },
+      }),
+    ).rejects.toBe(unknown);
+    const operations = client.operations.filter((entry) =>
+      ["input.begin", "key.down", "input.end"].includes(entry.operation),
+    );
+    expect(operations.map((entry) => entry.operation)).toEqual([
+      "input.begin",
+      "key.down",
+      "input.end",
+    ]);
+    const begin = operations[0]!.input as { gestureId: string; expectedInputGeneration: string };
+    expect(begin.expectedInputGeneration).toBe("0:0");
+    expect(operations[2]!.input).toEqual({ gestureId: begin.gestureId });
+  });
+
+  for (const kind of ["key", "drag"] as const) {
+    it(`preserves uncertain ${kind} failure when paired release and channel end also fail`, async () => {
+      const { manager, client } = createManager();
+      const viewer = await manager.attach("workspace-one", "Agent");
+      const control = await manager.acquireControl(viewer.viewerToken);
+      const frame = (await manager.capture(viewer.viewerToken)).frame!;
+      const original = client.requestWorkspace.bind(client);
+      const unknown = new RuntimeProtocolError(
+        "UNKNOWN_OUTCOME",
+        "Original held-input outcome unknown",
+      );
+      const cleanup = kind === "key" ? "key.up" : "mouse.up";
+      let pressed = false;
+      let moves = 0;
+      client.requestWorkspace = async (workspaceId, operation, input) => {
+        const result = await original(workspaceId, operation, input);
+        if (operation === "key.down" || operation === "mouse.down") pressed = true;
+        if (
+          (kind === "key" && pressed && operation === "state") ||
+          (kind === "drag" && operation === "mouse.move" && ++moves === 2)
+        )
+          throw unknown;
+        if (operation === cleanup || operation === "input.end")
+          throw new Error("Secondary cleanup failed");
+        return result;
+      };
+      const point = { x: 10, y: 10, width: 1280, height: 800 };
+      await expect(
+        manager.sendInput({
+          viewerToken: viewer.viewerToken,
+          controlToken: control.controlToken,
+          expected: expected(control.state),
+          target: frame,
+          event:
+            kind === "key"
+              ? { kind: "key", key: "Enter" }
+              : { kind: "drag", button: "left", start: point, end: { ...point, x: 20, y: 20 } },
+        }),
+      ).rejects.toBe(unknown);
+      expect(client.operations.filter((entry) => entry.operation === cleanup)).toHaveLength(1);
+      expect(client.operations.filter((entry) => entry.operation === "input.end")).toHaveLength(1);
+      expect(
+        client.operations.filter(
+          (entry) => entry.operation === (kind === "key" ? "key.down" : "mouse.down"),
+        ),
+      ).toHaveLength(1);
+    });
+  }
+
   it("viewer and status-only agent attachment do not start JPEG, but explicit image reads keep the shared frame path", async () => {
     const { manager, client } = createManager();
     const desktop = await manager.attach("workspace-one", "Desktop video viewer");

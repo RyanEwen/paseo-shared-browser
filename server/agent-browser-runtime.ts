@@ -1344,19 +1344,28 @@ export class AgentBrowserRuntime {
     if (parsed.type === "up") this.heldKeys.delete(parsed.code);
   }
 
-  async keyDown(key: string, code = key): Promise<void> {
+  /** Track intent before publication. Internal discrete presses can use the
+   * same opaque channel as live input so a lost ACK retains original-page cleanup. */
+  async keyDown(key: string, code = key, gestureId?: string): Promise<void> {
+    if (gestureId) await this.assertLiveInput(gestureId);
     this.assertHeldKeyCapacity(code);
     this.heldKeys.set(code, { key, code });
-    await this.dispatchInput("Input.dispatchKeyEvent", {
-      type: "keyDown",
-      key,
-      code,
-      text: key.length === 1 ? key : undefined,
-    });
+    await this.dispatchInput(
+      "Input.dispatchKeyEvent",
+      {
+        type: "keyDown",
+        key,
+        code,
+        text: key.length === 1 ? key : undefined,
+      },
+      gestureId,
+    );
   }
 
-  async keyUp(key: string, code = key): Promise<void> {
-    await this.dispatchInput("Input.dispatchKeyEvent", { type: "keyUp", key, code });
+  /** Release on a current channel; its end cleanup still owns the original
+   * page if navigation or attachment loss prevents this ordinary key-up. */
+  async keyUp(key: string, code = key, gestureId?: string): Promise<void> {
+    await this.dispatchInput("Input.dispatchKeyEvent", { type: "keyUp", key, code }, gestureId);
     this.heldKeys.delete(code);
   }
 

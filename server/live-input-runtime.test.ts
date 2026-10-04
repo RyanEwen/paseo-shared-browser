@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MAX_HELD_BROWSER_KEYS } from "../shared/browser";
 import { AgentBrowserRuntime } from "./agent-browser-runtime";
+import { CdpUnknownOutcomeError } from "./cdp";
 import { createRuntimeOwner } from "./runtime-owner";
 
 /** Exercise native publication/cleanup without starting Chromium or touching any profile. */
@@ -59,6 +60,35 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 describe("runtime-owned live input", () => {
+  it("releases a discrete unknown-down only on its captured original page", async () => {
+    const state = fixture();
+    await state.begin("internal-discrete");
+    const unknown = new CdpUnknownOutcomeError("Down acknowledgement lost");
+    state.intercept(async (method) => {
+      if (method === "Input.dispatchKeyEvent") throw unknown;
+    });
+    await expect(state.runtime.keyDown("Control", "Control", "internal-discrete")).rejects.toBe(
+      unknown,
+    );
+    state.intercept(async () => {});
+    const replacementCalls: string[] = [];
+    state.control.page = {
+      ...state.page,
+      send: async (method: string) => {
+        replacementCalls.push(method);
+        return {};
+      },
+    };
+    state.control.attachmentGeneration++;
+    await state.runtime.endLiveInput("internal-discrete");
+    expect(
+      state.calls
+        .filter((entry) => entry.method === "Input.dispatchKeyEvent")
+        .map((entry) => entry.params.type),
+    ).toEqual(["keyDown", "keyUp"]);
+    expect(replacementCalls).toEqual([]);
+  });
+
   for (const counter of ["documentGeneration", "attachmentGeneration"] as const) {
     it(`refuses ${counter} drift during page attachment before admitting input`, async () => {
       const state = fixture();

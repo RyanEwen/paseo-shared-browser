@@ -1,19 +1,19 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { chmod, mkdir, open, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer, type Socket } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import type {
-  BrowserFrame,
-  BrowserInputEvent,
-  BrowserState,
-  DevicePresetId,
-  Viewport,
-} from "../shared/browser";
+import type { ZodType } from "zod";
+import type { BrowserFrame, BrowserState } from "../shared/browser";
 import {
+  applyDevicePresetRpc,
   beginBrowserGestureRpc,
   captureBrowserRpc,
   endBrowserGestureRpc,
+  navigateBrowserRpc,
+  resizeBrowserRpc,
+  sendBrowserInputRpc,
   setCaptureDensityRpc,
   updateBrowserGestureRpc,
 } from "../shared/browser";
@@ -98,6 +98,14 @@ interface AgentBinding {
   lastFrame: BrowserFrame | null;
 }
 
+/** Pair cleanup with a down acknowledged in this exact request/runtime. */
+interface AgentPublicationContext {
+  binding: AgentBinding;
+  keys: Map<string, RuntimeInstance>;
+  buttons: Map<string, RuntimeInstance>;
+  channels: Map<string, RuntimeInstance>;
+}
+
 export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance> {
   private readonly owner: RuntimeOwner<Runtime>;
   private readonly now: () => number;
@@ -112,6 +120,7 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
   private readonly workspaceOperations = new Map<string, Promise<void>>();
   private readonly archived = new Set<string>();
   private readonly browserPolicy: SessionManager;
+  private readonly agentRequestContext = new AsyncLocalStorage<AgentPublicationContext>();
   private readonly agentBindings = new Map<string, AgentBinding>();
   private readonly agentTickets = new Map<string, Set<string>>();
   private activeBridge: ActiveBridge | null = null;
@@ -262,6 +271,9 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
     operation: string,
     input: JsonValue,
   ): Promise<JsonValue> {
+    // Capture the caller before entering the workspace tail. Revocation must
+    // fence queued native publication, not only the initial ticket lookup.
+    const agent = this.agentRequestContext.getStore();
     const execute = async () => {
       if (this.archived.has(workspaceId)) this.workspaceArchived(workspaceId);
       const entry = this.workspaces.get(workspaceId);
@@ -270,8 +282,32 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
           "WORKSPACE_NOT_FOUND",
           `Workspace runtime not found: ${workspaceId}`,
         );
+      const data = input && typeof input === "object" && !Array.isArray(input) ? input : {};
+      const key = typeof data.key === "string" ? data.key : "";
+      const button = typeof data.button === "string" ? data.button : "";
+      const channelId = typeof data.gestureId === "string" ? data.gestureId : "";
+      const pairedRelease =
+        agent &&
+        ((operation === "key.up" && agent.keys.get(key) === entry.runtime) ||
+          (operation === "mouse.up" && agent.buttons.get(button) === entry.runtime) ||
+          (operation === "input.end" && agent.channels.get(channelId) === entry.runtime));
+      if (agent && !pairedRelease) this.assertAgentBindingCurrent(agent.binding);
+      // A lost down/begin ACK still requires cleanup. Record intent only after
+      // the current binding fence, immediately before native publication.
+      if (agent) {
+        if (operation === "key.down") agent.keys.set(key, entry.runtime);
+        if (operation === "mouse.down") agent.buttons.set(button, entry.runtime);
+        if (operation === "input.begin") agent.channels.set(channelId, entry.runtime);
+      }
       try {
         const result = await this.owner.request(entry.runtime, operation, input);
+        // Revocation blocks new publication, but never strands a possibly published press.
+        // These records allow only its policy-generated paired release, on the
+        // original runtime, before the outer request refuses its revoked result.
+        if (agent) {
+          if (operation === "key.up") agent.keys.delete(key);
+          if (operation === "mouse.up") agent.buttons.delete(button);
+        }
         if (this.archived.has(workspaceId)) this.workspaceArchived(workspaceId);
         if (this.workspaces.get(workspaceId) !== entry)
           throw new RuntimeProtocolError("RUNTIME_FAILURE", "Video runtime was replaced");
@@ -287,6 +323,8 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
           "RUNTIME_FAILURE",
           `Workspace runtime ${operation} failed: ${error instanceof Error ? error.message : String(error)}`,
         );
+      } finally {
+        if (agent && operation === "input.end") agent.channels.delete(channelId);
       }
     };
     return operation === "video.read"
@@ -465,34 +503,53 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
     this.assertActiveBridge(bridgeId, epoch);
     const tickets = this.agentTickets.get(agentId);
     if (!tickets) return { revoked: 0 };
+    const viewers: string[] = [];
     let revoked = 0;
+    // Remove every credential synchronously before waiting on viewer cleanup.
     for (const ticket of tickets) {
       const binding = this.agentBindings.get(ticket);
       if (!binding) continue;
       this.agentBindings.delete(ticket);
       revoked += 1;
-      if (binding.viewerToken)
-        await this.browserPolicy.detach(binding.viewerToken).catch(() => undefined);
+      if (binding.viewerToken) viewers.push(binding.viewerToken);
     }
     this.agentTickets.delete(agentId);
+    await Promise.allSettled(viewers.map((viewerToken) => this.browserPolicy.detach(viewerToken)));
     return { revoked };
   }
 
-  private async requestAgent(
-    ticket: string,
+  /** Carry exact ticket identity through awaited policy and native publication. */
+  private requestAgent(ticket: string, operation: string, input: JsonValue): Promise<JsonValue> {
+    this.assertPluginAvailable();
+    const binding = this.requireAgentBinding(ticket);
+    const execute = () => this.executeAgentRequest(binding, operation, input);
+    // Attachment constructs shared session state; its late viewer is removed
+    // explicitly. Only actionable requests carry a native publication fence.
+    if (operation === "status" || operation === "capture" || operation === "acquire-control") {
+      return execute();
+    }
+    return this.agentRequestContext.run(
+      { binding, keys: new Map(), buttons: new Map(), channels: new Map() },
+      execute,
+    );
+  }
+
+  private async executeAgentRequest(
+    binding: AgentBinding,
     operation: string,
     input: JsonValue,
   ): Promise<JsonValue> {
-    this.assertPluginAvailable();
-    const binding = this.requireAgentBinding(ticket);
+    this.assertAgentBindingCurrent(binding);
     const data = asObject(input);
     if (operation === "status" || operation === "capture")
       return (await this.requestAgentObservation(binding, operation, data)) as unknown as JsonValue;
     try {
       if (operation === "acquire-control") {
         await this.requestAgentObservation(binding, "status", {});
+        this.assertAgentBindingCurrent(binding);
         const viewerToken = binding.viewerToken!;
         const result = await this.browserPolicy.acquireControl(viewerToken, false);
+        this.assertAgentBindingCurrent(binding);
         binding.controlToken = result.controlToken;
         binding.lastState = result.state;
         return { state: result.state } as unknown as JsonValue;
@@ -513,42 +570,52 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
           binding.controlToken = null;
         }
       }
+      this.assertAgentBindingCurrent(binding);
       const expected = expectedState(binding);
       let result: { state: BrowserState };
       if (operation === "navigate") {
-        result = await this.browserPolicy.navigate({
-          viewerToken,
-          controlToken,
-          expected,
-          action: data.action as never,
-        });
+        result = await this.browserPolicy.navigate(
+          parseAgentInput(navigateBrowserRpc.input, {
+            viewerToken,
+            controlToken,
+            expected,
+            action: data.action,
+          }),
+        );
       } else if (operation === "viewport") {
-        result = await this.browserPolicy.resize({
-          viewerToken,
-          controlToken,
-          expected,
-          viewport: data.viewport as Viewport,
-        });
+        result = await this.browserPolicy.resize(
+          parseAgentInput(resizeBrowserRpc.input, {
+            viewerToken,
+            controlToken,
+            expected,
+            viewport: data.viewport,
+          }),
+        );
       } else if (operation === "device") {
-        result = await this.browserPolicy.applyDevicePreset({
-          viewerToken,
-          controlToken,
-          expected,
-          presetId: data.presetId as DevicePresetId,
-        });
+        result = await this.browserPolicy.applyDevicePreset(
+          parseAgentInput(applyDevicePresetRpc.input, {
+            viewerToken,
+            controlToken,
+            expected,
+            presetId: data.presetId,
+          }),
+        );
       } else if (operation === "input") {
         if (!binding.lastFrame)
           throw new RuntimeProtocolError("INVALID_REQUEST", "Capture a frame before sending input");
-        result = await this.browserPolicy.sendInput({
-          viewerToken,
-          controlToken,
-          expected,
-          target: binding.lastFrame,
-          event: data.event as BrowserInputEvent,
-        });
+        result = await this.browserPolicy.sendInput(
+          parseAgentInput(sendBrowserInputRpc.input, {
+            viewerToken,
+            controlToken,
+            expected,
+            target: binding.lastFrame,
+            event: data.event,
+          }),
+        );
       } else {
         throw new RuntimeProtocolError("INVALID_REQUEST", `Unknown agent operation: ${operation}`);
       }
+      this.assertAgentBindingCurrent(binding);
       binding.lastState = result.state;
       binding.lastFrame = null;
       return result as unknown as JsonValue;
@@ -583,21 +650,47 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
       binding.controlToken = null;
       result = await run(await this.ensureAgentViewer(binding));
     }
+    this.assertAgentBindingCurrent(binding);
     binding.lastState = result.state;
     if (operation === "capture") binding.lastFrame = result.frame ?? null;
     return result;
   }
 
+  /** Publish an attached viewer only while its original credential still exists. */
   private async ensureAgentViewer(binding: AgentBinding): Promise<string> {
+    this.assertAgentBindingCurrent(binding);
     if (binding.viewerToken) return binding.viewerToken;
-    this.assertPluginAvailable();
     const attached = await this.browserPolicy.attach(
       binding.workspaceId!,
       `Agent ${binding.agentId!.slice(0, 48)}`,
     );
+    try {
+      this.assertAgentBindingCurrent(binding);
+    } catch (error) {
+      // Cleanup must run outside the revoked caller's publication fence.
+      await this.agentRequestContext
+        .exit(() => this.browserPolicy.detach(attached.viewerToken))
+        .catch(() => undefined);
+      throw error;
+    }
+    if (binding.viewerToken) {
+      // Parallel observations may both attach. Keep the first published viewer.
+      await this.agentRequestContext.exit(() => this.browserPolicy.detach(attached.viewerToken));
+      this.assertAgentBindingCurrent(binding);
+      return binding.viewerToken;
+    }
     binding.viewerToken = attached.viewerToken;
     binding.lastState = attached.state;
     return attached.viewerToken;
+  }
+
+  /** A deleted or replaced ticket cannot regain authority after an awaited step. */
+  private assertAgentBindingCurrent(binding: AgentBinding): void {
+    this.assertPluginAvailable();
+    if (this.agentBindings.get(binding.ticket) !== binding) {
+      throw new RuntimeProtocolError("AUTHENTICATION_FAILED", "Agent ticket was revoked");
+    }
+    if (this.archived.has(binding.workspaceId!)) this.workspaceArchived(binding.workspaceId!);
   }
 
   private requireAgentBinding(ticket: string): AgentBinding {
@@ -824,6 +917,16 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
     this.cancel(this.orphanTimer);
     this.orphanTimer = null;
   }
+}
+
+/** Raw agent sockets reuse the public mutation contract. Never expose parser
+ * issues or submitted values in errors from this trusted-ticket boundary. */
+function parseAgentInput<Value>(schema: ZodType<Value>, value: unknown): Value {
+  const parsed = schema.safeParse(value);
+  if (!parsed.success) {
+    throw new RuntimeProtocolError("INVALID_REQUEST", "Invalid agent browser request");
+  }
+  return parsed.data;
 }
 
 function asObject(value: JsonValue): Record<string, JsonValue> {
