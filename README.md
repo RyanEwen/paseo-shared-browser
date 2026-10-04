@@ -187,6 +187,8 @@ User-supplied `AGENT_BROWSER_*` variables are deliberately ignored.
 - Human control: **Take control**, **Release**, and **Take over** for explicit handoff. Agent MCP
   calls have no forced-takeover operation.
 - With control, mouse movement forwards real hover effects and standard browser cursor changes.
+  Automatic cursors resolve selectable text to an I-beam while respecting explicit
+  cursor styles and non-selectable areas.
   Wheel scrolling stays inside the browser canvas; held drags update before release. Leaving the
   canvas clears remote hover, while dragging beyond its edges still releases the held button.
 - Hidden Linux browsers use an authenticated private virtual display when `/usr/bin/Xvfb`

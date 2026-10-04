@@ -24,6 +24,7 @@ import {
   browserCursorSchema,
   browserGestureKeySchema,
 } from "../shared/browser";
+import { browserCursorExpression } from "./browser-cursor";
 import { GESTURE_IDLE_MS, GESTURE_LIFETIME_MS } from "./browser-gesture";
 import { CAPTURE_MAX_AGE_MS, createCaptureTransportPolicy } from "./capture-transport-policy";
 import { formatRuntimeInputGeneration } from "./input-generation";
@@ -1074,7 +1075,7 @@ export class AgentBrowserRuntime {
       await this.assertLiveInput(gestureId);
       const page = this.liveInput!.page;
       const result = await page.send<{ result: { value?: unknown } }>("Runtime.evaluate", {
-        expression: `(() => { const e = document.elementFromPoint(${x}, ${y}); return e ? getComputedStyle(e).cursor : null; })()`,
+        expression: browserCursorExpression(x, y),
         returnByValue: true,
       });
       await this.assertLiveInput(gestureId);
