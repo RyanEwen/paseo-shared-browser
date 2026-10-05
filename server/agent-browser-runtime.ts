@@ -291,6 +291,7 @@ export class AgentBrowserRuntime {
   } | null = null;
   private stopping = false;
   private video: NativeVideoCapture | null = null;
+  private videoRetirement: Promise<void> | null = null;
   private readonly videoRecovery = createVideoSourceRecovery();
   private videoTransitionDepth = 0;
   private videoTransitionEpoch = 0;
@@ -791,7 +792,7 @@ export class AgentBrowserRuntime {
     // resumes from current configuration instead of treating idle expiry as a
     // permanent codec failure or creating a replacement while the old track closes.
     if (this.video?.idleExpired) {
-      await this.stopVideo();
+      this.retireVideoForRead();
       return this.videoReset();
     }
 
@@ -851,7 +852,7 @@ export class AgentBrowserRuntime {
       // track while the failed source/helper is still being retired.
       this.videoRecovery.failed(recoveryContext, video.sourceFailure);
       const permanent = video.sourceFailure === "source-dimensions";
-      await this.stopVideo();
+      this.retireVideoForRead();
       if (
         this.stopping ||
         connection !== this.connection ||
@@ -884,8 +885,27 @@ export class AgentBrowserRuntime {
     this.video?.invalidateQueuedFrames();
   }
 
+  /** Establish the stop barrier now, but do not hold a viewing RPC across slow
+   * helper teardown. stopVideo owns barrier release; no replacement can start
+   * until it settles. Explicit stop callers still await their cleanup. */
+  private retireVideoForRead(): void {
+    const retirement = this.stopVideo();
+    this.videoRetirement = retirement;
+    const complete = () => {
+      if (this.videoRetirement === retirement) this.videoRetirement = null;
+    };
+    void retirement.then(complete, () => {
+      complete();
+      console.warn("[shared-browser] Video retirement failed");
+    });
+  }
+
   /** Stop admission too: a concurrent reader cannot replace a source still closing. */
   async stopVideo(): Promise<void> {
+    if (this.videoRetirement) {
+      await this.videoRetirement;
+      return;
+    }
     await this.withVideoTransition(async () => {});
   }
 

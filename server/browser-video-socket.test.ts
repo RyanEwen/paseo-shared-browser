@@ -9,7 +9,7 @@ import { RuntimeProtocolError } from "./runtime-protocol";
 import { resolveSupervisorPaths, startSupervisorServer } from "./supervisor";
 import { SupervisorClient } from "./supervisor-client";
 
-it("keeps authenticated input moving on the same socket while video waits", async () => {
+it("keeps video past unrelated teardown and input past video on the authenticated socket", async () => {
   const home = await mkdtemp(join(tmpdir(), "owned-video-socket-"));
   let release = () => {};
   let started = () => {};
@@ -20,6 +20,10 @@ it("keeps authenticated input moving on the same socket while video waits", asyn
   const arrived = new Promise<void>((resolve) => {
     started = resolve;
   });
+  const retirementGate = Promise.withResolvers<void>();
+  const retirementStarted = Promise.withResolvers<void>();
+  let blockRetirement = false;
+  let retirement: Promise<unknown> | null = null;
   const stateGate = Promise.withResolvers<void>();
   const inputPublished = Promise.withResolvers<void>();
   let blockState = false;
@@ -31,6 +35,10 @@ it("keeps authenticated input moving on the same socket while video waits", asyn
       stop: async () => {},
       request: async (_runtime, operation, parameters) => {
         calls.push(operation);
+        if (operation === "screencast.stop" && blockRetirement) {
+          retirementStarted.resolve();
+          await retirementGate.promise;
+        }
         if (operation === "identity") return { userAgent: "Owned fixture" };
         if (operation === "frame") {
           jpegQuality = (parameters as { quality?: unknown }).quality;
@@ -119,6 +127,27 @@ it("keeps authenticated input moving on the same socket while video waits", asyn
     expect(maximum.frame?.mimeType).toBe("image/jpeg");
     expect(jpegQuality).toBe(100);
     const initial = await client.requestBrowser<MediaReply>("video.read", input);
+    // Switching panels can retire one workspace while another keeps playing.
+    // Its native teardown must not occupy the shared socket's video lane.
+    const retiring = await client.requestBrowser<{ viewerToken: string }>("attach", {
+      workspaceId: "retiring",
+      viewerLabel: "Retiring fixture",
+    });
+    blockRetirement = true;
+    retirement = client.requestBrowser("detach", { viewerToken: retiring.viewerToken });
+    await retirementStarted.promise;
+    const independentRead = client.requestBrowser<MediaReply>("video.read", input);
+    const progressed = await Promise.race([
+      independentRead.then(() => true),
+      new Promise<boolean>((resolve) => {
+        timeout = setTimeout(() => resolve(false), 250);
+      }),
+    ]);
+    retirementGate.resolve();
+    await retirement;
+    await independentRead;
+    expect(progressed).toBe(true);
+    blockRetirement = false;
     const frame = initial.packets![0]!.frame;
     const stateReads = calls.filter((call) => call === "state").length;
     block = true;
@@ -157,6 +186,8 @@ it("keeps authenticated input moving on the same socket while video waits", asyn
     expect(calls.filter((call) => call === "state")).toHaveLength(finalStateReads);
   } finally {
     if (timeout) clearTimeout(timeout);
+    retirementGate.resolve();
+    await retirement?.catch(() => undefined);
     stateGate.resolve();
     release();
     await pending?.catch(() => undefined);

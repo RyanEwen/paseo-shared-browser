@@ -159,15 +159,29 @@ describe("native video runtime fence", () => {
       const former = fixture.captures[0]!;
       former.sourceFailure = "source-stopped";
       former.stop.mockImplementationOnce(() => release.promise);
-      const retirement = runtime.readVideo({ quality: "high", waitMs: 0 });
+      let settled = false;
+      const retirement = runtime.readVideo({ quality: "high", waitMs: 0 }).then((reply) => {
+        settled = true;
+        return reply;
+      });
       for (let i = 0; i < 10; i++) await Promise.resolve();
-      await vi.advanceTimersByTimeAsync(6000);
+      // Backend teardown can outlive the outer plugin RPC deadline. The reader
+      // must release its admission slot while replacement capture stays fenced.
+      await vi.advanceTimersByTimeAsync(35000);
+      expect(settled).toBe(true);
       const readers = await Promise.all(
         Array.from({ length: 8 }, () => runtime.readVideo({ quality: "high", waitMs: 0 })),
       );
       expect(readers.every((value) => value.status === "reset")).toBe(true);
       expect(fixture.captures).toHaveLength(1);
+      let cleanupSettled = false;
+      const cleanup = runtime.stopVideo().then(() => {
+        cleanupSettled = true;
+      });
+      await vi.advanceTimersByTimeAsync(1);
+      expect(cleanupSettled).toBe(false);
       release.resolve();
+      await cleanup;
       await retirement;
       await Promise.all(
         Array.from({ length: 8 }, () => runtime.readVideo({ quality: "high", waitMs: 0 })),
@@ -219,13 +233,20 @@ describe("native video runtime fence", () => {
     expired.idleExpired = true;
     const stopping = Promise.withResolvers<void>();
     expired.stop.mockImplementationOnce(() => stopping.promise);
-    const retirement = runtime.readVideo({ quality: "high", waitMs: 0 });
+    let settled = false;
+    const retirement = runtime.readVideo({ quality: "high", waitMs: 0 }).then((reply) => {
+      settled = true;
+      return reply;
+    });
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    expect(settled).toBe(true);
     expect(await runtime.readVideo({ quality: "high", waitMs: 0 })).toMatchObject({
       status: "reset",
       packets: [],
     });
     expect(fixture.captures).toHaveLength(1);
     stopping.resolve();
+    await runtime.stopVideo();
     expect(await retirement).toMatchObject({ status: "reset", packets: [] });
     await runtime.readVideo({ quality: "high", waitMs: 0 });
     expect(fixture.captures).toHaveLength(2);
@@ -249,6 +270,7 @@ describe("native video runtime fence", () => {
       status: "reset",
       packets: [],
     });
+    await runtime.stopVideo();
     await runtime.readVideo({ quality: "high", waitMs: 0 });
     expect(fixture.captures).toHaveLength(2);
     await runtime.stopVideo();

@@ -1113,7 +1113,9 @@ export async function startSupervisorServer<Runtime extends RuntimeInstance>(
           globalMediaInFlight += 1;
         }
       }
-      const before = concurrent === "heartbeat" ? Promise.resolve() : processing;
+      // Video admission/result fencing already belongs to each workspace's
+      // policy queue. Another workspace's teardown must not block that lane.
+      const before = concurrent === null ? processing : Promise.resolve();
       const execution = before
         .then(async () => {
           const { response, lease } = await handleLine(line, token, supervisor);

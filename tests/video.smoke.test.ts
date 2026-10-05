@@ -115,7 +115,8 @@ function ownedIpcDirectory(home: string): string {
   return join("/tmp", `paseo-shared-browser-${hash}`);
 }
 
-it("paints native video at genuine capture density", async () => {
+/** Prove mouse and native touch acknowledgements retain fresh encoded playback. */
+async function proveNativeVideo(pointerKind: "mouse" | "touch") {
   const preparedHome = process.env.PASEO_HOME ?? join(homedir(), ".paseo");
   const runtimeRoot = resolveBrowserRuntimeRoot(preparedHome);
   const binaryPath =
@@ -502,7 +503,7 @@ it("paints native video at genuine capture density", async () => {
     const gesture = await client.requestBrowser<{
       gestureId: string;
       nextSequence: number;
-    }>("gesture.begin", { ...clickContext, target: clickTarget, pointerKind: "mouse" });
+    }>("gesture.begin", { ...clickContext, target: clickTarget, pointerKind });
     expect(gesture.gestureId).toBeDefined();
     const pressed = await client.requestBrowser<{ state: BrowserState; nextSequence: number }>(
       "gesture.update",
@@ -511,12 +512,19 @@ it("paints native video at genuine capture density", async () => {
         gestureId: gesture.gestureId,
         sequence: gesture.nextSequence,
         target: clickTarget,
-        event: {
-          kind: "down",
-          point: { x: 350, y: 320, width: 1280, height: 800 },
-          button: "left",
-          clickCount: 1,
-        },
+        event:
+          pointerKind === "touch"
+            ? {
+                kind: "touch",
+                type: "start",
+                points: [{ id: 0, x: 350, y: 320, width: 1280, height: 800 }],
+              }
+            : {
+                kind: "down",
+                point: { x: 350, y: 320, width: 1280, height: 800 },
+                button: "left",
+                clickCount: 1,
+              },
       },
     );
     const released = await client.requestBrowser<{ state: BrowserState; nextSequence: number }>(
@@ -525,12 +533,15 @@ it("paints native video at genuine capture density", async () => {
         ...clickContext,
         gestureId: gesture.gestureId,
         sequence: pressed.nextSequence,
-        event: {
-          kind: "up",
-          point: { x: 350, y: 320, width: 1280, height: 800 },
-          button: "left",
-          clickCount: 1,
-        },
+        event:
+          pointerKind === "touch"
+            ? { kind: "touch", type: "end", points: [] }
+            : {
+                kind: "up",
+                point: { x: 350, y: 320, width: 1280, height: 800 },
+                button: "left",
+                clickCount: 1,
+              },
       },
     );
     const ended = await client.requestBrowser<{ state: BrowserState }>("gesture.end", {
@@ -604,4 +615,10 @@ it("paints native video at genuine capture density", async () => {
       }
     }
   }
-}, 30000);
+}
+
+it.each(["mouse", "touch"] as const)(
+  "paints native video at genuine capture density after %s input",
+  proveNativeVideo,
+  30000,
+);
