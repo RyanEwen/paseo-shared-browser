@@ -7,8 +7,9 @@ const managers: SessionManager[] = [];
 afterEach(() => {
   for (const manager of managers.splice(0)) manager.disconnect();
 });
-function fixture() {
+function fixture(monotonicStart?: number) {
   let now = Date.parse("2026-10-03T12:00:00.000Z");
+  let monotonicNow = monotonicStart ?? now;
   let token = 0;
   let generation = "1:1";
   let url = "https://fixture.invalid/";
@@ -22,7 +23,7 @@ function fixture() {
   let metadataError: Error | null = null;
   let duringMetadata: (() => void) | null = null;
   let capacity = false;
-  const packet: NativeVideoPacket = {
+  const packet: NativeVideoPacket & { capturedAtMonotonicMs: number } = {
     streamId: "v".repeat(32),
     captureGeneration: 1,
     sequence: 1,
@@ -32,6 +33,7 @@ function fixture() {
     width: 1280,
     height: 800,
     capturedAt: new Date(now).toISOString(),
+    capturedAtMonotonicMs: monotonicNow,
     dataBase64: "AA==",
   };
   const client: BrowserRuntimeClient = {
@@ -81,6 +83,7 @@ function fixture() {
     client,
     validateWorkspace: async () => true,
     now: () => now,
+    monotonicNow: () => monotonicNow,
     issueToken: () => `t${String(++token).padStart(32, "0")}`,
   });
   managers.push(manager);
@@ -107,6 +110,10 @@ function fixture() {
       duringMetadata = callback;
     },
     advance(ms: number) {
+      now += ms;
+      monotonicNow += ms;
+    },
+    shiftWall(ms: number) {
       now += ms;
     },
     change() {
@@ -349,6 +356,7 @@ describe("video authority", () => {
     f.advance(1001);
     expect((await f.manager.readVideo(input(a.viewerToken))).status).toBe("reset");
     f.packet.capturedAt = new Date(Date.parse(f.packet.capturedAt) + 1001).toISOString();
+    f.packet.capturedAtMonotonicMs += 1001;
     f.packet.width = 400;
     expect((await f.manager.readVideo(input(a.viewerToken))).status).toBe("reset");
   });
@@ -426,4 +434,130 @@ it("preserves the typed capacity fallback without issuing mutation packets", asy
   expect(reply.reasonCode).toBe("encoder-capacity");
   expect(reply.packets).toEqual([]);
   expect(f.calls.some((call) => call.startsWith("input."))).toBe(false);
+});
+
+it.each([-10_000, 10_000])(
+  "keeps fresh video admissible across a %i ms wall-clock correction",
+  async (jump) => {
+    const f = fixture();
+    const a = await f.manager.attach("workspace", "A");
+    f.shiftWall(jump);
+    const reply = await f.manager.readVideo(input(a.viewerToken));
+    expect(reply.status).toBe("ready");
+    expect(reply.packets).toHaveLength(1);
+    expect(reply.packets[0]).not.toHaveProperty("capturedAtMonotonicMs");
+    f.advance(1001);
+    expect((await f.manager.readVideo(input(a.viewerToken))).status).toBe("reset");
+  },
+);
+
+it.each([-10_000, 10_000])(
+  "preserves the post-action video fence across a %i ms wall-clock correction",
+  async (jump) => {
+    const f = fixture();
+    const a = await f.manager.attach("workspace", "A");
+    const control = await f.manager.acquireControl(a.viewerToken);
+    const initial = await f.manager.readVideo(input(a.viewerToken));
+    const frame = initial.packets[0]!.frame;
+    f.advance(1);
+    await f.manager.sendInput({
+      viewerToken: a.viewerToken,
+      controlToken: control.controlToken,
+      expected: initial.state,
+      target: frame,
+      event: { kind: "type", text: "owned fixture" },
+    });
+    f.shiftWall(jump);
+    // Even an apparently new wall timestamp cannot promote pre-action pixels.
+    f.packet.capturedAt = new Date(Date.parse(f.packet.capturedAt) + jump + 1).toISOString();
+    expect((await f.manager.readVideo(input(a.viewerToken))).status).toBe("reset");
+    f.advance(100);
+    f.packet.capturedAtMonotonicMs += 101;
+    f.packet.timestampUs += 101_000;
+    f.packet.sequence += 1;
+    expect((await f.manager.readVideo(input(a.viewerToken))).status).toBe("ready");
+  },
+);
+
+it.each([-10_000, 0, 10_000])(
+  "cannot restore pre-gesture input authority across a %i ms wall correction, including a zero elapsed fence",
+  async (jump) => {
+    const f = fixture(0);
+    const a = await f.manager.attach("workspace", "A");
+    const { controlToken } = await f.manager.acquireControl(a.viewerToken);
+    const initial = await f.manager.readVideo(input(a.viewerToken));
+    const target = initial.packets[0]!.frame;
+    const context = {
+      viewerToken: a.viewerToken,
+      controlToken,
+      expected: {
+        ...initial.state,
+        runtimeId: initial.state.runtimeId!,
+        bridgeEpoch: initial.state.bridgeEpoch!,
+      },
+    };
+    const begin = await f.manager.beginGesture({ ...context, target, pointerKind: "touch" });
+    if (!("gestureId" in begin)) throw new Error("Fixture input was not admitted");
+    const point = { x: 20, y: 20, width: 1280, height: 800 };
+    await f.manager.updateGesture({
+      ...context,
+      gestureId: begin.gestureId,
+      sequence: 1,
+      target,
+      event: { kind: "touch", type: "start", points: [{ ...point, id: 0 }] },
+    });
+    await f.manager.updateGesture({
+      ...context,
+      gestureId: begin.gestureId,
+      sequence: 2,
+      event: { kind: "touch", type: "end", points: [] },
+    });
+    await f.manager.endGesture({
+      ...context,
+      gestureId: begin.gestureId,
+      sequence: 3,
+      cancel: false,
+    });
+    f.shiftWall(jump);
+    // Re-reading the original receipt can display it, but cannot re-arm a discrete press.
+    const old = await f.manager.readVideo(input(a.viewerToken));
+    expect(old.status).toBe("ready");
+    expect(old.packets[0]!.frame.frameId).toBe(target.frameId);
+    await expect(
+      f.manager.sendInput({ ...context, target, event: { kind: "type", text: "old pixels" } }),
+    ).rejects.toThrow("frame is stale");
+    f.advance(100);
+    f.packet.capturedAtMonotonicMs = 100;
+    f.packet.sequence++;
+    f.packet.timestampUs += 100_000;
+    const fresh = await f.manager.readVideo(input(a.viewerToken));
+    await expect(
+      f.manager.sendInput({
+        ...context,
+        target: fresh.packets[0]!.frame,
+        event: { kind: "type", text: "fresh pixels" },
+      }),
+    ).resolves.toHaveProperty("state");
+  },
+);
+
+it("fails closed when private native timing is missing", async () => {
+  const f = fixture();
+  const a = await f.manager.attach("workspace", "A");
+  Reflect.deleteProperty(f.packet, "capturedAtMonotonicMs");
+  await expect(f.manager.readVideo(input(a.viewerToken))).rejects.toThrow("invalid video packet");
+});
+
+it("rejects future native time and refuses to re-stamp an existing receipt", async () => {
+  const f = fixture(0);
+  const a = await f.manager.attach("workspace", "A");
+  f.packet.capturedAtMonotonicMs = 51;
+  expect((await f.manager.readVideo(input(a.viewerToken))).status).toBe("reset");
+  f.packet.capturedAtMonotonicMs = 50;
+  const reply = await f.manager.readVideo(input(a.viewerToken));
+  expect(reply.status).toBe("ready");
+  expect(reply.packets[0]!.frame).not.toHaveProperty("capturedAtMonotonicMs");
+  f.advance(1);
+  f.packet.capturedAtMonotonicMs = 51;
+  await expect(f.manager.readVideo(input(a.viewerToken))).rejects.toThrow("receipt timestamp");
 });

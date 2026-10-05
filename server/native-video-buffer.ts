@@ -1,42 +1,50 @@
 /** Bounded per-encoder packet history. Gaps return a fresh keyframe, never a broken delta chain. */
 import {
-  type NativeVideoPacket,
   VIDEO_MAX_BATCH_BYTES,
   VIDEO_MAX_BATCH_PACKETS,
   VIDEO_SOURCE_CLOCK_TOLERANCE_MS,
 } from "../shared/browser-video";
+import type { RuntimeVideoPacket } from "./native-video-packet";
 export const NATIVE_VIDEO_MAX_AGE_MS = 1000;
 const MAX_RING_BYTES = 8 * 1024 * 1024;
 export interface VideoSourceClock {
   sourceMs: number;
   monotonicMs: number;
-  wallMs: number;
 }
-/** Chromium VideoFrame timestamps and CDP Performance.Timestamp share TimeTicks, not JS time origin. */
+/** Map Chromium TimeTicks into Node elapsed time and validate source age.
+ * Wall-clock corrections affect outward metadata only, never retained freshness. */
 export function videoSourceTime(
   timestampUs: number,
   clock: VideoSourceClock,
   nowMonotonicMs: number,
-): string | null {
+  nowWallMs: number,
+): Pick<RuntimeVideoPacket, "capturedAt" | "capturedAtMonotonicMs"> | null {
   const elapsedMs = timestampUs / 1000 - clock.sourceMs;
-  const ageMs = nowMonotonicMs - (clock.monotonicMs + elapsedMs);
+  const capturedAtMonotonicMs = clock.monotonicMs + elapsedMs;
+  const ageMs = nowMonotonicMs - capturedAtMonotonicMs;
   if (
     !Number.isFinite(ageMs) ||
     ageMs < -VIDEO_SOURCE_CLOCK_TOLERANCE_MS ||
     ageMs > NATIVE_VIDEO_MAX_AGE_MS
   )
     return null;
-  return new Date(clock.wallMs + elapsedMs).toISOString();
+  // Wall time is presentation metadata only. Calibrating it once would make
+  // NTP/WSL clock corrections turn fresh pixels into future or expired frames.
+  return {
+    capturedAt: new Date(nowWallMs - ageMs).toISOString(),
+    capturedAtMonotonicMs,
+  };
 }
+/** Retain source receipts with dependency-safe cursors. Read clocks are Node elapsed milliseconds. */
 export function createNativeVideoBuffer() {
-  let packets: NativeVideoPacket[] = [];
+  let packets: RuntimeVideoPacket[] = [];
   let bytes = 0;
   let lastSequence = 0;
   let needsKey = true;
-  const size = (packet: NativeVideoPacket) => Buffer.byteLength(packet.dataBase64, "base64");
+  const size = (packet: RuntimeVideoPacket) => Buffer.byteLength(packet.dataBase64, "base64");
   return {
     /** Caller already validated identity/source age. A missing sequence suppresses dependent deltas. */
-    add(packet: NativeVideoPacket): boolean {
+    add(packet: RuntimeVideoPacket): boolean {
       if (packet.sequence <= lastSequence) return false;
       if (lastSequence && packet.sequence !== lastSequence + 1) needsKey = true;
       lastSequence = packet.sequence;
@@ -58,11 +66,13 @@ export function createNativeVideoBuffer() {
     /** Ask for a fresh key only when this reader cannot recover its retained chain.
      * No observed packet yet and an up-to-date decoder waiting for its next delta
      * are ordinary waiting, not reasons to generate repeated recovery keys. */
-    needsKeyFrame(afterSequence: number, nowMs: number): boolean {
+    needsKeyFrame(afterSequence: number, nowMonotonicMs: number): boolean {
       if (!lastSequence) return false;
       if (needsKey) return true;
       const fresh = packets.filter(
-        (packet) => nowMs - Date.parse(packet.capturedAt) <= NATIVE_VIDEO_MAX_AGE_MS,
+        (packet) =>
+          nowMonotonicMs - packet.capturedAtMonotonicMs >= -VIDEO_SOURCE_CLOCK_TOLERANCE_MS &&
+          nowMonotonicMs - packet.capturedAtMonotonicMs <= NATIVE_VIDEO_MAX_AGE_MS,
       );
       const first = fresh[0];
       if (!first) return afterSequence < lastSequence;
@@ -72,9 +82,11 @@ export function createNativeVideoBuffer() {
       return false;
     },
     /** Returning no packet is honest when all retained source receipts are older than one second. */
-    read(afterSequence: number, nowMs: number): NativeVideoPacket[] {
+    read(afterSequence: number, nowMonotonicMs: number): RuntimeVideoPacket[] {
       let candidates = packets.filter(
-        (packet) => nowMs - Date.parse(packet.capturedAt) <= NATIVE_VIDEO_MAX_AGE_MS,
+        (packet) =>
+          nowMonotonicMs - packet.capturedAtMonotonicMs >= -VIDEO_SOURCE_CLOCK_TOLERANCE_MS &&
+          nowMonotonicMs - packet.capturedAtMonotonicMs <= NATIVE_VIDEO_MAX_AGE_MS,
       );
       const first = candidates[0];
       if (!first) return [];
@@ -89,7 +101,7 @@ export function createNativeVideoBuffer() {
         return [];
       }
       let batchBytes = 0;
-      const batch: NativeVideoPacket[] = [];
+      const batch: RuntimeVideoPacket[] = [];
       for (const packet of candidates) {
         const packetBytes = size(packet);
         if (batchBytes + packetBytes > VIDEO_MAX_BATCH_BYTES) break;

@@ -8,7 +8,6 @@ import { randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import {
   type NativeVideoPacket,
-  nativeVideoPacketSchema,
   VIDEO_MAX_WAIT_MS,
   VIDEO_SOURCE_CLOCK_TOLERANCE_MS,
 } from "../shared/browser-video";
@@ -26,12 +25,13 @@ import {
   videoSourceTime,
 } from "./native-video-buffer";
 import { NATIVE_VIDEO_EXTENSION_ID } from "./native-video-extension";
+import { type RuntimeVideoPacket, runtimeVideoPacketSchema } from "./native-video-packet";
 import type { VideoSourceFailureCode } from "./video-source-recovery";
 export type NativeVideoQuality = "low" | "medium" | "high";
 export interface NativeVideoRead {
   status: "ready" | "waiting" | "reset" | "unsupported";
   streamId: string | null;
-  packets: NativeVideoPacket[];
+  packets: RuntimeVideoPacket[];
   reason?: string;
   reasonCode?: "encoder-capacity";
 }
@@ -167,7 +167,6 @@ export class NativeVideoCapture {
       await this.helper.send("Performance.enable");
       this.helper.on("Runtime.bindingCalled", this.onPacket);
       const before = performance.now();
-      const wallBefore = Date.now();
       const metrics = await this.helper.send<{ metrics: { name: string; value: number }[] }>(
         "Performance.getMetrics",
       );
@@ -178,7 +177,6 @@ export class NativeVideoCapture {
       this.clock = {
         sourceMs: timestamp * 1000,
         monotonicMs: (before + after) / 2,
-        wallMs: wallBefore + (after - before) / 2,
       };
       await this.evaluate(
         `startCapture(${JSON.stringify(this.options.targetId)},${this.options.width},${this.options.height},${this.generation})`,
@@ -229,12 +227,12 @@ export class NativeVideoCapture {
       raw.captureGeneration !== this.generation
     )
       return;
-    const capturedAt =
+    const sourceTime =
       typeof raw.timestampUs === "number"
-        ? videoSourceTime(raw.timestampUs, this.clock, performance.now())
+        ? videoSourceTime(raw.timestampUs, this.clock, performance.now(), Date.now())
         : null;
-    if (!capturedAt) return;
-    const packet = nativeVideoPacketSchema.safeParse({ ...raw, capturedAt });
+    if (!sourceTime) return;
+    const packet = runtimeVideoPacketSchema.safeParse({ ...raw, ...sourceTime });
     if (
       !packet.success ||
       packet.data.width !== this.options.width ||
@@ -366,10 +364,11 @@ export class NativeVideoCapture {
         input.streamId !== null &&
         input.streamId !== state.streamId;
       const after = reset ? 0 : (input.afterSequence ?? 0);
-      const needsKey = input.requestKeyFrame || state.buffer.needsKeyFrame(after, Date.now());
+      const needsKey =
+        input.requestKeyFrame || state.buffer.needsKeyFrame(after, performance.now());
       const requested = needsKey && (await this.requestRecoveryKey(key, state));
       if (!requested) await this.evaluate(`touchEncoder(${JSON.stringify(key)})`);
-      let packets = state.buffer.read(after, Date.now());
+      let packets = state.buffer.read(after, performance.now());
       const waitMs = Math.min(VIDEO_MAX_WAIT_MS, Math.max(0, input.waitMs ?? 250));
       if (!packets.length && waitMs && !this.failure && !state.failure) {
         await new Promise<void>((resolve) => {
@@ -382,10 +381,14 @@ export class NativeVideoCapture {
           this.waiters.add(wake);
         });
         this.assertCurrent();
-        packets = state.buffer.read(after, Date.now());
+        packets = state.buffer.read(after, performance.now());
         // A gap can arrive while the reader waits. Request recovery before
         // returning waiting, rather than depending on the next periodic GOP.
-        if (!packets.length && !state.failure && state.buffer.needsKeyFrame(after, Date.now())) {
+        if (
+          !packets.length &&
+          !state.failure &&
+          state.buffer.needsKeyFrame(after, performance.now())
+        ) {
           await this.requestRecoveryKey(key, state);
         }
       }

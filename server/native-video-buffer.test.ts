@@ -1,12 +1,12 @@
 import { describe, expect, it } from "vitest";
-import type { NativeVideoPacket } from "../shared/browser-video";
 import { createNativeVideoBuffer, videoSourceTime } from "./native-video-buffer";
+import type { RuntimeVideoPacket } from "./native-video-packet";
 
 const packet = (
   sequence: number,
   type: "key" | "delta" = "delta",
   capturedAt = 1000,
-): NativeVideoPacket => ({
+): RuntimeVideoPacket => ({
   streamId: "stream",
   captureGeneration: 1,
   sequence,
@@ -17,13 +17,17 @@ const packet = (
   height: 800,
   dataBase64: Buffer.from("owned-packet").toString("base64"),
   capturedAt: new Date(capturedAt).toISOString(),
+  capturedAtMonotonicMs: capturedAt,
 });
 describe("native encoded receipt buffer", () => {
   it("maps actual TimeTicks age instead of refreshing a delayed packet", () => {
     const clock = { sourceMs: 112000000, monotonicMs: 500, wallMs: 2000 };
-    expect(videoSourceTime(112000100000, clock, 700)).toBe(new Date(2100).toISOString());
-    expect(videoSourceTime(112000100000, clock, 1701)).toBeNull();
-    expect(videoSourceTime(112001000000, clock, 700)).toBeNull();
+    expect(videoSourceTime(112000100000, clock, 700, 2200)).toEqual({
+      capturedAt: new Date(2100).toISOString(),
+      capturedAtMonotonicMs: 600,
+    });
+    expect(videoSourceTime(112000100000, clock, 1701, 2200)).toBeNull();
+    expect(videoSourceTime(112001000000, clock, 700, 2200)).toBeNull();
   });
   it("does not bootstrap a decoder from an arbitrary delta", () => {
     const buffer = createNativeVideoBuffer();
@@ -120,3 +124,18 @@ it("never catches up across a delta dependency without a newer complete key", ()
     Array.from({ length: 19 }, (_, i) => i + 2),
   );
 });
+
+it.each([-75_000, 75_000])(
+  "retains source age rather than calibration wall time after a %i ms correction",
+  (jump) => {
+    const clock = { sourceMs: 112000000, monotonicMs: 500 };
+    const time = videoSourceTime(112000100000, clock, 700, 2200 + jump)!;
+    expect(time.capturedAtMonotonicMs).toBe(600);
+    expect(Date.parse(time.capturedAt)).toBe(2100 + jump);
+    const buffer = createNativeVideoBuffer();
+    buffer.add({ ...packet(1, "key"), ...time });
+    expect(buffer.read(0, 700)).toHaveLength(1);
+    expect(buffer.read(0, 1601)).toEqual([]);
+    expect(videoSourceTime(112000100000, clock, 1701, 2200 + jump)).toBeNull();
+  },
+);

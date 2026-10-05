@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import { performance } from "node:perf_hooks";
 import type { RpcInput, RpcOutput } from "@getpaseo/plugin";
 import {
   type applyDevicePresetRpc,
@@ -30,7 +31,6 @@ import {
   type BrowserFrameAuthority,
   type BrowserVideoReadInput,
   type BrowserVideoReadReply,
-  nativeVideoPacketSchema,
   readBrowserVideoRpc,
   VIDEO_MAX_BATCH_BYTES,
   VIDEO_SOURCE_CLOCK_TOLERANCE_MS,
@@ -44,6 +44,7 @@ import {
 import { BrowserGesture } from "./browser-gesture";
 import { runWithInputCleanup } from "./input-cleanup";
 import { sameRuntimeInputAttachment } from "./input-generation";
+import { runtimeVideoPacketSchema } from "./native-video-packet";
 import { NAVIGATION_METADATA_TIMEOUT_MS } from "./navigation-budget";
 import type { JsonValue } from "./runtime-protocol";
 import { createViewerCaptureLifetime, type ViewerCaptureLifetime } from "./viewer-capture-lifetime";
@@ -87,6 +88,8 @@ export interface SessionManagerOptions {
   validateWorkspace: WorkspaceValidator;
   client: BrowserRuntimeClient;
   now?: () => number;
+  /** Same process-local elapsed clock as native capture, injectable for deterministic tests. */
+  monotonicNow?: () => number;
   issueToken?: () => string;
   viewerTtlMs?: number;
   controlLeaseMs?: number;
@@ -135,7 +138,12 @@ interface BrowserSession {
   >;
   recentFrames: Map<
     string,
-    { navigationGeneration: number; viewportGeneration: number; expiresAt: number }
+    {
+      navigationGeneration: number;
+      viewportGeneration: number;
+      expiresAt: number;
+      expiresAtMonotonicMs?: number;
+    }
   >;
   lastUrl: string;
   lastTitle: string;
@@ -147,12 +155,13 @@ interface BrowserSession {
   humanInputAdmission: HumanInputAdmission | null;
   inputGeneration: string | null;
   frameRevision: number;
-  videoNotBefore: number;
+  /** Playback and input fences use the native capture's Node elapsed clock. */
+  videoNotBefore: number | null;
   /** Older native pixels may play, but cannot renew press authority after input. */
-  videoInputNotBefore: number;
+  videoInputNotBefore: number | null;
   videoReads: Set<string>;
   videoLifetime: ViewerCaptureLifetime | null;
-  videoReceipts: Map<string, BrowserFrameAuthority>;
+  videoReceipts: Map<string, { frame: BrowserFrameAuthority; capturedAtMonotonicMs: number }>;
 }
 
 function defaultToken(): string {
@@ -203,6 +212,7 @@ export class SessionManager {
   private readonly validateWorkspace: WorkspaceValidator;
   private readonly client: BrowserRuntimeClient;
   private readonly now: () => number;
+  private readonly monotonicNow: () => number;
   private readonly issueToken: () => string;
   private readonly viewerTtlMs: number;
   private readonly controlLeaseMs: number;
@@ -220,6 +230,7 @@ export class SessionManager {
     this.validateWorkspace = options.validateWorkspace;
     this.client = options.client;
     this.now = options.now ?? Date.now;
+    this.monotonicNow = options.monotonicNow ?? (() => performance.now());
     this.issueToken = options.issueToken ?? defaultToken;
     this.viewerTtlMs = options.viewerTtlMs ?? VIEWER_TTL_MS;
     this.controlLeaseMs = options.controlLeaseMs ?? CONTROL_LEASE_MS;
@@ -453,13 +464,13 @@ export class SessionManager {
         let bytes = 0;
         if (Array.isArray(raw.packets)) {
           for (const value of raw.packets.slice(0, 32)) {
-            const parsed = nativeVideoPacketSchema.safeParse(value);
+            const parsed = runtimeVideoPacketSchema.safeParse(value);
             if (!parsed.success) throw new Error("Runtime returned an invalid video packet");
-            const packet = parsed.data;
-            const capturedAtMs = Date.parse(packet.capturedAt);
-            const age = this.now() - capturedAtMs;
+            // Private source time cannot be supplied or changed by a remote viewer.
+            const { capturedAtMonotonicMs, ...packet } = parsed.data;
+            const age = this.monotonicNow() - capturedAtMonotonicMs;
             if (
-              capturedAtMs < session.videoNotBefore ||
+              (session.videoNotBefore !== null && capturedAtMonotonicMs < session.videoNotBefore) ||
               age < -VIDEO_SOURCE_CLOCK_TOLERANCE_MS ||
               age > 1000 ||
               packet.width !== dimensions.width ||
@@ -478,7 +489,11 @@ export class SessionManager {
               packet.sequence,
               packet.timestampUs,
             ]);
-            let frame = session.videoReceipts.get(receipt);
+            const remembered = session.videoReceipts.get(receipt);
+            if (remembered && remembered.capturedAtMonotonicMs !== capturedAtMonotonicMs) {
+              throw new Error("Runtime changed an existing video receipt timestamp");
+            }
+            let frame = remembered?.frame;
             if (!frame) {
               frame = {
                 frameId: this.issueUniqueToken(),
@@ -491,9 +506,9 @@ export class SessionManager {
                 height: packet.height,
                 capturedAt: packet.capturedAt,
               };
-              session.videoReceipts.set(receipt, frame);
+              session.videoReceipts.set(receipt, { frame, capturedAtMonotonicMs });
             }
-            this.rememberFrame(session, frame, true);
+            this.rememberFrame(session, frame, capturedAtMonotonicMs);
             packets.push({ ...packet, frame });
           }
         }
@@ -846,7 +861,7 @@ export class SessionManager {
     session.frameCache.clear();
     if (!hover) {
       session.recentFrames.clear();
-      session.videoInputNotBefore = this.now();
+      session.videoInputNotBefore = this.monotonicNow();
     }
   }
 
@@ -1139,8 +1154,8 @@ export class SessionManager {
         frameCache: new Map(),
         recentFrames: new Map(),
         frameRevision: 0,
-        videoNotBefore: 0,
-        videoInputNotBefore: 0,
+        videoNotBefore: null,
+        videoInputNotBefore: null,
         videoReads: new Set(),
         videoLifetime: null,
         videoReceipts: new Map(),
@@ -1321,8 +1336,14 @@ export class SessionManager {
   }
   private pruneRecentFrames(session: BrowserSession): void {
     const now = this.now();
-    for (const [id, frame] of session.recentFrames)
-      if (frame.expiresAt <= now) session.recentFrames.delete(id);
+    const monotonicNow = this.monotonicNow();
+    for (const [id, frame] of session.recentFrames) {
+      const expired =
+        frame.expiresAtMonotonicMs === undefined
+          ? frame.expiresAt <= now
+          : frame.expiresAtMonotonicMs <= monotonicNow;
+      if (expired) session.recentFrames.delete(id);
+    }
   }
   private serialize<T>(session: BrowserSession, operation: () => Promise<T>): Promise<T> {
     const result = session.mutationTail.then(operation, operation);
@@ -1334,7 +1355,7 @@ export class SessionManager {
   }
   private invalidateFrames(session: BrowserSession): void {
     session.frameRevision += 1;
-    session.videoNotBefore = this.now();
+    session.videoNotBefore = this.monotonicNow();
     session.videoInputNotBefore = session.videoNotBefore;
     session.frameCache.clear();
     session.recentFrames.clear();
@@ -1434,12 +1455,11 @@ export class SessionManager {
   private rememberFrame(
     session: BrowserSession,
     frame: BrowserFrameAuthority,
-    nativeVideo = false,
+    capturedAtMonotonicMs?: number,
   ): void {
-    if (nativeVideo && session.videoInputNotBefore > 0) {
-      const capturedAt = Date.parse(frame.capturedAt);
+    if (capturedAtMonotonicMs !== undefined && session.videoInputNotBefore !== null) {
       const exclusiveFloor = session.videoInputNotBefore + VIDEO_SOURCE_CLOCK_TOLERANCE_MS;
-      if (!Number.isFinite(capturedAt) || capturedAt <= exclusiveFloor) {
+      if (!Number.isFinite(capturedAtMonotonicMs) || capturedAtMonotonicMs <= exclusiveFloor) {
         session.recentFrames.delete(frame.frameId);
         return;
       }
@@ -1449,6 +1469,11 @@ export class SessionManager {
       navigationGeneration: frame.navigationGeneration,
       viewportGeneration: frame.viewportGeneration,
       expiresAt: this.now() + FRAME_TOKEN_TTL_MS,
+      ...(capturedAtMonotonicMs === undefined
+        ? {}
+        : {
+            expiresAtMonotonicMs: this.monotonicNow() + FRAME_TOKEN_TTL_MS,
+          }),
     });
     while (session.recentFrames.size > MAX_RECENT_FRAMES) {
       const oldest = session.recentFrames.keys().next().value;

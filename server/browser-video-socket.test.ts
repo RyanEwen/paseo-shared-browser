@@ -1,7 +1,9 @@
 /** Actual plugin bridge socket: a held media reply must not delay a later input command. */
+
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { performance } from "node:perf_hooks";
 import { expect, it } from "vitest";
 import type { BrowserFrame, BrowserState } from "../shared/browser";
 import type { BrowserVideoReadReply } from "../shared/browser-video";
@@ -28,6 +30,7 @@ it("keeps video past unrelated teardown and input past video on the authenticate
   const inputPublished = Promise.withResolvers<void>();
   let blockState = false;
   let jpegQuality: unknown;
+  let videoSequence = 0;
   const calls: string[] = [];
   const running = await startSupervisorServer(
     {
@@ -74,7 +77,7 @@ it("keeps video past unrelated teardown and input past video on the authenticate
               {
                 streamId: "s".repeat(32),
                 captureGeneration: 1,
-                sequence: 1,
+                sequence: ++videoSequence,
                 timestampUs: 1000,
                 type: "key",
                 codec: "vp8",
@@ -82,6 +85,7 @@ it("keeps video past unrelated teardown and input past video on the authenticate
                 height: 800,
                 dataBase64: "AA==",
                 capturedAt: new Date().toISOString(),
+                capturedAtMonotonicMs: performance.now(),
               },
             ],
           };
