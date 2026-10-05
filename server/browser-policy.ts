@@ -314,13 +314,16 @@ export class SessionManager {
     this.sessions.delete(workspaceId);
   }
 
+  /** List retained browser sessions even after their last viewer leaves or expires. */
   async listOpenWorkspaceIds(): Promise<string[]> {
     this.assertOpen();
     const result: string[] = [];
     for (const session of this.sessions.values()) {
       await this.serialize(session, async () => {
         this.pruneExpired(session);
-        if (session.viewers.size > 0) result.push(session.workspaceId);
+        // Viewer leases control access and capture, not the lifetime of the browser.
+        // Keep an idle browser discoverable so another device can reattach to it.
+        if (!session.archived) result.push(session.workspaceId);
       });
     }
     return result;

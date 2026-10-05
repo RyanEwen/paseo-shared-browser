@@ -607,16 +607,36 @@ describe("SessionManager control leases", () => {
     expect(client.workspaces.size).toBe(0);
   });
 
-  it("reports only workspaces with attached viewers and bounds live sessions", async () => {
+  it("keeps detached browser sessions discoverable and bounds live sessions", async () => {
     const { manager } = createManager({ maxSessions: 1 });
     expect(await manager.listOpenWorkspaceIds()).toEqual([]);
     const viewer = await manager.attach("workspace-one", "Client");
     expect(await manager.listOpenWorkspaceIds()).toEqual(["workspace-one"]);
     await manager.detach(viewer.viewerToken);
-    expect(await manager.listOpenWorkspaceIds()).toEqual([]);
+    expect(await manager.listOpenWorkspaceIds()).toEqual(["workspace-one"]);
     await expect(manager.attach("workspace-two", "Second client")).rejects.toThrow(
       "session limit (1) reached",
     );
+  });
+
+  it("keeps a browser discoverable after viewer expiry without extending the expired lease", async () => {
+    let now = 0;
+    const { manager, client } = createManager({ now: () => now });
+    const viewer = await manager.attach("workspace-one", "First device");
+
+    now = 10_001;
+    expect(await manager.listOpenWorkspaceIds()).toEqual(["workspace-one"]);
+    await expect(manager.status(viewer.viewerToken)).rejects.toThrow(
+      "Viewer token is invalid or expired",
+    );
+
+    const replacement = await manager.attach("workspace-one", "Another device");
+    expect(replacement.state.sessionId).toBe(viewer.state.sessionId);
+    expect(client.workspaces.size).toBe(1);
+
+    await manager.archiveWorkspace("workspace-one");
+    expect(await manager.listOpenWorkspaceIds()).toEqual([]);
+    expect(client.archiveCalls).toEqual(["workspace-one"]);
   });
 
   it("lets archive win while workspace startup is in flight", async () => {
