@@ -157,6 +157,7 @@ export function useBrowserVideo(options: BrowserVideoOptions) {
       let retryNotBefore = 0;
       let explicitRetryTimer: ReturnType<typeof setTimeout> | null = null;
       let lastPaintedAt = Date.now();
+      let lastQuietReadAt = 0;
       let streamId: string | null = null;
       let sequence = 0;
       let keyRequested = true;
@@ -197,7 +198,8 @@ export function useBrowserVideo(options: BrowserVideoOptions) {
         },
       });
       const watchdog = setInterval(() => {
-        if (Date.now() - lastPaintedAt <= 2500 || !visible.current) return;
+        if (Date.now() - Math.max(lastPaintedAt, lastQuietReadAt) <= 2500 || !visible.current)
+          return;
         // Request a new image, but hold the already painted canvas until that
         // exact request is decoded. Display retention grants no input receipt.
         if (!fallbackRef.current) {
@@ -312,6 +314,22 @@ export function useBrowserVideo(options: BrowserVideoOptions) {
             }
             if (stopped) break;
             if (!latest.current.acceptState(reply.state)) continue;
+            // An unchanged tab may produce no native frames. Only a healthy
+            // same-stream read with every received packet already painted can
+            // renew the quiet-picture hold. Reset, stale authority and a stuck
+            // decoder still fall through to the ordinary stall watchdog.
+            // Input revocation removes frontRef, but leaves these pixels visible.
+            // Liveness may retain them without restoring their input authority.
+            const painted = displayedPacket.current;
+            if (
+              reply.status === "waiting" &&
+              painted &&
+              reply.streamId === painted.streamId &&
+              painted.sequence === sequence &&
+              latest.current.isCurrent(painted, epoch)
+            ) {
+              lastQuietReadAt = Date.now();
+            }
             if (reply.status === "unsupported") {
               if (reply.reasonCode === "encoder-capacity") {
                 // Capacity is a typed, viewing-only soft failure. Keep JPEG
@@ -354,7 +372,7 @@ export function useBrowserVideo(options: BrowserVideoOptions) {
                 if (!decoder.receive(packet, epoch)) keyRequested = true;
               }
             }
-            // A static tab produces genuine frames around once per second. Bound
+            // An unchanged tab can produce no native frames. Bound
             // empty/recovery polling and yield even when a reply is already buffered.
             await pause(reply.packets.length ? 0 : 40);
           }

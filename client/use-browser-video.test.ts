@@ -933,3 +933,37 @@ it("stops hidden-panel JPEG requests, including a queued refresh follow-up", asy
   render().refreshCapture();
   expect(imageQuery.refetch).toHaveBeenCalledOnce();
 });
+
+it.each([false, true])("keeps a healthy quiet video after local input: %s", async (afterInput) => {
+  const f = setup();
+  f.reply(0, 1);
+  await drain();
+  f.paint();
+  f.render();
+  f.commit();
+  if (afterInput) {
+    f.advanceEpoch();
+    f.render();
+    f.commit();
+  }
+  await vi.advanceTimersByTimeAsync(1);
+  for (let index = 1; index <= 8; index++) {
+    harness.reads[index]!.resolve({
+      status: "waiting",
+      streamId: "s".repeat(32),
+      state: {},
+      packets: [],
+    } as unknown as BrowserVideoReadReply);
+    await drain();
+    await vi.advanceTimersByTimeAsync(500);
+  }
+  expect(f.render().fallbackRevision).toBe(0);
+  if (afterInput) {
+    expect(f.render().frontRef.current).toBeNull();
+  } else {
+    expect(f.render().frontRef.current?.sequence).toBe(1);
+  }
+  // A genuinely stuck next read still invokes the existing fallback watchdog.
+  await vi.advanceTimersByTimeAsync(3000);
+  expect(f.render().fallbackRevision).toBeGreaterThan(0);
+});
