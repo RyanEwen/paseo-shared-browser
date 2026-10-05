@@ -21,10 +21,12 @@ it.each([-1, 0, 40])(
       width: 1280,
       height: 800,
       capturedAt: new Date(now + sourceSkew).toISOString(),
+      capturedAtMonotonicMs: now + sourceSkew,
       dataBase64: "AA==",
     };
     const manager = new SessionManager({
       now: () => now,
+      monotonicNow: () => now,
       validateWorkspace: async () => true,
       issueToken: () => String(++ids).padStart(32, "0"),
       client: {
@@ -35,6 +37,7 @@ it.each([-1, 0, 40])(
           createdAt: now,
         }),
         archiveWorkspace: async () => {},
+        closeWorkspace: async () => {},
         disconnect() {},
         requestWorkspace: async (_workspace, operation) => {
           calls.push(operation);
@@ -176,6 +179,7 @@ it.each([-1, 0, 40])(
       packet.sequence += 1;
       packet.timestampUs += 100000;
       packet.capturedAt = new Date(now).toISOString();
+      packet.capturedAtMonotonicMs = now;
       const fresh = await manager.readVideo(videoInput);
       const freshFrame = fresh.packets[0]!.frame;
       const accepted = await manager.beginGesture({

@@ -46,6 +46,7 @@ async function fixture() {
       return null;
     },
     archiveWorkspace: async () => {},
+    closeWorkspace: async () => {},
     disconnect: () => {},
   };
   const manager = new SessionManager({

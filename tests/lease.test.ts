@@ -24,6 +24,9 @@ class FakeSupervisorClient {
     input: JsonValue;
   }> = [];
   archiveCalls: string[] = [];
+  closeCalls: string[] = [];
+  closeGate: Promise<void> | null = null;
+  closeStarted: (() => void) | null = null;
   failOperation: string | null = null;
   ensureGate: Promise<void> | null = null;
   ensureStarted: (() => void) | null = null;
@@ -126,6 +129,16 @@ class FakeSupervisorClient {
     this.archiveCalls.push(workspaceId);
     const workspace = this.workspaces.get(workspaceId);
     if (workspace) workspace.stopped = true;
+  }
+
+  async closeWorkspace(workspaceId: string, runtimeId: string) {
+    const workspace = this.workspaces.get(workspaceId);
+    if (!workspace || runtimeId !== `runtime-${workspaceId}`)
+      throw new Error("Browser runtime was replaced");
+    this.closeCalls.push(workspaceId);
+    this.closeStarted?.();
+    if (this.closeGate) await this.closeGate;
+    workspace.stopped = true;
   }
 
   disconnect() {
@@ -584,6 +597,68 @@ describe("SessionManager control leases", () => {
     await expect(manager.attach("workspace-archive", "Late client")).rejects.toThrow("archived");
   });
 
+  it("closes every viewer and blocks background attach until a person reopens", async () => {
+    const { manager, client } = createManager();
+    const first = await manager.attach("workspace-close", "First viewer");
+    const second = await manager.attach("workspace-close", "Second viewer");
+    const control = await manager.acquireControl(first.viewerToken);
+
+    await expect(
+      manager.closeBrowser({
+        viewerToken: second.viewerToken,
+        controlToken: control.controlToken,
+        sessionId: first.state.sessionId,
+        runtimeId: first.state.runtimeId!,
+      }),
+    ).rejects.toThrow("control lease");
+    expect(client.workspaces.get("workspace-close")?.stopped).toBe(false);
+
+    await expect(
+      manager.closeBrowser({
+        viewerToken: first.viewerToken,
+        controlToken: control.controlToken,
+        sessionId: first.state.sessionId,
+        runtimeId: first.state.runtimeId!,
+      }),
+    ).resolves.toEqual({ closed: true });
+    expect(client.workspaces.get("workspace-close")?.stopped).toBe(true);
+    expect(await manager.listOpenWorkspaceIds()).toEqual([]);
+    await expect(manager.status(first.viewerToken)).rejects.toThrow("Browser is closed");
+    await expect(manager.status(second.viewerToken)).rejects.toThrow("Browser is closed");
+    await expect(manager.attach("workspace-close", "Background viewer")).rejects.toThrow(
+      "Browser is closed",
+    );
+
+    await manager.reopenBrowser("workspace-close");
+    const reopened = await manager.attach("workspace-close", "New viewer");
+    expect(reopened.state.sessionId).not.toBe(first.state.sessionId);
+    expect(client.workspaces.get("workspace-close")?.stopped).toBe(false);
+  });
+
+  it("does not let an attachment queued behind close restart Chromium", async () => {
+    const { manager, client } = createManager();
+    const viewer = await manager.attach("workspace-close-race", "Controller");
+    const control = await manager.acquireControl(viewer.viewerToken);
+    const started = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    client.closeStarted = started.resolve;
+    client.closeGate = release.promise;
+
+    const closing = manager.closeBrowser({
+      viewerToken: viewer.viewerToken,
+      controlToken: control.controlToken,
+      sessionId: viewer.state.sessionId,
+      runtimeId: viewer.state.runtimeId!,
+    });
+    await started.promise;
+    const attaching = manager.attach("workspace-close-race", "Late viewer");
+    release.resolve();
+
+    await expect(closing).resolves.toEqual({ closed: true });
+    await expect(attaching).rejects.toThrow("Browser is closed");
+    expect(client.workspaces.get("workspace-close-race")?.stopped).toBe(true);
+  });
+
   it("cannot create a runtime after disconnect begins", async () => {
     let resolveValidation!: (valid: boolean) => void;
     let validationStarted!: () => void;
@@ -658,12 +733,13 @@ describe("SessionManager control leases", () => {
     await expect(manager.attach("workspace-racing", "Late client")).rejects.toThrow("archived");
   });
 
-  it("archives an ensured runtime when session initialization fails", async () => {
+  it("closes an ensured runtime without archiving when session initialization fails", async () => {
     const { manager, client } = createManager();
     client.failOperation = "identity";
 
     await expect(manager.attach("workspace-failed", "Client")).rejects.toThrow("Failed identity");
-    expect(client.archiveCalls).toEqual(["workspace-failed"]);
+    expect(client.closeCalls).toEqual(["workspace-failed"]);
+    expect(client.archiveCalls).toEqual([]);
     expect(client.workspaces.get("workspace-failed")?.stopped).toBe(true);
   });
 });

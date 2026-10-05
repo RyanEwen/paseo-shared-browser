@@ -108,6 +108,25 @@ export const detachBrowserRpc = defineRpc({
   output: z.object({ detached: z.boolean() }),
 });
 
+/** Stop the current workspace runtime only when its controller still owns this session. */
+export const closeBrowserRpc = defineRpc({
+  name: "shared-browser.close",
+  input: z.object({
+    viewerToken: opaqueTokenSchema,
+    controlToken: opaqueTokenSchema,
+    sessionId: opaqueTokenSchema,
+    runtimeId: runtimeIdSchema,
+  }),
+  output: z.object({ closed: z.literal(true) }),
+});
+
+/** Reopen a deliberately closed workspace browser using its retained profile. */
+export const reopenBrowserRpc = defineRpc({
+  name: "shared-browser.reopen",
+  input: z.object({ workspaceId: workspaceIdSchema }),
+  output: z.object({ opened: z.literal(true) }),
+});
+
 export const listOpenBrowserWorkspacesRpc = defineRpc({
   name: "shared-browser.presence",
   input: z.object({}),

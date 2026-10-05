@@ -345,8 +345,34 @@ it("shares and persists a production agent-browser runtime across supervisor cli
     await vi.waitFor(() => expect(retainedCookie).toContain("shared-browser-profile=retained"));
     console.log("browser-smoke: restored");
 
-    await manager.archiveWorkspace("workspace-smoke");
+    await manager.closeBrowser({
+      viewerToken: restored.viewerToken,
+      controlToken: restoredControl.controlToken,
+      sessionId: restored.state.sessionId,
+      runtimeId: restored.state.runtimeId!,
+    });
     await expect(manager.capture(restored.viewerToken, "medium", null)).rejects.toThrow(
+      "Browser is closed",
+    );
+    await expect(manager.attach("workspace-smoke", "Background viewer")).rejects.toThrow(
+      "Browser is closed",
+    );
+    await manager.reopenBrowser("workspace-smoke");
+    const reopened = await manager.attach("workspace-smoke", "Explicitly reopened client");
+    expect(reopened.state.runtimeId).not.toBe(restored.state.runtimeId);
+    const reopenedControl = await manager.acquireControl(reopened.viewerToken, false);
+    retainedCookie = "";
+    await manager.navigate({
+      viewerToken: reopened.viewerToken,
+      controlToken: reopenedControl.controlToken,
+      expected: expected(reopenedControl.state),
+      action: { kind: "goto", url: `${origin}/read-cookie` },
+    });
+    await vi.waitFor(() => expect(retainedCookie).toContain("shared-browser-profile=retained"));
+    console.log("browser-smoke: closed-and-reopened");
+
+    await manager.archiveWorkspace("workspace-smoke");
+    await expect(manager.capture(reopened.viewerToken, "medium", null)).rejects.toThrow(
       "invalid or expired",
     );
     console.log("browser-smoke: archived");

@@ -60,6 +60,12 @@ export type RuntimeRequest =
       workspaceId: string;
     })
   | (AdminRequestBase & {
+      method: "workspace.close";
+      epoch: number;
+      workspaceId: string;
+      runtimeId: string;
+    })
+  | (AdminRequestBase & {
       method: "browser.request";
       epoch: number;
       operation: string;
@@ -183,6 +189,17 @@ export function parseRuntimeRequest(value: unknown): RuntimeRequest {
       bridgeId,
       epoch,
       workspaceId: requireString(value, "workspaceId"),
+    };
+  if (method === "workspace.close")
+    return {
+      id,
+      version: RUNTIME_PROTOCOL_VERSION,
+      method,
+      token,
+      bridgeId,
+      epoch,
+      workspaceId: requireString(value, "workspaceId"),
+      runtimeId: requireString(value, "runtimeId"),
     };
   if (method === "workspace.request")
     return {

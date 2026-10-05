@@ -12,6 +12,7 @@ import {
   browserGestureEventSchema,
   canUseCaptureDensity,
   type captureBrowserRpc,
+  type closeBrowserRpc,
   DEFAULT_VIEWPORT,
   DEVICE_PRESETS,
   type DevicePresetId,
@@ -51,6 +52,7 @@ import { createViewerCaptureLifetime, type ViewerCaptureLifetime } from "./viewe
 export type WorkspaceValidator = (workspaceId: string) => Promise<void | boolean>;
 type CaptureReply = Omit<RpcOutput<typeof captureBrowserRpc>, "state"> & { state: BrowserState };
 type DensityInput = RpcInput<typeof setCaptureDensityRpc>;
+type CloseInput = RpcInput<typeof closeBrowserRpc>;
 type NavigateInput = RpcInput<typeof navigateBrowserRpc>;
 type ResizeInput = RpcInput<typeof resizeBrowserRpc>;
 type ApplyDevicePresetInput = RpcInput<typeof applyDevicePresetRpc>;
@@ -81,6 +83,7 @@ export interface BrowserRuntimeClient {
   }>;
   requestWorkspace(workspaceId: string, operation: string, input: JsonValue): Promise<JsonValue>;
   archiveWorkspace(workspaceId: string): Promise<void>;
+  closeWorkspace(workspaceId: string, runtimeId: string): Promise<void>;
   disconnect(): void;
 }
 
@@ -220,8 +223,11 @@ export class SessionManager {
   private readonly maxSessions: number;
   private readonly sessions = new Map<string, BrowserSession>();
   private readonly viewerSessions = new Map<string, BrowserSession>();
+  private readonly closedViewerWorkspaces = new Map<string, string>();
   private readonly sessionCreations = new Map<string, Promise<BrowserSession>>();
+  private readonly sessionClosures = new Map<string, Promise<void>>();
   private readonly archived = new Set<string>();
+  private readonly deliberatelyClosed = new Set<string>();
   private bridgeEpoch = 0;
   private lifecycleGeneration = 0;
   private closed = false;
@@ -270,6 +276,7 @@ export class SessionManager {
     this.assertOpen();
     const session = await this.getOrCreateSession(workspaceId);
     return this.serialize(session, async () => {
+      if (session.archived) throw new Error("Browser session is closed");
       this.pruneExpired(session);
       if (session.viewers.size >= MAX_VIEWERS_PER_SESSION)
         throw new Error(`Shared browser viewer limit (${MAX_VIEWERS_PER_SESSION}) reached`);
@@ -308,6 +315,59 @@ export class SessionManager {
     });
   }
 
+  /** Stop one runtime and invalidate every viewer without archiving its workspace or profile. */
+  async closeBrowser(input: CloseInput): Promise<{ closed: true }> {
+    const session = this.requireViewer(input.viewerToken);
+    const closing = this.serialize(session, async () => {
+      this.requireController(session, input.viewerToken, input.controlToken);
+      if (session.sessionId !== input.sessionId || session.runtimeId !== input.runtimeId)
+        throw new Error("Browser session is stale");
+
+      session.videoLifetime?.cancel();
+      await this.cancelGesture(session);
+      session.archived = true;
+      this.deliberatelyClosed.add(session.workspaceId);
+      for (const token of session.viewers.keys()) {
+        this.viewerSessions.delete(token);
+        this.closedViewerWorkspaces.set(token, session.workspaceId);
+      }
+      session.viewers.clear();
+      session.controller = null;
+      try {
+        await this.client.closeWorkspace(session.workspaceId, session.runtimeId);
+      } finally {
+        this.sessions.delete(session.workspaceId);
+      }
+    });
+    this.sessionClosures.set(session.workspaceId, closing);
+    try {
+      await closing;
+      return { closed: true };
+    } finally {
+      if (this.sessionClosures.get(session.workspaceId) === closing)
+        this.sessionClosures.delete(session.workspaceId);
+    }
+  }
+
+  /** Only an explicit human reopen removes the close fence used by viewer and agent attach. */
+  async reopenBrowser(workspaceId: string): Promise<{ opened: true }> {
+    this.assertOpen();
+    const validation = await this.validateWorkspace(workspaceId);
+    if (validation === false) throw new Error("Workspace not found");
+    const closing = this.sessionClosures.get(workspaceId);
+    if (closing) await closing.catch(() => undefined);
+    this.deliberatelyClosed.delete(workspaceId);
+    try {
+      await this.getOrCreateSession(workspaceId);
+    } catch (error) {
+      this.deliberatelyClosed.add(workspaceId);
+      throw error;
+    }
+    for (const [token, closedWorkspaceId] of this.closedViewerWorkspaces)
+      if (closedWorkspaceId === workspaceId) this.closedViewerWorkspaces.delete(token);
+    return { opened: true };
+  }
+
   async archiveWorkspace(workspaceId: string): Promise<void> {
     this.assertOpen();
     this.archived.add(workspaceId);
@@ -342,6 +402,7 @@ export class SessionManager {
   async status(viewerToken: string): Promise<{ state: BrowserState }> {
     const session = this.requireViewer(viewerToken);
     return this.serialize(session, async () => {
+      if (session.archived) throw new Error("Browser session is closed");
       this.pruneExpired(session);
       this.heartbeatViewer(session, viewerToken);
       return { state: await this.snapshotState(session, viewerToken) };
@@ -1074,6 +1135,7 @@ export class SessionManager {
     this.sessions.clear();
     this.sessionCreations.clear();
     this.viewerSessions.clear();
+    this.closedViewerWorkspaces.clear();
   }
 
   disconnect(): void {
@@ -1085,6 +1147,9 @@ export class SessionManager {
 
   private async getOrCreateSession(workspaceId: string): Promise<BrowserSession> {
     if (this.archived.has(workspaceId)) throw new Error("Workspace was archived");
+    const closing = this.sessionClosures.get(workspaceId);
+    if (closing) await closing.catch(() => undefined);
+    if (this.deliberatelyClosed.has(workspaceId)) throw new Error("Browser is closed");
     const existing = this.sessions.get(workspaceId);
     if (existing) return existing;
     const pending = this.sessionCreations.get(workspaceId);
@@ -1120,10 +1185,10 @@ export class SessionManager {
   }
 
   private async createSession(workspaceId: string): Promise<BrowserSession> {
-    let ensured = false;
+    let runtimeId: string | null = null;
     try {
       const descriptor = await this.client.ensureWorkspace(workspaceId);
-      ensured = true;
+      runtimeId = descriptor.runtimeId;
       const identity = asRecord(await this.client.requestWorkspace(workspaceId, "identity", null));
       const userAgent = boundedText(String(identity.userAgent ?? "Chromium"), 512);
       await this.client.requestWorkspace(workspaceId, "emulate", {
@@ -1170,7 +1235,8 @@ export class SessionManager {
         inputGeneration: typeof state.inputGeneration === "string" ? state.inputGeneration : null,
       };
     } catch (error) {
-      if (ensured) await this.client.archiveWorkspace(workspaceId).catch(() => undefined);
+      if (runtimeId)
+        await this.client.closeWorkspace(workspaceId, runtimeId).catch(() => undefined);
       throw error;
     }
   }
@@ -1211,6 +1277,7 @@ export class SessionManager {
   }
 
   private requireViewer(token: string): BrowserSession {
+    if (this.closedViewerWorkspaces.has(token)) throw new Error("Browser is closed");
     const session = this.viewerSessions.get(token);
     if (!session || !session.viewers.has(token))
       throw new Error("Viewer token is invalid or expired");

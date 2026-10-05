@@ -10,6 +10,7 @@ import {
   applyDevicePresetRpc,
   beginBrowserGestureRpc,
   captureBrowserRpc,
+  closeBrowserRpc,
   endBrowserGestureRpc,
   navigateBrowserRpc,
   resizeBrowserRpc,
@@ -148,6 +149,8 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
         requestWorkspace: (workspaceId, operation, input) =>
           this.requestWorkspaceLocal(workspaceId, operation, input),
         archiveWorkspace: (workspaceId) => this.archiveWorkspaceLocal(workspaceId).then(() => {}),
+        closeWorkspace: (workspaceId, runtimeId) =>
+          this.closeWorkspaceLocal(workspaceId, runtimeId),
         disconnect: () => {},
       },
       now: this.now,
@@ -241,6 +244,19 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
     const result = await this.archiveWorkspaceLocal(workspaceId);
     this.assertActiveBridge(bridgeId, epoch);
     return result;
+  }
+
+  async closeWorkspace(
+    bridgeId: string,
+    epoch: number,
+    workspaceId: string,
+    runtimeId: string,
+  ): Promise<void> {
+    const bridge = this.assertActiveBridge(bridgeId, epoch);
+    await bridge.ready;
+    this.assertActiveBridge(bridgeId, epoch);
+    await this.closeWorkspaceLocal(workspaceId, runtimeId);
+    this.assertActiveBridge(bridgeId, epoch);
   }
 
   private ensureWorkspaceLocal(workspaceId: string): Promise<RuntimeDescriptor> {
@@ -346,6 +362,19 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
     });
   }
 
+  /** Stop the exact runtime confirmed by the viewer while keeping the workspace reusable. */
+  private closeWorkspaceLocal(workspaceId: string, runtimeId: string): Promise<void> {
+    return this.runWorkspaceOperation(workspaceId, async () => {
+      const entry = this.workspaces.get(workspaceId);
+      if (!entry || entry.runtime.runtimeId !== runtimeId)
+        throw new RuntimeProtocolError("RUNTIME_FAILURE", "Browser runtime was replaced");
+      this.invalidateAgentObservations(workspaceId);
+      this.revokeAgentControl(workspaceId);
+      await this.owner.stop(entry.runtime);
+      if (this.workspaces.get(workspaceId) === entry) this.workspaces.delete(workspaceId);
+    });
+  }
+
   private async requestBrowser(
     bridgeId: string,
     epoch: number,
@@ -429,6 +458,12 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
         break;
       case "list":
         result = { workspaceIds: await this.browserPolicy.listOpenWorkspaceIds() };
+        break;
+      case "close":
+        result = await this.browserPolicy.closeBrowser(closeBrowserRpc.input.parse(data));
+        break;
+      case "reopen":
+        result = await this.browserPolicy.reopenBrowser(requireText(data, "workspaceId"));
         break;
       case "archive": {
         const workspaceId = requireText(data, "workspaceId");
@@ -793,6 +828,13 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
         );
       case "workspace.archive":
         return this.archiveWorkspace(request.bridgeId, request.epoch, request.workspaceId);
+      case "workspace.close":
+        return this.closeWorkspace(
+          request.bridgeId,
+          request.epoch,
+          request.workspaceId,
+          request.runtimeId,
+        ).then(() => ({ closed: true }));
       case "browser.request":
         return this.requestBrowser(
           request.bridgeId,

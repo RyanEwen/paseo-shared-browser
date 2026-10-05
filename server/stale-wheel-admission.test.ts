@@ -41,6 +41,7 @@ it("reopens admitted human geometry despite a late pre-wheel decoded frame witho
       return null;
     },
     archiveWorkspace: async () => {},
+    closeWorkspace: async () => {},
     disconnect: () => {},
   };
   const manager = new SessionManager({

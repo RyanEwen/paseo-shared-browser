@@ -55,6 +55,12 @@ bridge can reclaim the existing workspace runtime. If no bridge reconnects, the 
 all orphaned runtimes after a 120-second grace period. A missed heartbeat fences the old bridge after
 30 seconds; the bridge sends heartbeats every 10 seconds.
 
+The browser actions menu has **Close shared browser** for the current controller. After confirmation,
+it stops that workspace's Chromium process and ends every viewer and agent connection to it, even
+when their panels are active. Background reconnects cannot reopen a deliberately closed browser.
+A person can select **Open shared browser** from the closed panel to start a new runtime with the
+retained profile. Closing the browser does not remove saved cookies or site data.
+
 Each workspace gets a private profile under
 `$PASEO_HOME/plugin-data/shared-browser/profiles/<workspace-id-sha256>`. Cookies and site login state
 therefore survive viewer disconnects, plugin reloads, and Chromium process restarts while that
@@ -139,7 +145,8 @@ User-supplied `AGENT_BROWSER_*` variables are deliberately ignored.
 ## Controls
 
 - Toolbar: back, forward, reload, address bar, a combined monitor menu, mobile emulation toggle
-  and a vertical-dots browser actions menu. Icon controls expose their action name
+  and a vertical-dots browser actions menu. The controller can close the shared browser from that
+  menu after confirmation. Icon controls expose their action name
   as a hover tooltip on desktop/web and retain native accessibility labels.
 - Custom viewports support 320 to 2560 pixels wide and 480 to 2560 pixels high. Invalid sizes
   show their error inside the device dialog; a successful Apply closes it.

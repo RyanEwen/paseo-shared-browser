@@ -26,6 +26,7 @@ import {
   type BrowserState,
   beginBrowserGestureRpc,
   captureBrowserRpc,
+  closeBrowserRpc,
   DEVICE_PRESETS,
   type DevicePresetId,
   detachBrowserRpc,
@@ -36,6 +37,7 @@ import {
   MIN_VIEWPORT,
   navigateBrowserRpc,
   releaseControlRpc,
+  reopenBrowserRpc,
   resizeBrowserRpc,
   sendBrowserInputRpc,
   setCaptureDensityRpc,
@@ -65,7 +67,7 @@ import {
   BrowserToolbarMenu,
 } from "./browser-toolbar-menu";
 import { BrowserVideoSurface } from "./browser-video-surface";
-import { isExpiredBrowserViewerError } from "./browser-viewer-recovery";
+import { isBrowserClosedError, isExpiredBrowserViewerError } from "./browser-viewer-recovery";
 import { createFrameLifecycle } from "./frame-lifecycle";
 import { useBrowserCanvasInput } from "./use-browser-canvas-input";
 import { useBrowserCaptureDensity } from "./use-browser-capture-density";
@@ -174,6 +176,8 @@ export function SharedBrowserPanel({
   const attachBrowser = useRpc(attachBrowserRpc);
   const detachBrowser = useRpc(detachBrowserRpc);
   const captureBrowser = useRpc(captureBrowserRpc);
+  const closeBrowser = useRpc(closeBrowserRpc);
+  const reopenBrowser = useRpc(reopenBrowserRpc);
   const acquireControl = useRpc(acquireControlRpc);
   const releaseControl = useRpc(releaseControlRpc);
   const navigateBrowser = useRpc(navigateBrowserRpc);
@@ -212,6 +216,10 @@ export function SharedBrowserPanel({
   const [controlToken, setControlToken] = useState<string | null>(null);
   const [operationError, setOperationError] = useState<string | null>(null);
   const [reconnecting, setReconnecting] = useState(false);
+  const [browserClosed, setBrowserClosed] = useState(false);
+  const [closeConfirmationOpen, setCloseConfirmationOpen] = useState(false);
+  const [closePending, setClosePending] = useState(false);
+  const [reopenPending, setReopenPending] = useState(false);
   const [runtimeNotice, setRuntimeNotice] = useState<string | null>(null);
   const [addressDraft, setAddressDraft] = useState("");
   const [addressFocused, setAddressFocused] = useState(false);
@@ -227,6 +235,9 @@ export function SharedBrowserPanel({
   const displayAnchorRef = useRef<View | null>(null);
   const actionsAnchorRef = useRef<View | null>(null);
   const [paneSize, setPaneSize] = useState<Size>({ width: 0, height: 0 });
+  const panelScope = `${host.id}/${workspaceId}`;
+  const panelScopeRef = useRef(panelScope);
+  panelScopeRef.current = panelScope;
   const menuRestoreFocus = useRef(true);
   const closeToolbarMenu = useCallback((restoreFocus = true) => {
     menuRestoreFocus.current = restoreFocus;
@@ -317,12 +328,18 @@ export function SharedBrowserPanel({
       return result;
     },
     retry: false,
+    enabled: !browserClosed,
     staleTime: Number.POSITIVE_INFINITY,
     gcTime: 0,
     refetchOnWindowFocus: false,
   });
 
-  const viewerToken = reconnecting ? null : (attachQuery.data?.viewerToken ?? null);
+  const closedView = browserClosed || isBrowserClosedError(attachQuery.error);
+  const viewerToken = reconnecting || closedView ? null : (attachQuery.data?.viewerToken ?? null);
+
+  useEffect(() => {
+    if (isBrowserClosedError(attachQuery.error)) setBrowserClosed(true);
+  }, [attachQuery.error]);
 
   useEffect(() => {
     if (!viewerToken) return;
@@ -348,6 +365,8 @@ export function SharedBrowserPanel({
     setControlToken(null);
     setOperationError(null);
     setRuntimeNotice(null);
+    setBrowserClosed(false);
+    setCloseConfirmationOpen(false);
   }, [reset, workspaceId, host.id, inputLifecycle]);
 
   useLayoutEffect(() => {
@@ -598,10 +617,15 @@ export function SharedBrowserPanel({
     resizeMutation.isPending ||
     densityControl.pending ||
     deviceMutation.isPending ||
-    inputMutation.isPending;
+    inputMutation.isPending ||
+    closePending;
   const videoViewerExpired =
     video.errorViewerToken === viewerToken && isExpiredBrowserViewerError(video.error);
   const viewingExpired = videoViewerExpired || isExpiredBrowserViewerError(captureQuery.error);
+  useEffect(() => {
+    if (isBrowserClosedError(captureQuery.error) || isBrowserClosedError(video.error))
+      setBrowserClosed(true);
+  }, [captureQuery.error, video.error]);
   const canControl = Boolean(
     viewerToken && controlToken && state?.controller === "self" && !viewingExpired,
   );
@@ -934,6 +958,54 @@ export function SharedBrowserPanel({
     });
   }, [attachQuery.isFetching, attachQuery.refetch]);
 
+  /** Confirmed close ends every viewer's runtime and immediately drops this panel's media. */
+  const confirmCloseBrowser = async () => {
+    const current = stateRef.current;
+    const viewerToken = activeViewerTokenRef.current;
+    if (!current?.runtimeId || !viewerToken || !controlToken || closePending) return;
+    setClosePending(true);
+    setOperationError(null);
+    try {
+      await closeBrowser({
+        viewerToken,
+        controlToken,
+        sessionId: current.sessionId,
+        runtimeId: current.runtimeId,
+      });
+      if (panelScopeRef.current !== panelScope) return;
+      inputLifecycle.bump();
+      activeViewerTokenRef.current = null;
+      stateRef.current = null;
+      frameRef.current = null;
+      reset();
+      setState(null);
+      setControlToken(null);
+      setBrowserClosed(true);
+      setCloseConfirmationOpen(false);
+    } catch (error) {
+      setOperationError(errorMessage(error));
+    } finally {
+      setClosePending(false);
+    }
+  };
+
+  /** Explicit user action is the only way to clear the server's closed fence. */
+  const reopenClosedBrowser = async () => {
+    if (reopenPending) return;
+    setReopenPending(true);
+    setOperationError(null);
+    try {
+      await reopenBrowser({ workspaceId });
+      if (panelScopeRef.current !== panelScope) return;
+      setBrowserClosed(false);
+      reconnect();
+    } catch (error) {
+      setOperationError(errorMessage(error));
+    } finally {
+      setReopenPending(false);
+    }
+  };
+
   useBrowserViewerRecovery({
     identity: JSON.stringify([host.id, workspaceId]),
     viewerToken,
@@ -1049,6 +1121,31 @@ export function SharedBrowserPanel({
         },
       ]
     : styles.interactionLayer;
+
+  if (closedView) {
+    return (
+      <View style={styles.screen}>
+        <CanvasPlaceholder
+          styles={styles}
+          theme={theme}
+          title="Shared browser closed"
+          detail="The browser was closed for everyone. Its saved site data is available when you reopen it."
+        />
+        {operationError ? (
+          <ErrorNotice styles={styles} theme={theme} message={operationError} />
+        ) : null}
+        <View style={styles.controlStrip}>
+          <ControlButton
+            styles={styles}
+            theme={theme}
+            label={reopenPending ? "Opening…" : "Open shared browser"}
+            disabled={reopenPending}
+            onPress={() => void reopenClosedBrowser()}
+          />
+        </View>
+      </View>
+    );
+  }
 
   return (
     <View
@@ -1377,6 +1474,39 @@ export function SharedBrowserPanel({
           </View>
         </Modal.Content>
       </Modal>
+      <Modal
+        title="Close shared browser?"
+        icon={<Icon name="X" size={18} color={theme.colors.statusDanger} />}
+        open={closeConfirmationOpen}
+        onOpenChange={(open) => {
+          if (!closePending) setCloseConfirmationOpen(open);
+        }}
+      >
+        <Modal.Content>
+          <View style={styles.deviceModalContent}>
+            <Text style={styles.canvasDetail}>
+              This closes the browser for every viewer and agent in this workspace. The saved site
+              data stays available when someone explicitly reopens it.
+            </Text>
+            <View style={styles.controlStrip}>
+              <ControlButton
+                styles={styles}
+                theme={theme}
+                label="Cancel"
+                disabled={closePending}
+                onPress={() => setCloseConfirmationOpen(false)}
+              />
+              <ControlButton
+                styles={styles}
+                theme={theme}
+                label={closePending ? "Closing…" : "Close browser"}
+                disabled={!canControl || closePending}
+                onPress={() => void confirmCloseBrowser()}
+              />
+            </View>
+          </View>
+        </Modal.Content>
+      </Modal>
       {toolbarMenu ? (
         <BrowserToolbarMenu
           key={toolbarMenu}
@@ -1390,8 +1520,8 @@ export function SharedBrowserPanel({
             toolbarMenu === "display"
               ? 300 + preferences.favoritePresetIds.length * (layout.compact ? 44 : 36)
               : layout.platform === "web"
-                ? 88
-                : 176
+                ? 132
+                : 220
           }
           onClose={() => closeToolbarMenu()}
           shouldRestoreFocus={() => menuRestoreFocus.current}
@@ -1536,6 +1666,18 @@ export function SharedBrowserPanel({
                 onPress={() => {
                   closeToolbarMenu();
                   reconnect();
+                }}
+              />
+              <BrowserMenuSeparator theme={theme} />
+              <BrowserMenuItem
+                theme={theme}
+                compact={layout.compact}
+                label="Close shared browser"
+                icon="X"
+                disabled={!canControl || anyMutationPending}
+                onPress={() => {
+                  closeToolbarMenu(false);
+                  setCloseConfirmationOpen(true);
                 }}
               />
             </>

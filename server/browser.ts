@@ -11,11 +11,13 @@ import type {
   attachBrowserRpc,
   beginBrowserGestureRpc,
   captureBrowserRpc,
+  closeBrowserRpc,
   detachBrowserRpc,
   endBrowserGestureRpc,
   listOpenBrowserWorkspacesRpc,
   navigateBrowserRpc,
   releaseControlRpc,
+  reopenBrowserRpc,
   resizeBrowserRpc,
   sendBrowserInputRpc,
   setCaptureDensityRpc,
@@ -43,6 +45,10 @@ type DensityInput = RpcInput<typeof setCaptureDensityRpc>;
 type DensityOutput = RpcOutput<typeof setCaptureDensityRpc>;
 type CaptureInput = RpcInput<typeof captureBrowserRpc>;
 type CaptureOutput = RpcOutput<typeof captureBrowserRpc>;
+type CloseInput = RpcInput<typeof closeBrowserRpc>;
+type CloseOutput = RpcOutput<typeof closeBrowserRpc>;
+type ReopenInput = RpcInput<typeof reopenBrowserRpc>;
+type ReopenOutput = RpcOutput<typeof reopenBrowserRpc>;
 type AcquireControlInput = RpcInput<typeof acquireControlRpc>;
 type AcquireControlOutput = RpcOutput<typeof acquireControlRpc>;
 type ReleaseControlInput = RpcInput<typeof releaseControlRpc>;
@@ -86,6 +92,14 @@ class RemoteBrowserManager {
 
   detach(viewerToken: string): Promise<DetachOutput> {
     return this.requestBrowser<DetachOutput>("detach", { viewerToken });
+  }
+
+  close(input: CloseInput): Promise<CloseOutput> {
+    return this.requestBrowser<CloseOutput>("close", input);
+  }
+
+  reopen(workspaceId: string): Promise<ReopenOutput> {
+    return this.requestBrowser<ReopenOutput>("reopen", { workspaceId });
   }
 
   capture(
@@ -279,6 +293,19 @@ export async function handleAttachBrowser(
 
 export async function handleDetachBrowser({ viewerToken }: DetachInput): Promise<DetachOutput> {
   return (await getProductionManager()).detach(viewerToken);
+}
+
+export async function handleCloseBrowser(input: CloseInput): Promise<CloseOutput> {
+  return (await getProductionManager()).close(input);
+}
+
+export async function handleReopenBrowser(
+  input: ReopenInput,
+  context: PluginHandlerContext,
+): Promise<ReopenOutput> {
+  const workspace = await context.paseo.workspaces.ref(input.workspaceId).refresh();
+  if (!workspace) throw new Error("Workspace not found");
+  return (await getProductionManager()).reopen(input.workspaceId);
 }
 
 export async function handleWorkspaceArchived(workspaceId: string): Promise<void> {

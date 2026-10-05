@@ -10,12 +10,14 @@ import {
   handleAttachBrowser,
   handleBeginBrowserGesture,
   handleCaptureBrowser,
+  handleCloseBrowser,
   handleDetachBrowser,
   handleEndBrowserGesture,
   handleListOpenBrowserWorkspaces,
   handleNavigateBrowser,
   handleReadBrowserVideo,
   handleReleaseControl,
+  handleReopenBrowser,
   handleResizeBrowser,
   handleSendBrowserInput,
   handleSetCaptureDensity,
@@ -31,11 +33,13 @@ import {
   attachBrowserRpc,
   beginBrowserGestureRpc,
   captureBrowserRpc,
+  closeBrowserRpc,
   detachBrowserRpc,
   endBrowserGestureRpc,
   listOpenBrowserWorkspacesRpc,
   navigateBrowserRpc,
   releaseControlRpc,
+  reopenBrowserRpc,
   resizeBrowserRpc,
   sendBrowserInputRpc,
   setCaptureDensityRpc,
@@ -81,6 +85,8 @@ export default function contribute(server: PluginServerContext) {
   server.registerSettings(browserDisplayPreferences);
   server.handle(attachBrowserRpc, handleAttachBrowser);
   server.handle(detachBrowserRpc, handleDetachBrowser);
+  server.handle(closeBrowserRpc, handleCloseBrowser);
+  server.handle(reopenBrowserRpc, handleReopenBrowser);
   server.handle(captureBrowserRpc, handleCaptureBrowser);
   server.handle(setCaptureDensityRpc, handleSetCaptureDensity);
   server.handle(readBrowserVideoRpc, handleReadBrowserVideo);
