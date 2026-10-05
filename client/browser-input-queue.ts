@@ -111,6 +111,9 @@ export function createBrowserInputQueue(options: QueueOptions) {
   // Only an acknowledged begin grants this geometry basis. Visual pixels never
   // renew it; normal idle closure retains it for same-document channel reopening.
   let admittedBasis: BrowserGestureAuthority | null = null;
+  // Buffer real physical edges while begin is pending. This context grants no
+  // reusable admission and publishes nothing until the server acknowledges it.
+  let pendingAdmission: { authority: BrowserGestureAuthority; epoch: number } | null = null;
 
   const cancelChannel = async (old: Channel) => {
     admittedBasis = null;
@@ -130,6 +133,7 @@ export function createBrowserInputQueue(options: QueueOptions) {
     epoch += 1;
     commands = [];
     admittedBasis = null;
+    pendingAdmission = null;
     const old = channel;
     channel = null;
     options.onCursor(null);
@@ -231,46 +235,55 @@ export function createBrowserInputQueue(options: QueueOptions) {
           current = admissionAuthority();
           if (!current) throw new Error("A decoded frame and active browser control are required.");
           const admissionDeadline = Date.now() + FRAME_ADMISSION_WAIT_MS;
-          for (let attempt = 0; attempt < MAX_FRAME_ADMISSION_ATTEMPTS; attempt += 1) {
-            if (Date.now() >= admissionDeadline) break;
-            const sentAuthority = current;
-            const result = await options.transport.begin({ ...sentAuthority, pointerKind });
-            if (!("admission" in result)) {
-              owned = {
-                authority: sentAuthority,
-                pointerKind,
-                gestureId: result.gestureId,
-                sequence: result.nextSequence,
-                heldButtons: new Set(),
-                heldKeys: new Set(),
-                touchCount: 0,
-              };
+          const pending = { authority: current, epoch: currentEpoch };
+          pendingAdmission = pending;
+          try {
+            for (let attempt = 0; attempt < MAX_FRAME_ADMISSION_ATTEMPTS; attempt += 1) {
+              if (Date.now() >= admissionDeadline) break;
+              const sentAuthority = current;
+              const result = await options.transport.begin({ ...sentAuthority, pointerKind });
+              if (!("admission" in result)) {
+                owned = {
+                  authority: sentAuthority,
+                  pointerKind,
+                  gestureId: result.gestureId,
+                  sequence: result.nextSequence,
+                  heldButtons: new Set(),
+                  heldKeys: new Set(),
+                  touchCount: 0,
+                };
+              }
+              if (currentEpoch !== epoch || !sameAuthority(sentAuthority, currentControl())) break;
+              options.onState(result.state);
+              if (!sameAuthority(sentAuthority, currentControl())) break;
+              if (owned) {
+                channel = owned;
+                admittedBasis = sentAuthority;
+                break;
+              }
+              // Only this validated non-publication receipt permits another begin.
+              // A runtime/transport exception never retries an action. Captures
+              // already decoding may also be revoked, so admission remains bounded.
+              if (attempt === MAX_FRAME_ADMISSION_ATTEMPTS - 1) break;
+              options.onFinish();
+              const latest = options.authority();
+              if (!latest || latest.target.frameId === sentAuthority.target.frameId) {
+                if (!options.waitForFrame) throw new Error("Waiting for a current decoded frame.");
+                const remaining = admissionDeadline - Date.now();
+                if (remaining <= 0) break;
+                await options.waitForFrame(sentAuthority.target.frameId, remaining);
+              }
+              if (currentEpoch !== epoch) break;
+              current = options.authority();
+              if (!current || !sameAuthority(sentAuthority, current)) {
+                throw new Error(
+                  "Browser input context changed. Release the gesture and try again.",
+                );
+              }
             }
-            if (currentEpoch !== epoch || !sameAuthority(sentAuthority, currentControl())) break;
-            options.onState(result.state);
-            if (!sameAuthority(sentAuthority, currentControl())) break;
-            if (owned) {
-              channel = owned;
-              admittedBasis = sentAuthority;
-              break;
-            }
-            // Only this validated non-publication receipt permits another begin.
-            // A runtime/transport exception never retries an action. Captures
-            // already decoding may also be revoked, so admission remains bounded.
-            if (attempt === MAX_FRAME_ADMISSION_ATTEMPTS - 1) break;
-            options.onFinish();
-            const latest = options.authority();
-            if (!latest || latest.target.frameId === sentAuthority.target.frameId) {
-              if (!options.waitForFrame) throw new Error("Waiting for a current decoded frame.");
-              const remaining = admissionDeadline - Date.now();
-              if (remaining <= 0) break;
-              await options.waitForFrame(sentAuthority.target.frameId, remaining);
-            }
-            if (currentEpoch !== epoch) break;
-            current = options.authority();
-            if (!current || !sameAuthority(sentAuthority, current)) {
-              throw new Error("Browser input context changed. Release the gesture and try again.");
-            }
+          } finally {
+            // A cancelled incarnation must not clear another pending owner.
+            if (pendingAdmission === pending) pendingAdmission = null;
           }
           if (currentEpoch !== epoch || !sameAuthority(current, currentControl())) break;
           if (!owned)
@@ -354,7 +367,9 @@ export function createBrowserInputQueue(options: QueueOptions) {
   };
 
   const enqueue = (event: BrowserGestureEvent) => {
-    if (channel ? !sameAuthority(channel.authority, currentControl()) : !admissionAuthority()) {
+    const continuity =
+      channel?.authority ?? (pendingAdmission?.epoch === epoch ? pendingAdmission.authority : null);
+    if (continuity ? !sameAuthority(continuity, currentControl()) : !admissionAuthority()) {
       cancel();
       return false;
     }

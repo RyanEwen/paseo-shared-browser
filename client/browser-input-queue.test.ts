@@ -928,3 +928,99 @@ it("reuses acknowledged empty geometry for separate touch contacts and committed
   expect(f.errors).toEqual([]);
   f.queue.cancel();
 });
+
+it("preserves a complete tap while begin waits and only decoded authority is revoked", async () => {
+  const f = fixture(undefined, true);
+  const start: BrowserGestureEvent = {
+    kind: "touch",
+    type: "start",
+    points: [{ ...point(1), id: 0 }],
+  };
+  const end: BrowserGestureEvent = { kind: "touch", type: "end", points: [] };
+  expect(f.queue.enqueue(start)).toBe(true);
+  f.changeAuthority(null);
+  expect(f.queue.enqueue(end)).toBe(true);
+  f.queue.finish();
+  expect(f.sent).toEqual([]);
+  f.beginGate.resolve({ state, gestureId: "pending-tap", nextSequence: 1 });
+  await flush();
+  expect(f.sent.map((input) => input.event)).toEqual([start, end]);
+  expect(f.sent.map((input) => input.sequence)).toEqual([1, 2]);
+  expect(f.ended).toEqual([
+    expect.objectContaining({ gestureId: "pending-tap", sequence: 3, cancel: false }),
+  ]);
+  expect(f.errors).toEqual([]);
+});
+
+it("discards pending tap edges after actual control replacement", async () => {
+  const f = fixture(undefined, true);
+  f.queue.enqueue({ kind: "touch", type: "start", points: [{ ...point(1), id: 0 }] });
+  f.changeAuthority(null);
+  f.changeControl({ ...authority, controlToken: "replacement" });
+  expect(f.queue.enqueue({ kind: "touch", type: "end", points: [] })).toBe(false);
+  f.beginGate.resolve({ state, gestureId: "old-pending-tap", nextSequence: 1 });
+  await flush();
+  expect(f.sent).toEqual([]);
+  expect(f.ended).toEqual([
+    expect.objectContaining({ gestureId: "old-pending-tap", sequence: 1, cancel: true }),
+  ]);
+});
+
+it("publishes no buffered tap after unknown begin failure and never reuses its basis", async () => {
+  const f = fixture(undefined, true);
+  f.queue.enqueue({ kind: "touch", type: "start", points: [{ ...point(1), id: 0 }] });
+  f.changeAuthority(null);
+  expect(f.queue.enqueue({ kind: "touch", type: "end", points: [] })).toBe(true);
+  f.beginGate.reject(new Error("Unknown admission outcome"));
+  await flush();
+  expect(f.sent).toEqual([]);
+  expect(f.ended).toEqual([]);
+  expect(f.errors).toHaveLength(1);
+  expect(f.queue.enqueue({ kind: "touch", type: "start", points: [{ ...point(2), id: 0 }] })).toBe(
+    false,
+  );
+});
+
+it("preserves release during stale-frame waiting until fresh same-context admission", async () => {
+  const frameGate = deferred<void>();
+  let waiting = false;
+  const f = fixture(async () => {
+    waiting = true;
+    await frameGate.promise;
+  }, true);
+  const beginnings: BrowserGestureAuthority[] = [];
+  f.transport.begin = async (input) => {
+    beginnings.push(input);
+    return beginnings.length === 1
+      ? { state, admission: "stale-frame" }
+      : { state, gestureId: "fresh-tap", nextSequence: 1 };
+  };
+  const start: BrowserGestureEvent = {
+    kind: "touch",
+    type: "start",
+    points: [{ ...point(1), id: 0 }],
+  };
+  const end: BrowserGestureEvent = { kind: "touch", type: "end", points: [] };
+  f.queue.enqueue(start);
+  await flush();
+  expect(waiting).toBe(true);
+  f.changeAuthority(null);
+  expect(f.queue.enqueue(end)).toBe(true);
+  f.queue.finish();
+  expect(f.sent).toEqual([]);
+  f.changeAuthority({
+    ...authority,
+    target: { ...authority.target, frameId: "fresh-after-stale" },
+  });
+  frameGate.resolve();
+  await flush();
+  expect(beginnings.map((input) => input.target.frameId)).toEqual([
+    "decoded-front",
+    "fresh-after-stale",
+  ]);
+  expect(f.sent.map((input) => input.event)).toEqual([start, end]);
+  expect(f.ended).toEqual([
+    expect.objectContaining({ gestureId: "fresh-tap", sequence: 3, cancel: false }),
+  ]);
+  expect(f.errors).toEqual([]);
+});
