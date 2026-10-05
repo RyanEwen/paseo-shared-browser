@@ -97,6 +97,7 @@ export function useBrowserVideo(options: BrowserVideoOptions) {
   const frontRef = useRef<BrowserVideoPacket | null>(null);
   const visible = useRef(false);
   const hostActive = useRef(false);
+  const [active, setActive] = useState(false);
   const [failure, setFailure] = useState<{ error: unknown; viewerToken: string | null } | null>(
     null,
   );
@@ -387,6 +388,7 @@ export function useBrowserVideo(options: BrowserVideoOptions) {
     const synchronize = () => {
       const active = documentActive && applicationActive && options.active !== false;
       hostActive.current = active;
+      setActive(active);
       if (!active) {
         // Revoke pixels synchronously with real host suspension. Any uncancelable
         // bounded SDK read is discarded, and cannot overlap the next incarnation.
@@ -419,6 +421,7 @@ export function useBrowserVideo(options: BrowserVideoOptions) {
   }, [node, options.viewerToken, options.quality, options.active, options.bitrate, options.fps]);
 
   return {
+    active,
     canvasRef,
     front,
     frontViewport: presentation?.viewport ?? null,

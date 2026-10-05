@@ -33,6 +33,17 @@ const harness = vi.hoisted(() => ({
   disposals: 0,
   decoderCloses: 0,
 }));
+const imageQuery = vi.hoisted(() => ({
+  options: null as null | { enabled: boolean; queryFn(): Promise<unknown> },
+  refetch: vi.fn(() => Promise.resolve()),
+}));
+vi.mock("@tanstack/react-query", () => ({
+  CancelledError: class extends Error {},
+  useQuery(options: { enabled: boolean; queryFn(): Promise<unknown> }) {
+    imageQuery.options = options;
+    return { refetch: imageQuery.refetch };
+  },
+}));
 vi.mock("react", () => {
   const effect = (
     operation: () => (() => void) | void,
@@ -885,4 +896,40 @@ it("rapid local presses preserve one decoder and delta cursor while old-read pai
   }
   expect(harness.decoderCloses).toBe(initialCloses);
   expect(f.drawn).toHaveLength(11);
+});
+
+it("stops hidden-panel JPEG requests, including a queued refresh follow-up", async () => {
+  const { useBrowserImageCapture } = await import("./use-browser-image-capture");
+  const capture = vi.fn();
+  let active = true;
+  const render = () => {
+    harness.index = 0;
+    return useBrowserImageCapture({
+      active,
+      viewerToken: "viewer",
+      quality: "high",
+      activeInput: false,
+      videoOwnsPresentation: false,
+      hasVideoPresentation: () => false,
+      refreshVideo: vi.fn(),
+      mutationEpoch: () => 0,
+      knownFrame: () => null,
+      capture,
+    });
+  };
+  const shown = render();
+  expect(imageQuery.options?.enabled).toBe(true);
+  const queuedCapture = imageQuery.options!.queryFn;
+  active = false;
+  const hidden = render();
+  expect(imageQuery.options?.enabled).toBe(false);
+  await expect(queuedCapture()).rejects.toBeDefined();
+  hidden.refreshCapture();
+  hidden.retryFrameCapture();
+  shown.refreshCapture();
+  expect(capture).not.toHaveBeenCalled();
+  expect(imageQuery.refetch).not.toHaveBeenCalled();
+  active = true;
+  render().refreshCapture();
+  expect(imageQuery.refetch).toHaveBeenCalledOnce();
 });

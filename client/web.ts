@@ -295,6 +295,7 @@ interface VideoCanvasElement {
   remove(): void;
 }
 export interface BrowserVideoCanvasNode {
+  getClientRects(): ArrayLike<unknown>;
   appendChild(child: VideoCanvasElement): void;
   ownerDocument: {
     createElement(kind: "canvas"): VideoCanvasElement;
@@ -302,6 +303,12 @@ export interface BrowserVideoCanvasNode {
     addEventListener(type: string, listener: () => void): void;
     removeEventListener(type: string, listener: () => void): void;
     defaultView: {
+      IntersectionObserver: new (
+        callback: (entries: { isIntersecting: boolean }[]) => void,
+      ) => {
+        observe(node: BrowserVideoCanvasNode): void;
+        disconnect(): void;
+      };
       requestAnimationFrame(callback: () => void): number;
       cancelAnimationFrame(id: number): void;
       addEventListener(type: string, listener: () => void): void;
@@ -368,7 +375,15 @@ export function bindBrowserVideoVisibility(
   const document = node.ownerDocument;
   const view = document.defaultView;
   let suspended = false;
-  const changed = () => onActive(!document.hidden && !suspended);
+  let intersecting = node.getClientRects().length > 0;
+  const changed = () => onActive(!document.hidden && !suspended && intersecting);
+  const observer = view
+    ? new view.IntersectionObserver((entries) => {
+        intersecting = entries.some((entry) => entry.isIntersecting);
+        changed();
+      })
+    : null;
+  observer?.observe(node);
   const hide = () => {
     suspended = true;
     changed();
@@ -382,6 +397,7 @@ export function bindBrowserVideoVisibility(
   view?.addEventListener("pageshow", show);
   changed();
   return () => {
+    observer?.disconnect();
     document.removeEventListener("visibilitychange", changed);
     view?.removeEventListener("pagehide", hide);
     view?.removeEventListener("pageshow", show);

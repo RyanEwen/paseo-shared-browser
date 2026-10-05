@@ -12,6 +12,8 @@ import type { CaptureQuality } from "../shared/capture-settings";
 import { browserCaptureInterval } from "./browser-capture-cadence";
 
 interface ImageCaptureOptions {
+  /** Hidden retained panels keep state but publish no new media requests. */
+  active?: boolean;
   viewerToken: string | null;
   quality: CaptureQuality;
   activeInput: boolean;
@@ -48,6 +50,7 @@ export function useBrowserImageCapture(options: ImageCaptureOptions) {
       // A timer already queued before video paint must not publish a JPEG RPC.
       if (
         !mounted.current ||
+        latest.current.active === false ||
         latest.current.viewerToken !== options.viewerToken ||
         latest.current.quality !== options.quality ||
         latest.current.videoOwnsPresentation ||
@@ -78,12 +81,13 @@ export function useBrowserImageCapture(options: ImageCaptureOptions) {
       }
     },
     enabled:
+      options.active !== false &&
       Boolean(options.viewerToken) &&
       !options.videoOwnsPresentation &&
       !options.hasVideoPresentation(),
     retry: false,
     refetchInterval: (query) =>
-      options.videoOwnsPresentation
+      options.active === false || options.videoOwnsPresentation
         ? false
         : browserCaptureInterval(query.state.data?.state.status, options.activeInput),
     refetchIntervalInBackground: false,
@@ -93,7 +97,7 @@ export function useBrowserImageCapture(options: ImageCaptureOptions) {
 
   const refreshCapture = useCallback(() => {
     const current = latest.current;
-    if (!mounted.current) return;
+    if (!mounted.current || current.active === false) return;
     current.refreshVideo();
     if (!current.viewerToken || current.videoOwnsPresentation || current.hasVideoPresentation())
       return;
@@ -106,6 +110,7 @@ export function useBrowserImageCapture(options: ImageCaptureOptions) {
         const after = latest.current;
         if (
           !mounted.current ||
+          after.active === false ||
           after.viewerToken !== viewerToken ||
           after.quality !== quality ||
           after.videoOwnsPresentation ||
@@ -121,6 +126,7 @@ export function useBrowserImageCapture(options: ImageCaptureOptions) {
     const current = latest.current;
     if (
       mounted.current &&
+      current.active !== false &&
       current.viewerToken &&
       !current.videoOwnsPresentation &&
       !current.hasVideoPresentation()

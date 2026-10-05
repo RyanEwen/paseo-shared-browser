@@ -161,6 +161,7 @@ export function SharedBrowserPanel({
   host,
   layout,
   workspaceId,
+  active = true,
 }: PluginWorkspacePanelProps) {
   const styles = useMemo(() => createStyles(theme, layout.compact), [theme, layout.compact]);
   const viewerLabel = useState(() =>
@@ -355,6 +356,7 @@ export function SharedBrowserPanel({
   }, [state?.sessionId, state?.viewportGeneration]);
 
   const video = useBrowserVideo({
+    active,
     viewerToken,
     quality: "high",
     bitrate: preferences.videoBitrate,
@@ -391,6 +393,7 @@ export function SharedBrowserPanel({
     refreshCapture,
     retryFrameCapture,
   } = useBrowserImageCapture({
+    active: active && (!video.supported || video.active),
     viewerToken,
     quality: preferences.captureQuality,
     activeInput,
