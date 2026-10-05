@@ -7,6 +7,7 @@ import { DEVICE_PRESETS } from "./device-presets";
 import {
   groupResolutionPresets,
   normalizeResolutionFavorites,
+  orderedResolutionFavorites,
   toggleResolutionFavorite,
 } from "./resolution-menu";
 
@@ -40,6 +41,31 @@ describe("resolution choices and host preferences", () => {
       "pixel-7-sharp",
       "ipad-pro-11",
     ]);
+  });
+
+  it("projects scrambled saved favorites in the grouped picker order without rewriting them", () => {
+    const saved = Object.freeze([
+      "pixel-7-sharp",
+      "desktop-1440x1440",
+      "desktop-1920x1200",
+      "desktop-2560x1440",
+      "desktop-1440x900",
+      "desktop-chrome",
+      "desktop-1440x810",
+      "desktop-chrome",
+      "retired",
+    ]);
+    expect(orderedResolutionFavorites(saved)).toEqual([
+      "desktop-chrome",
+      "desktop-1440x810",
+      "desktop-2560x1440",
+      "desktop-1440x900",
+      "desktop-1920x1200",
+      "desktop-1440x1440",
+      "pixel-7-sharp",
+    ]);
+    expect(saved[0]).toBe("pixel-7-sharp");
+    expect(saved).toHaveLength(9);
   });
 
   it("prunes removed favorites and duplicates without changing stable favorite order", () => {

@@ -38,8 +38,7 @@ organization names.
   `AGENT_BROWSER_IDLE_TIMEOUT_MS=0`, `AGENT_BROWSER_STREAM_PORT=0`, and
   `AGENT_BROWSER_NO_AUTO_DIALOG=1` itself.
 - Desktop/web clients with usable WebCodecs and Android apps with the host video renderer
-  receive encoded workspace-tab video. Other native and unsupported clients receive JPEG frames
-  from CDP `Page.startScreencast` or bounded screenshots.
+  receive encoded workspace-tab video. Other native and unsupported clients receive JPEG frames from CDP `Page.startScreencast` or bounded screenshots.
   Remote input supports mouse hover, wheel scrolling, continuous dragging, native touch pan/pinch,
   tap, double-tap, right-click, text, and special keys.
 - Device presets for Desktop Chrome, iPhone 15 Pro, Pixel 7, and iPad Pro 11 change Chromium's
@@ -140,7 +139,8 @@ User-supplied `AGENT_BROWSER_*` variables are deliberately ignored.
 ## Controls
 
 - Toolbar: back, forward, reload, address bar, a combined monitor menu, mobile emulation toggle
-  and a vertical-dots browser actions menu.
+  and a vertical-dots browser actions menu. Icon controls expose their action name
+  as a hover tooltip on desktop/web and retain native accessibility labels.
 - Custom viewports support 320 to 2560 pixels wide and 480 to 2560 pixels high. Invalid sizes
   show their error inside the device dialog; a successful Apply closes it.
 - Desktop presets also include 1280 × 800 (16:10) and 1280 × 1280 (1:1).
@@ -148,9 +148,13 @@ User-supplied `AGENT_BROWSER_*` variables are deliberately ignored.
   with a sharper 824 × 1678 capture.
 - Desktop presets include 1920 × 1080 and 2560 × 1440 (16:9), 1920 × 1200 and
   2560 × 1600 (16:10), and 1920 × 1920 and 2560 × 2560 (1:1).
+- Desktop choices use height names such as 720p, 1080p, 1200p and 1440p, with
+  dimensions shown alongside. Square choices name their width explicitly.
+  The 1440-wide choices are 1440 × 810, 1440 × 900 and 1440 × 1440.
 - The Resolution and quality menu groups desktop choices by 16:9, 16:10 and 1:1,
   then mobile. Each group sorts by width. Filled stars mark favorites; the monitor
-  menu provides favorites and access to the full resolution and quality list.
+  menu provides favorites in that same grouped order and access to the full
+  resolution and quality list.
 - Monitor and browser actions open compact anchored menus rather than dialogs. Menus stay
   within the pane, scroll long lists, and dismiss with an outside press, Escape or native Back.
 - The monitor menu offers **Fit to panel** (default) and **Actual size (100%)**. Actual size
@@ -237,6 +241,8 @@ User-supplied `AGENT_BROWSER_*` variables are deliberately ignored.
 - Human control: **Take control**, **Release**, and **Take over** for explicit handoff. Agent MCP
   calls have no forced-takeover operation.
 - With control, mouse movement forwards real hover effects and standard browser cursor changes.
+  Automatic cursors resolve selectable text to an I-beam while respecting explicit
+  cursor styles and non-selectable areas.
   Wheel scrolling stays inside the browser canvas; held drags update before release. Leaving the
   canvas clears remote hover, while dragging beyond its edges still releases the held button.
 - Hidden Linux browsers use an authenticated private virtual display when `/usr/bin/Xvfb`

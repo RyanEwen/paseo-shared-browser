@@ -1,7 +1,7 @@
 /** Public themed panel controls and notices. Leaves own only focus/hover styling, never browser authority. */
 import type { PluginWorkspacePanelProps } from "@getpaseo/plugin/client";
 import { Icon, TextInput } from "@getpaseo/plugin/client/react-native";
-import { type ReactNode, useState } from "react";
+import { type ReactNode, useCallback, useState } from "react";
 import {
   ActivityIndicator,
   Pressable,
@@ -12,6 +12,7 @@ import {
   View,
   type ViewStyle,
 } from "react-native";
+import { setBrowserControlTooltip } from "./browser-control-tooltip-web";
 import { DIMENSION } from "./browser-panel-styles";
 
 type Theme = PluginWorkspacePanelProps["theme"];
@@ -149,8 +150,10 @@ export function ChromeIconButton({
   onPress(): void;
 }) {
   const [hovered, setHovered] = useState(false);
+  const tooltipRef = useCallback((node: unknown) => setBrowserControlTooltip(node, label), [label]);
   return (
     <Pressable
+      ref={tooltipRef}
       accessibilityRole="button"
       accessibilityLabel={label}
       accessibilityState={{ disabled, selected, ...(expanded === undefined ? {} : { expanded }) }}

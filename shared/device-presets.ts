@@ -11,19 +11,13 @@ const DESKTOP_CHROME_EMULATION = {
 
 /** Larger desktop presets change resolution while retaining the same input and browser behavior. */
 function createDesktopPreset<const Id extends string>(id: Id, width: number, height: number) {
-  const dimensions = `${width} × ${height}`;
-  let ratio = "16:9";
-  if (width === height) {
-    ratio = "1:1";
-  } else if (width * 10 === height * 16) {
-    ratio = "16:10";
-  }
+  const name = width === height ? `${width} square` : `${height}p`;
 
   return {
     ...DESKTOP_CHROME_EMULATION,
     id,
-    label: `Desktop ${dimensions} (${ratio})`,
-    shortLabel: dimensions,
+    label: name,
+    shortLabel: name,
     viewport: { width, height },
   } as const;
 }
@@ -43,15 +37,12 @@ const PIXEL_7_EMULATION = {
 } as const;
 
 export const DEVICE_PRESETS = [
-  {
-    ...DESKTOP_CHROME_EMULATION,
-    id: "desktop-chrome",
-    label: "Desktop Chrome",
-    shortLabel: "Desktop",
-    viewport: { width: 1280, height: 720 },
-  },
+  createDesktopPreset("desktop-chrome", 1280, 720),
   createDesktopPreset("desktop-1280x800", 1280, 800),
   createDesktopPreset("desktop-1280x1280", 1280, 1280),
+  createDesktopPreset("desktop-1440x810", 1440, 810),
+  createDesktopPreset("desktop-1440x900", 1440, 900),
+  createDesktopPreset("desktop-1440x1440", 1440, 1440),
   createDesktopPreset("desktop-1920x1080", 1920, 1080),
   createDesktopPreset("desktop-2560x1440", 2560, 1440),
   createDesktopPreset("desktop-1920x1200", 1920, 1200),

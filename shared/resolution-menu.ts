@@ -54,6 +54,15 @@ export function normalizeResolutionFavorites(ids: readonly string[]): DevicePres
   return favorites;
 }
 
+/** Project stored favorites in picker order without rewriting the user's saved settings. */
+export function orderedResolutionFavorites(ids: readonly string[]): DevicePresetId[] {
+  const favorites = new Set(normalizeResolutionFavorites(ids));
+  return groupResolutionPresets()
+    .flatMap((group) => group.presets)
+    .filter((preset) => favorites.has(preset.id))
+    .map((preset) => preset.id);
+}
+
 /** Toggle only a current preset. Unknown IDs cannot become persisted shortcuts. */
 export function toggleResolutionFavorite(ids: readonly string[], id: string): DevicePresetId[] {
   const current = normalizeResolutionFavorites(ids);
