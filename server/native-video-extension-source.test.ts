@@ -1,6 +1,6 @@
 /** Exercise the actual trusted helper program's producer bounds without a fake duplicate policy. */
 import { createContext, runInContext } from "node:vm";
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 import { NATIVE_VIDEO_EXTENSION_SOURCE } from "./native-video-extension-source";
 
 it("oversize closes only that encoder, and repeated source frames cannot restart expensive keys", async () => {
@@ -8,6 +8,12 @@ it("oversize closes only that encoder, and repeated source frames cannot restart
   const encoders: { configuration: { bitrate: number }; calls: number; closed: boolean }[] = [];
   let deliver: (result: unknown) => void = () => {};
   let stopped = false;
+  const scaledFrames: {
+    timestamp: number;
+    displayWidth: number;
+    displayHeight: number;
+    close: ReturnType<typeof vi.fn>;
+  }[] = [];
   const reader = {
     read: () =>
       new Promise((resolve) => {
@@ -74,6 +80,21 @@ it("oversize closes only that encoder, and repeated source frames cannot restart
       readable = { getReader: () => reader };
     },
     VideoEncoder: Encoder,
+    VideoFrame: class {
+      timestamp: number;
+      displayWidth: number;
+      displayHeight: number;
+      close = vi.fn();
+      constructor(
+        source: { timestamp: number },
+        options: { displayWidth: number; displayHeight: number },
+      ) {
+        this.timestamp = source.timestamp;
+        this.displayWidth = options.displayWidth;
+        this.displayHeight = options.displayHeight;
+        scaledFrames.push(this);
+      }
+    },
     nativeVideoPacket: (json: string) => packets.push(JSON.parse(json)),
     performance: { now: () => 100 },
     Uint8Array,
@@ -115,4 +136,66 @@ it("oversize closes only that encoder, and repeated source frames cannot restart
   });
   await runInContext("stopCapture()", context);
   expect(stopped).toBe(true);
+  await runInContext('startCapture("exact",412,839,3)', context);
+  await runInContext('addEncoder("low","odd-stream")', context);
+  const close = vi.fn();
+  deliver({
+    value: { timestamp: 300000, displayWidth: 412, displayHeight: 838, format: "I420", close },
+    done: false,
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  expect(packets).toContainEqual(
+    expect.objectContaining({
+      streamId: "odd-stream",
+      width: 412,
+      height: 839,
+      timestampUs: 300000,
+    }),
+  );
+  expect(close).toHaveBeenCalledOnce();
+  expect(scaledFrames[0]?.close).toHaveBeenCalledOnce();
+  await runInContext("stopCapture()", context);
 });
+
+it.each([
+  [412, 839, 412, 838],
+  [393, 659, 392, 658],
+  [413, 800, 412, 800],
+])(
+  "corrects only even-aligned YUV dimensions for %i by %i",
+  (width, height, nativeWidth, nativeHeight) => {
+    const frames: unknown[] = [];
+    const context = createContext({
+      VideoFrame: class {
+        constructor(
+          readonly source: unknown,
+          readonly options: unknown,
+        ) {
+          frames.push(this);
+        }
+      },
+    });
+    runInContext(NATIVE_VIDEO_EXTENSION_SOURCE, context);
+    const native = {
+      displayWidth: nativeWidth,
+      displayHeight: nativeHeight,
+      format: "I420",
+      timestamp: 42,
+    };
+    context.frame = native;
+    const result = runInContext(`frameForViewport(frame,${width},${height})`, context);
+    expect(result.source).toBe(native);
+    expect(result.options).toEqual({ displayWidth: width, displayHeight: height });
+    expect(frames).toHaveLength(1);
+    context.frame = { ...native, displayWidth: width, displayHeight: height };
+    expect(runInContext(`frameForViewport(frame,${width},${height})`, context)).toBe(context.frame);
+    for (const invalid of [
+      { ...native, displayHeight: nativeHeight - 2 },
+      { ...native, displayWidth: nativeWidth + 2 },
+      { ...native, format: "RGBA" },
+    ]) {
+      context.frame = invalid;
+      expect(runInContext(`frameForViewport(frame,${width},${height})`, context)).toBeNull();
+    }
+  },
+);

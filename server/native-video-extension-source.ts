@@ -35,6 +35,19 @@ async function stopCapture() {
   await previous.reader.cancel().catch(() => {});
   await previous.loop.catch(() => {});
 }
+/** Preserve requested geometry across Chromium's even-aligned YUV capture.
+ * Only the known one-pixel rounding is resampled by VideoEncoder. Other source
+ * changes remain failures; cloning retains the source timestamp and lifetime.
+ */
+function frameForViewport(frame, width, height) {
+  if (frame.displayWidth === width && frame.displayHeight === height) return frame;
+  if (
+    !["I420", "NV12"].includes(frame.format) ||
+    frame.displayWidth !== (width & ~1) ||
+    frame.displayHeight !== (height & ~1)
+  ) return null;
+  return new VideoFrame(frame, { displayWidth: width, displayHeight: height });
+}
 /** Start one exact tab at physical pixel dimensions; generation fences previously queued frames. */
 async function startCapture(targetId, width, height, generation) {
   await stopCapture();
@@ -82,12 +95,14 @@ async function startCapture(targetId, width, height, generation) {
               nativeVideoPacket(JSON.stringify({ error: "Native video capture stopped" }));
             break;
           }
+          let encodingFrame = null;
           try {
             if (capture !== current || current.stopped) break;
             if (frame.timestamp < current.minimumTimestampUs) continue;
-            if (frame.displayWidth !== width || frame.displayHeight !== height) {
-              // Exact pixels are mandatory. Do not silently crop, pad or change
-              // density; distinguish this permanent geometry failure privately.
+            encodingFrame = frameForViewport(frame, width, height);
+            if (!encodingFrame) {
+              // Only native YUV even-alignment is correctable. Keep unexpected
+              // source geometry terminal without changing viewport or density.
               nativeVideoPacket(
                 JSON.stringify({
                   error: "Native video dimensions changed",
@@ -122,7 +137,7 @@ async function startCapture(targetId, width, height, generation) {
               const keyFrame =
                 state.forceKey || frame.timestamp - state.lastKeyTimestamp >= 1000000;
               try {
-                state.encoder.encode(frame, { keyFrame });
+                state.encoder.encode(encodingFrame, { keyFrame });
               } catch {
                 // A synchronous codec rejection belongs to this cohort, just
                 // like its asynchronous error callback. Healthy peers keep the track.
@@ -143,6 +158,7 @@ async function startCapture(targetId, width, height, generation) {
               state.forceKey = false;
             }
           } finally {
+            if (encodingFrame && encodingFrame !== frame) encodingFrame.close();
             frame.close();
           }
         }

@@ -105,10 +105,12 @@ Rendering DPR is raised to at least the selected density while a genuine phone
 DPR is retained. Explicit preset changes retain their established density reset
 behavior; mode-only changes retain it. Returned state reports actual density.
 
-Native and decoded dimensions must match exactly. An isolated Chromium 154 probe
-produced 412 by 838 native pixels for a requested 412 by 839 Pixel 7 viewport;
-824 by 1678 at 2x matched. The implementation refuses the mismatch rather than
-silently cropping, rounding, padding or changing density.
+Encoded and decoded dimensions match the requested viewport and density. Chromium
+YUV capture rounds odd physical dimensions down to even sizes. Only that exact
+one-pixel alignment is resampled by the encoder to the requested size, preserving
+page layout, capture density and source timing. Other dimension mismatches remain
+terminal. Odd-sized 1x captures can use VP8 when H.264 rejects those dimensions;
+2x Pixel 7 capture remains 824 by 1678.
 
 ## Failure and navigation recovery
 

@@ -249,6 +249,8 @@ async function proveNativeVideo(pointerKind: "mouse" | "touch") {
     await connection.send("Target.activateTarget", { targetId: created.targetId });
     const presets: readonly { id: DevicePresetId; width: number; height: number }[] = [
       { id: "desktop-1280x800", width: 1280, height: 800 },
+      { id: "pixel-7", width: 412, height: 839 },
+      { id: "iphone-15-pro", width: 393, height: 659 },
       { id: "pixel-7-sharp", width: 824, height: 1678 },
       { id: "desktop-2560x2560", width: 2560, height: 2560 },
     ];
