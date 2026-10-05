@@ -18,7 +18,7 @@ async function fixture(launchEnvironment?: Readonly<Record<string, string>>) {
     binary,
     "#!" +
       process.execPath +
-      '\nif(process.argv.includes("--version")){console.log("0.37.1");}else{console.log(JSON.stringify({display:process.env.DISPLAY??null,authority:process.env.XAUTHORITY??null,wayland:process.env.WAYLAND_DISPLAY??null,socket:process.env.AGENT_BROWSER_SOCKET_DIR,profile:process.env.AGENT_BROWSER_PROFILE??null,args:process.argv.slice(2)}));}\n',
+      '\nif(process.argv.includes("--version")){console.log("0.38.2");}else{console.log(JSON.stringify({display:process.env.DISPLAY??null,authority:process.env.XAUTHORITY??null,wayland:process.env.WAYLAND_DISPLAY??null,socket:process.env.AGENT_BROWSER_SOCKET_DIR,profile:process.env.AGENT_BROWSER_PROFILE??null,args:process.argv.slice(2)}));}\n',
     { mode: 0o700 },
   );
   const runtime = new AgentBrowserRuntime({

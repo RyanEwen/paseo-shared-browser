@@ -33,7 +33,7 @@ organization names.
 - The plugin server runs beside the Paseo daemon and starts one `agent-browser` session and Chromium
   process per open browser workspace. Browser execution, profiles, IPC, and network access are on the
   daemon host, not on the viewing phone, browser, or desktop app.
-- The plugin owns `agent-browser` version `0.37.1`, its IPC directory, and the Chromium executable.
+- The plugin owns `agent-browser` version `0.38.2`, its IPC directory, and the Chromium executable.
   It strips inherited `AGENT_BROWSER_*` variables and sets `AGENT_BROWSER_SOCKET_DIR`,
   `AGENT_BROWSER_IDLE_TIMEOUT_MS=0`, `AGENT_BROWSER_STREAM_PORT=0`, and
   `AGENT_BROWSER_NO_AUTO_DIALOG=1` itself.
