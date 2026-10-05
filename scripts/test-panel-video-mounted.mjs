@@ -235,6 +235,15 @@ try {
   assert(control, "take control");
   await React.act(async () => control.click());
   await flush(30);
+  for (const label of ["Back", "Forward", "Reload", "Display options", "Browser menu"]) {
+    const button = document.querySelector(`button[aria-label="${label}"]`);
+    assert(button, `toolbar control ${label}`);
+    assert.equal(
+      button.getAttribute("title"),
+      label,
+      "icon-only controls expose native hover titles",
+    );
+  }
   if (values.fixture === "settlement") {
     // Real Query callback replacement: viewing recovery completes while a
     // published control acquisition is still awaiting its original reply.

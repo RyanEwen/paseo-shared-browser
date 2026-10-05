@@ -1,6 +1,7 @@
 /**
  * Encoded browser-tab video over the existing authenticated Paseo RPC transport.
- * Native clients retain JPEG playback. Packets never grant control; only a decoded
+ * Android uses the host video canvas; other native clients retain JPEG playback.
+ * Packets never grant control; only a decoded
  * presentation with current browser authority can provide an input target.
  */
 import { defineRpc } from "@getpaseo/plugin";

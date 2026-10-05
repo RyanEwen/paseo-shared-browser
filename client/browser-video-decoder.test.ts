@@ -29,7 +29,7 @@ function packet(sequence = 1, type: "key" | "delta" = "key", generation = 1): Br
     },
   };
 }
-function fixture(sourceVisuals = false) {
+function fixture(sourceVisuals = false, nativeDraw?: () => Promise<void>) {
   let currentEpoch = 1;
   let currentNavigation = 1;
   const admitted: number[] = [];
@@ -71,6 +71,7 @@ function fixture(sourceVisuals = false) {
       },
       draw(frame) {
         drawn.push(frame.timestamp);
+        return nativeDraw?.();
       },
     },
     isCurrent: (value, epoch) =>
@@ -412,4 +413,61 @@ it("catch-up retains the original input epoch even when newer key pixels remain 
   expect(f.presented).toEqual([3]);
   expect(f.admitted).toEqual([]);
   expect(f.keys()).toBe(0);
+});
+
+/** A native acknowledgement may arrive after mutation or decoder replacement. */
+it.each(["current", "mutation", "reset"] as const)(
+  "admits asynchronous native paint only for a current receipt (%s)",
+  async (invalidation) => {
+    let complete = () => {};
+    const f = fixture(
+      false,
+      () =>
+        new Promise<void>((resolve) => {
+          complete = resolve;
+        }),
+    );
+    f.decoder.receive(packet(), 1);
+    f.output(1000);
+    f.paint();
+    expect(f.presented).toEqual([]);
+    if (invalidation === "mutation") f.epoch(2);
+    if (invalidation === "reset") f.decoder.reset();
+    complete();
+    await Promise.resolve();
+    expect(f.presented).toEqual(invalidation === "current" ? [1] : []);
+    expect(f.closed).toEqual([1000]);
+    f.decoder.close();
+  },
+);
+
+it("serializes native paints while keeping only the newest waiting frame", async () => {
+  let complete = () => {};
+  const f = fixture(
+    false,
+    () =>
+      new Promise<void>((resolve) => {
+        complete = resolve;
+      }),
+  );
+  f.decoder.receive(packet(), 1);
+  f.output(1000);
+  f.paint();
+  f.decoder.receive(packet(2, "delta"), 1);
+  f.output(2000);
+  f.decoder.receive(packet(3, "delta"), 1);
+  f.output(3000);
+  f.paint();
+  expect(f.drawn).toEqual([1000]);
+  expect(f.presented).toEqual([]);
+  complete();
+  await Promise.resolve();
+  expect(f.presented).toEqual([1]);
+  f.paint();
+  expect(f.drawn).toEqual([1000, 3000]);
+  complete();
+  await Promise.resolve();
+  expect(f.presented).toEqual([1, 3]);
+  expect(f.closed).toEqual([2000, 1000, 3000]);
+  f.decoder.close();
 });

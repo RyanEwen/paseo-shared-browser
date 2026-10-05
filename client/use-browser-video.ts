@@ -1,7 +1,7 @@
 /**
  * Single-flight encoded-video reader. RPC waits never overlap per viewer; canceled
- * replies are discarded and cannot restore input against old pixels. Native hosts
- * keep the existing image path, as their public SDK has no video renderer.
+ * replies are discarded and cannot restore input against old pixels. Android uses
+ * the host video surface; other native hosts keep the existing image path.
  * Document/AppState suspension releases the decoder and stops reads. A bounded
  * in-flight SDK read cannot be aborted; its result is discarded before resuming.
  * Read failures get three delayed attempts, with failure cleared only by paint.
@@ -15,13 +15,13 @@ import { AppState } from "react-native";
 import type { BrowserState, Viewport } from "../shared/browser";
 import { type BrowserVideoPacket, readBrowserVideoRpc } from "../shared/browser-video";
 import { createBrowserVideoDecoder } from "./browser-video-decoder";
-import { isExpiredBrowserViewerError } from "./browser-viewer-recovery";
 import {
   type BrowserVideoCanvasNode,
   bindBrowserVideoVisibility,
   createBrowserVideoEnvironment,
   supportsBrowserVideo,
-} from "./web";
+} from "./browser-video-surface";
+import { isExpiredBrowserViewerError } from "./browser-viewer-recovery";
 
 interface BrowserVideoOptions {
   viewerToken: string | null;
@@ -148,7 +148,12 @@ export function useBrowserVideo(options: BrowserVideoOptions) {
     let applicationActive = AppState.currentState == null || AppState.currentState === "active";
     const start = () => {
       videoGeneration.current += 1;
-      const target = createBrowserVideoEnvironment(node);
+      const target = createBrowserVideoEnvironment(node, () => {
+        // Native pixels may change before the bridge acknowledgement arrives.
+        // Revoke the old receipt before sending any asynchronous draw command.
+        authorityRevision.current += 1;
+        frontRef.current = null;
+      });
       if (!target) return null;
       let stopped = false;
       let readExhausted = false;
@@ -441,6 +446,7 @@ export function useBrowserVideo(options: BrowserVideoOptions) {
   return {
     active,
     canvasRef,
+    surfaceError: (error: unknown) => setFailure({ error, viewerToken: options.viewerToken }),
     front,
     frontViewport: presentation?.viewport ?? null,
     frontRef,

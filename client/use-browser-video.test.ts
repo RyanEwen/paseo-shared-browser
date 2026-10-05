@@ -107,7 +107,7 @@ vi.mock("react-native", () => ({
     },
   },
 }));
-vi.mock("./web", () => ({
+vi.mock("./browser-video-surface", () => ({
   bindBrowserVideoVisibility(_node: unknown, callback: (active: boolean) => void) {
     harness.visibility = callback;
     callback(harness.documentActive);

@@ -30,11 +30,17 @@ export interface BrowserVideoDecodeEnvironment {
     /** Native queue capacity can free without producing a frame. */
     dequeue(): void;
   }): BrowserVideoCodec;
+  /** Native bridges already carry base64; avoid decoding and re-encoding each packet in Hermes. */
+  createEncodedChunk?(input: {
+    type: "key" | "delta";
+    timestamp: number;
+    dataBase64: string;
+  }): unknown;
   createChunk(input: { type: "key" | "delta"; timestamp: number; data: Uint8Array }): unknown;
   decodeBase64(data: string): Uint8Array;
   /** Schedule a draw on the next local paint; return an idempotent cancellation. */
   scheduleDraw(draw: () => void): () => void;
-  draw(frame: DecodedBrowserVideoFrame): void;
+  draw(frame: DecodedBrowserVideoFrame): void | Promise<void>;
 }
 export interface BrowserVideoDecoderOptions {
   environment: BrowserVideoDecodeEnvironment;
@@ -65,6 +71,7 @@ export function createBrowserVideoDecoder(options: BrowserVideoDecoderOptions) {
   let sequence = 0;
   let lastPresentedTimestamp = -1;
   let scheduled: (() => void) | null = null;
+  let painting = false;
   let paint: { frame: DecodedBrowserVideoFrame; packet: BrowserVideoPacket; epoch: number } | null =
     null;
   const pending = new Map<number, { packet: BrowserVideoPacket; epoch: number }>();
@@ -113,13 +120,21 @@ export function createBrowserVideoDecoder(options: BrowserVideoDecoderOptions) {
           return;
         }
         pending.set(entry.packet.timestampUs, entry);
-        codec.decode(
-          environment.createChunk({
+        let chunk: unknown;
+        if (environment.createEncodedChunk) {
+          chunk = environment.createEncodedChunk({
+            type: entry.packet.type,
+            timestamp: entry.packet.timestampUs,
+            dataBase64: entry.packet.dataBase64,
+          });
+        } else {
+          chunk = environment.createChunk({
             type: entry.packet.type,
             timestamp: entry.packet.timestampUs,
             data: environment.decodeBase64(entry.packet.dataBase64),
-          }),
-        );
+          });
+        }
+        codec.decode(chunk);
       }
     } catch (error) {
       fail(error);
@@ -159,22 +174,63 @@ export function createBrowserVideoDecoder(options: BrowserVideoDecoderOptions) {
     // Keep only the newest decoded frame while the local compositor is delayed.
     paint?.frame.close();
     paint = { frame, packet: entry.packet, epoch: entry.epoch };
-    if (scheduled) return;
+    schedulePaint();
+  };
+
+  /** Native paint crosses an asynchronous bridge. Serialize presentations so a
+   * newer frame cannot replace the pixels while an older receipt is admitted. */
+  const schedulePaint = () => {
+    if (scheduled || painting || !paint || closed) return;
+    const generation = decoderGeneration;
     scheduled = environment.scheduleDraw(() => {
       scheduled = null;
       const selected = paint;
       paint = null;
       if (!selected) return;
-      try {
-        if (!closed && canPresent(selected.packet, selected.epoch)) {
-          environment.draw(selected.frame);
+      const complete = () => {
+        if (
+          !closed &&
+          generation === decoderGeneration &&
+          canPresent(selected.packet, selected.epoch)
+        ) {
           lastPresentedTimestamp = selected.frame.timestamp;
           options.onPresented(selected.packet, selected.epoch);
         }
-      } catch (error) {
-        fail(error);
-      } finally {
+      };
+      const release = () => {
         selected.frame.close();
+        painting = false;
+        schedulePaint();
+      };
+      try {
+        if (
+          closed ||
+          generation !== decoderGeneration ||
+          !canPresent(selected.packet, selected.epoch)
+        ) {
+          release();
+          return;
+        }
+        const result = environment.draw(selected.frame);
+        if (!result) {
+          complete();
+          release();
+          return;
+        }
+        painting = true;
+        void (async () => {
+          try {
+            await result;
+            complete();
+          } catch (error) {
+            if (!closed && generation === decoderGeneration) fail(error);
+          } finally {
+            release();
+          }
+        })();
+      } catch (error) {
+        if (generation === decoderGeneration) fail(error);
+        release();
       }
     });
   };

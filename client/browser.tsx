@@ -64,6 +64,7 @@ import {
   BrowserMenuSeparator,
   BrowserToolbarMenu,
 } from "./browser-toolbar-menu";
+import { BrowserVideoSurface } from "./browser-video-surface";
 import { isExpiredBrowserViewerError } from "./browser-viewer-recovery";
 import { createFrameLifecycle } from "./frame-lifecycle";
 import { useBrowserCanvasInput } from "./use-browser-canvas-input";
@@ -944,7 +945,8 @@ export function SharedBrowserPanel({
 
   // Expiry belongs to the viewing-only recovery path, not an action failure.
   // A failed reattachment still surfaces its attachQuery error and manual retry.
-  const connectionError = attachQuery.error ?? (viewingExpired ? null : captureQuery.error);
+  const connectionError =
+    attachQuery.error ?? (viewingExpired ? null : (captureQuery.error ?? video.error));
   const recoveryError =
     state?.recoveryState === "runtime-unavailable"
       ? (state.error ?? "Browser runtime unavailable.")
@@ -1200,10 +1202,9 @@ export function SharedBrowserPanel({
             );
           })}
           {video.supported ? (
-            <View
-              ref={video.canvasRef}
-              pointerEvents="none"
-              accessible={false}
+            <BrowserVideoSurface
+              canvasRef={video.canvasRef}
+              onError={video.surfaceError}
               style={{
                 position: "absolute",
                 left: displayRect?.x ?? 0,

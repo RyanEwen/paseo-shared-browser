@@ -37,8 +37,9 @@ organization names.
   It strips inherited `AGENT_BROWSER_*` variables and sets `AGENT_BROWSER_SOCKET_DIR`,
   `AGENT_BROWSER_IDLE_TIMEOUT_MS=0`, `AGENT_BROWSER_STREAM_PORT=0`, and
   `AGENT_BROWSER_NO_AUTO_DIALOG=1` itself.
-- Desktop/web clients with usable WebCodecs receive encoded workspace-tab video. Native apps
-  and unsupported clients receive JPEG frames from CDP `Page.startScreencast` or bounded screenshots.
+- Desktop/web clients with usable WebCodecs and Android apps with the host video renderer
+  receive encoded workspace-tab video. Other native and unsupported clients receive JPEG frames
+  from CDP `Page.startScreencast` or bounded screenshots.
   Remote input supports mouse hover, wheel scrolling, continuous dragging, native touch pan/pinch,
   tap, double-tap, right-click, text, and special keys.
 - Device presets for Desktop Chrome, iPhone 15 Pro, Pixel 7, and iPad Pro 11 change Chromium's
@@ -162,8 +163,10 @@ User-supplied `AGENT_BROWSER_*` variables are deliberately ignored.
   reloading the page or image.
 - Desktop and web clients with WebCodecs play genuine encoded tab video (H264 when supported,
   otherwise VP8). The trusted bundled helper captures the exact workspace tab, not a screenshot
-  loop or title-selected window. Native phone apps and clients without usable video decoding
-  keep the existing JPEG fallback.
+  loop or title-selected window. Android uses Paseo's host-owned WebView canvas and retains native
+  touch controls. It requires an Android app rebuilt with the `EncodedVideo` plugin SDK API and
+  a System WebView supporting the stream codec. Other native apps and clients without usable
+  video decoding keep the existing JPEG fallback.
 - The monitor menu's resolution and quality list separates JPEG quality (70%, 90%, 95%,
   or 100%), video bitrate (2, 5, 12, or 24 Mbps), and video frame rate (15, 30, or 60 FPS).
   Defaults remain JPEG95 and 12 Mbps at 30 FPS. Old saved quality choices keep their
