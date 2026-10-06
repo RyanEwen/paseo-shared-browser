@@ -758,30 +758,48 @@ export class SessionManager {
     });
   }
 
+  /** Resize CSS layout under the control lease; panel following preserves device behavior and density. */
   async resize(input: ResizeInput): Promise<{ state: BrowserState }> {
     const session = this.requireViewer(input.viewerToken);
     return this.serialize(session, async () => {
       this.requireMutationAccess(session, input);
       await this.cancelGesture(session);
       assertViewport(input.viewport);
+      const preserveEmulation = input.preserveEmulation === true;
+      const captureScale = input.captureDensity ?? (preserveEmulation ? session.captureScale : 1);
+      if (
+        input.viewport.width * captureScale > MAX_VIEWPORT.width ||
+        input.viewport.height * captureScale > MAX_VIEWPORT.height
+      ) {
+        throw new RangeError(
+          "Viewport at the current capture density exceeds supported image bounds",
+        );
+      }
       if (
         session.viewport.width !== input.viewport.width ||
         session.viewport.height !== input.viewport.height ||
-        session.devicePresetId !== null
+        session.captureScale !== captureScale ||
+        (!preserveEmulation && session.devicePresetId !== null)
       ) {
         session.humanInputAdmission = null;
+        const preset = preserveEmulation
+          ? DEVICE_PRESETS.find(({ id }) => id === session.devicePresetId)
+          : undefined;
         await this.request(session, "emulate", {
           ...input.viewport,
-          deviceScaleFactor: 1,
-          mobile: false,
-          touch: false,
-          userAgent: session.defaultUserAgent,
-          platform: "",
+          deviceScaleFactor: Math.max(preset?.deviceScaleFactor ?? 1, captureScale),
+          captureScale,
+          mobile: preset?.isMobile ?? false,
+          touch: preset?.hasTouch ?? false,
+          userAgent: preserveEmulation ? session.userAgent : session.defaultUserAgent,
+          platform: preset?.platform ?? "",
         });
         session.viewport = { ...input.viewport };
-        session.devicePresetId = null;
-        session.captureScale = 1;
-        session.userAgent = session.defaultUserAgent;
+        session.captureScale = captureScale;
+        if (!preserveEmulation) {
+          session.devicePresetId = null;
+          session.userAgent = session.defaultUserAgent;
+        }
         session.viewportGeneration += 1;
         this.invalidateFrames(session);
       }

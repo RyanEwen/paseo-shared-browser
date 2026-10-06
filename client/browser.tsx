@@ -16,7 +16,7 @@ import {
   useRef,
   useState,
 } from "react";
-import { type LayoutChangeEvent, Text, View } from "react-native";
+import { type LayoutChangeEvent, Text, useWindowDimensions, View } from "react-native";
 import {
   acquireControlRpc,
   applyDevicePresetRpc,
@@ -49,6 +49,10 @@ import {
 } from "../shared/browser";
 import type { BrowserFrameAuthority } from "../shared/browser-video";
 import { groupResolutionPresets } from "../shared/resolution-menu";
+import {
+  type CaptureDensityMode,
+  getAutomaticCaptureDensity,
+} from "./browser-auto-capture-density";
 import { type BrowserCanvasDisplayMode, getBrowserCanvasLayout } from "./browser-canvas-layout";
 import { BrowserCanvasViewport } from "./browser-canvas-viewport";
 import {
@@ -67,6 +71,7 @@ import {
 } from "./browser-control-request";
 import { BrowserDialogBody } from "./browser-dialog-body";
 import { type EmulationSelection, matchingResolutionPresetId } from "./browser-emulation-mode";
+import { getFillViewportResolution } from "./browser-fill-viewport";
 import type { FrameCandidate } from "./browser-frame-buffer";
 import { BrowserFrameImage } from "./browser-frame-image";
 import { NativeKeyboardControls } from "./browser-native-keyboard-controls";
@@ -82,9 +87,11 @@ import {
 import { BrowserVideoSurface } from "./browser-video-surface";
 import { isBrowserClosedError, isExpiredBrowserViewerError } from "./browser-viewer-recovery";
 import { createFrameLifecycle } from "./frame-lifecycle";
+import { useBrowserAutoCaptureDensity } from "./use-browser-auto-capture-density";
 import { useBrowserCanvasInput } from "./use-browser-canvas-input";
 import { useBrowserCaptureDensity } from "./use-browser-capture-density";
 import { useBrowserEmulationMode } from "./use-browser-emulation-mode";
+import { useBrowserFillViewport } from "./use-browser-fill-viewport";
 import { useBrowserFrameBuffer } from "./use-browser-frame-buffer";
 import { useBrowserImageCapture } from "./use-browser-image-capture";
 import { useBrowserScopedMutation } from "./use-browser-scoped-mutation";
@@ -109,8 +116,9 @@ interface Size {
 interface ControlledActions {
   navigate(action: "back" | "forward" | "reload" | "goto", url?: string): void;
   applyViewport(): void;
+  fillViewport(): void;
   selectDevicePreset(id: DevicePresetId): void;
-  changeDensity(value: 1 | 2): void;
+  changeDensity(value: CaptureDensityMode): void;
   toggleEmulation(): void;
   sendKey(key: SpecialKey): void;
   openNativeKeyboard(kind: "keyboard" | "compose" | "commit"): void;
@@ -194,6 +202,7 @@ export function SharedBrowserPanel({
   active = true,
 }: PluginWorkspacePanelProps) {
   const styles = useMemo(() => createStyles(theme, layout.compact), [theme, layout.compact]);
+  const { scale: screenPixelRatio } = useWindowDimensions();
   const viewerLabel = useState(() =>
     `Paseo ${layout.platform} · ${host.label} · ${Date.now().toString(36)}${Math.random()
       .toString(36)
@@ -276,6 +285,23 @@ export function SharedBrowserPanel({
   const actionsAnchorRef = useRef<View | null>(null);
   const [paneSize, setPaneSize] = useState<Size>({ width: 0, height: 0 });
   const panelScope = `${host.id}/${workspaceId}`;
+  const [fillViewportScope, setFillViewportScope] = useState<string | null>(null);
+  const fillViewportEnabled = fillViewportScope === panelScope;
+  const [densitySelection, setDensitySelection] = useState<{
+    scope: string;
+    mode: CaptureDensityMode;
+  }>({ scope: panelScope, mode: "auto" });
+  const densityMode = densitySelection.scope === panelScope ? densitySelection.mode : "auto";
+  const [automaticDensityFailureScope, setAutomaticDensityFailureScope] = useState<string | null>(
+    null,
+  );
+  const automaticDensityEnabled =
+    densityMode === "auto" && automaticDensityFailureScope !== panelScope;
+  useEffect(() => {
+    setFillViewportScope(null);
+    setDensitySelection({ scope: panelScope, mode: "auto" });
+    setAutomaticDensityFailureScope(null);
+  }, [panelScope]);
   const panelScopeRef = useRef(panelScope);
   panelScopeRef.current = panelScope;
   const menuRestoreFocus = useRef(true);
@@ -296,6 +322,12 @@ export function SharedBrowserPanel({
   } | null>(null);
   const nextNativeRequest = useRef(0);
   const [activeInput, setActiveInput] = useState(false);
+  const activeInputRef = useRef(false);
+  /** Fence automatic timers immediately, before React commits a new physical press. */
+  const handleInputActivity = useCallback((active: boolean) => {
+    activeInputRef.current = active;
+    setActiveInput(active);
+  }, []);
   const [containerSize, setContainerSize] = useState<Size>({ width: 0, height: 0 });
 
   useEffect(() => {
@@ -642,7 +674,11 @@ export function SharedBrowserPanel({
       setDevicePickerOpen(false);
       mutationSucceeded(result.state);
     },
-    onError: mutationFailed,
+    onError: (error) => {
+      setFillViewportScope(null);
+      setAutomaticDensityFailureScope(panelScope);
+      mutationFailed(error);
+    },
   });
   const deviceMutation = useBrowserScopedMutation({
     identity: mutationIdentity,
@@ -696,7 +732,11 @@ export function SharedBrowserPanel({
     change: setCaptureDensity,
     beforeChange: () => inputLifecycle.bump(),
     onSuccess: mutationSucceeded,
-    onError: mutationFailed,
+    onError: (error) => {
+      setAutomaticDensityFailureScope(panelScope);
+      setFillViewportScope(null);
+      mutationFailed(error);
+    },
   });
 
   const anyMutationPending =
@@ -921,7 +961,7 @@ export function SharedBrowserPanel({
     onPoint: (point) => {
       lastPointRef.current = { x: point.x, y: point.y };
     },
-    onActivity: setActiveInput,
+    onActivity: handleInputActivity,
     onInputBoundary: () => {
       inputLifecycle.bump();
     },
@@ -1147,14 +1187,88 @@ export function SharedBrowserPanel({
       return;
     }
     inputLifecycle.bump();
+    setFillViewportScope(null);
     resizeMutation.mutate({ ...context, viewport: { width, height } });
   }, [requireControlContext, resizeMutation, viewportHeight, viewportWidth]);
+
+  const fillViewportLimitDensity = densityMode === "auto" ? 1 : (state?.captureScale ?? 1);
+  const fillTarget = getFillViewportResolution(containerSize, fillViewportLimitDensity);
+
+  /** Enable following and resize using current geometry after control acquisition. */
+  const fillViewport = useCallback(() => {
+    const context = requireControlContext();
+    if (!context || resizeMutation.isPending) return;
+    const viewport = fillTarget;
+    if (!viewport) {
+      setOperationError(
+        "The visible browser area is outside the supported resolution range at the current capture density.",
+      );
+      return;
+    }
+    inputLifecycle.bump();
+    setFillViewportScope(panelScope);
+    setScaleMode("fit");
+    const captureDensity =
+      densityMode === "auto"
+        ? getAutomaticCaptureDensity(viewport, containerSize, screenPixelRatio, "fit")
+        : null;
+    resizeMutation.mutate({
+      ...context,
+      viewport,
+      preserveEmulation: true,
+      ...(captureDensity === null ? {} : { captureDensity }),
+    });
+  }, [
+    requireControlContext,
+    resizeMutation,
+    containerSize,
+    inputLifecycle,
+    panelScope,
+    fillTarget,
+    densityMode,
+    screenPixelRatio,
+  ]);
+
+  useBrowserFillViewport({
+    identity: mutationIdentity,
+    enabled: fillViewportEnabled,
+    canResize:
+      active && canControl && !activeInput && !anyMutationPending && state?.status === "ready",
+    target: fillTarget,
+    viewport: state?.viewport ?? null,
+    apply: () => {
+      if (!activeInputRef.current) fillViewport();
+    },
+  });
+
+  const followingNeedsResize =
+    fillViewportEnabled &&
+    (fillTarget?.width !== state?.viewport.width || fillTarget?.height !== state?.viewport.height);
+  useBrowserAutoCaptureDensity({
+    identity: mutationIdentity,
+    enabled: automaticDensityEnabled,
+    canChange:
+      active &&
+      canControl &&
+      !activeInput &&
+      !anyMutationPending &&
+      !followingNeedsResize &&
+      state?.status === "ready",
+    target: state
+      ? getAutomaticCaptureDensity(state.viewport, containerSize, screenPixelRatio, scaleMode)
+      : null,
+    currentDensity: state?.captureScale ?? 1,
+    apply: (density) => {
+      if (!activeInputRef.current) densityControl.select(density);
+    },
+  });
 
   const selectDevicePreset = useCallback(
     (presetId: DevicePresetId) => {
       const context = requireControlContext();
       if (!context || deviceMutation.isPending) return;
       inputLifecycle.bump();
+      setFillViewportScope(null);
       setDevicePickerOpen(false);
       deviceMutation.mutate({ ...context, presetId });
     },
@@ -1265,8 +1379,13 @@ export function SharedBrowserPanel({
   controlledActionsRef.current = {
     navigate,
     applyViewport,
+    fillViewport,
     selectDevicePreset,
-    changeDensity: (value) => densityControl.select(value),
+    changeDensity: (value) => {
+      setDensitySelection({ scope: panelScope, mode: value });
+      setAutomaticDensityFailureScope(null);
+      if (value !== "auto") densityControl.select(value);
+    },
     toggleEmulation: emulation.toggle,
     sendKey: (key) => sendEvent({ kind: "key", key }),
     openNativeKeyboard: requestNativeKeyboard,
@@ -1327,10 +1446,17 @@ export function SharedBrowserPanel({
   const activeDevicePreset = state?.devicePresetId
     ? DEVICE_PRESETS.find(({ id }) => id === state.devicePresetId)
     : null;
-  const selectedResolutionPresetId = matchingResolutionPresetId(state);
-  const deviceLabel = selectedResolutionPresetId
-    ? (activeDevicePreset?.label ?? "Custom display")
-    : `${emulation.mode === "mobile" ? "Mobile" : "Desktop"} · custom display`;
+  const selectedResolutionPresetId = fillViewportEnabled ? null : matchingResolutionPresetId(state);
+  const fillViewportResolution = fillTarget;
+  const fillViewportDetail = fillViewportResolution
+    ? `${fillViewportResolution.width} × ${fillViewportResolution.height}`
+    : `Requires ${MIN_VIEWPORT.width}–${Math.floor(MAX_VIEWPORT.width / fillViewportLimitDensity)} × ${MIN_VIEWPORT.height}–${Math.floor(MAX_VIEWPORT.height / fillViewportLimitDensity)} at current capture density`;
+  let deviceLabel = `${emulation.mode === "mobile" ? "Mobile" : "Desktop"} · custom display`;
+  if (fillViewportEnabled) {
+    deviceLabel = "Fill viewport";
+  } else if (selectedResolutionPresetId) {
+    deviceLabel = activeDevicePreset?.label ?? "Custom display";
+  }
   const transportLabel =
     video.front && video.fallbackRevision
       ? "Updating video"
@@ -1708,10 +1834,19 @@ export function SharedBrowserPanel({
               theme={theme}
               groups={groupResolutionPresets()}
               selectedPresetId={selectedResolutionPresetId}
+              fillViewportResolution={fillViewportResolution}
+              fillViewportSelected={fillViewportEnabled}
+              fillViewportDetail={fillViewportDetail}
+              onFillViewport={() =>
+                requestControlled("fill the browser viewport", () =>
+                  controlledActionsRef.current?.fillViewport(),
+                )
+              }
               favoritePresetIds={preferences.favoritePresetIds}
               selectDisabled={!viewerToken || anyMutationPending}
               favoriteDisabled={preferences.disabled}
               density={state?.captureScale ?? 1}
+              densityMode={densityMode}
               viewport={state?.viewport ?? null}
               onDensityChange={(density) => {
                 requestControlled("change capture density", () =>
@@ -1978,6 +2113,26 @@ export function SharedBrowserPanel({
                   Release control to pan this view. While controlling, swipes go to the page.
                 </Text>
               ) : null}
+              <BrowserMenuSeparator theme={theme} />
+              <BrowserMenuItem
+                theme={theme}
+                compact={layout.compact}
+                label="Fill viewport"
+                icon="Maximize"
+                selected={fillViewportEnabled}
+                disabled={!viewerToken || anyMutationPending || !fillViewportResolution}
+                onPress={() => {
+                  closeToolbarMenu();
+                  requestControlled("fill the browser viewport", () =>
+                    controlledActionsRef.current?.fillViewport(),
+                  );
+                }}
+              />
+              <Text
+                style={[styles.devicePresetDetail, { paddingHorizontal: 12, paddingVertical: 4 }]}
+              >
+                {fillViewportDetail}
+              </Text>
               <BrowserMenuSeparator theme={theme} />
               <BrowserMenuHeading theme={theme}>Favorite resolutions</BrowserMenuHeading>
               {preferences.favoritePresetIds.length === 0 ? (

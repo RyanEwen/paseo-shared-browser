@@ -157,7 +157,7 @@ User-supplied `AGENT_BROWSER_*` variables are deliberately ignored.
   and a vertical-dots browser actions menu. The controller can close the shared browser from that
   menu after confirmation. Icon controls expose their action name
   as a hover tooltip on desktop/web and retain native accessibility labels.
-- Custom viewports support 320 to 2560 pixels wide and 480 to 2560 pixels high. Invalid sizes
+- Custom viewports support 320 to 3840 pixels wide and 480 to 3840 pixels high. Invalid sizes
   show their error inside the device dialog; a successful Apply closes it.
 - Desktop presets also include 1280 × 800 (16:10) and 1280 × 1280 (1:1).
 - Pixel 7 (high resolution) keeps the same 412 × 839 phone layout and input coordinates,
@@ -171,6 +171,12 @@ User-supplied `AGENT_BROWSER_*` variables are deliberately ignored.
   then mobile. Each group sorts by width. Filled stars mark favorites; the monitor
   menu provides favorites in that same grouped order and access to the full
   resolution and quality list.
+- **Fill viewport** resizes the shared browser to the visible panel and follows panel size
+  changes while this viewer controls it. It preserves mobile behavior. Auto capture density
+  adjusts detail for the screen as the panel grows or shrinks; manual density is retained.
+  Following pauses when the panel is hidden, control is released, or its dimensions exceed
+  the supported resolution at the current density. Choosing a preset or custom resolution
+  stops following; a failed resize also stops it and displays an error.
 - Monitor and browser actions open compact anchored menus rather than dialogs. Menus stay
   within the pane, scroll long lists, and dismiss with an outside press, Escape or native Back.
 - The monitor menu offers **Fit to panel** (default) and **Actual size (100%)**. Actual size
@@ -193,11 +199,16 @@ User-supplied `AGENT_BROWSER_*` variables are deliberately ignored.
   corresponding video bitrate when upgraded. These are encoder targets, not measured
   bandwidth or guaranteed frame rates. Large JPEGs may reduce quality to stay within
   the existing 4 MiB frame bound. Preferences persist on the connected Paseo host.
-  Capture density is a separate 1x/2x option for the controller. It raises real source
+  Capture density defaults to Auto for each viewer panel. While controlling, it selects
+  1x or 2x from the displayed page size and screen pixel density, accounting for Fit's
+  letterboxing and Actual size. Manual 1x/2x choices override Auto until Auto is selected
+  again, the workspace changes, or the panel is reopened. Density raises real source
   pixel detail without changing page size, input mode, or user agent. The 2x option
-  requires both page dimensions to be 1280 or less; larger pages keep 1x rather than
-  being resized. It can increase processing and bandwidth substantially. Quality
-  changes do not navigate or reload the shared page.
+  requires both page dimensions to be 1920 or less; larger pages use 1x. Fill viewport
+  adjusts automatic density and layout size together. Hidden panels, observers, active
+  gestures, and pending operations never trigger automatic density writes. A failed
+  adjustment pauses automation until Auto is selected again. Higher density can increase
+  processing and bandwidth substantially. Quality changes do not navigate or reload the page.
 - Video packets travel through the existing authenticated Paseo RPC connection, including its
   relay. No extra video port or unauthenticated media server is opened. This is encoded video
   delivered in bounded request/reply batches, not WebRTC or a custom push subscription.

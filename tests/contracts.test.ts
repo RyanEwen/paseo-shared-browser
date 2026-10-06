@@ -123,8 +123,8 @@ describe("shared RPC validation", () => {
     expect(viewportSchema.safeParse({ width: 320, height: 240 }).success).toBe(false);
     expect(viewportSchema.safeParse({ width: 2560, height: 1440 }).success).toBe(true);
     expect(viewportSchema.safeParse({ width: 2560, height: 2560 }).success).toBe(true);
-    expect(viewportSchema.safeParse({ width: 2561, height: 1440 }).success).toBe(false);
-    expect(viewportSchema.safeParse({ width: 1280, height: 2561 }).success).toBe(false);
+    expect(viewportSchema.safeParse({ width: 3841, height: 1440 }).success).toBe(false);
+    expect(viewportSchema.safeParse({ width: 1280, height: 3841 }).success).toBe(false);
   });
 
   it("rejects unbounded input text and scroll deltas", () => {

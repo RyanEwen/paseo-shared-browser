@@ -240,6 +240,10 @@ export const resizeBrowserRpc = defineRpc({
     controlToken: opaqueTokenSchema,
     expected: expectedStateSchema,
     viewport: viewportSchema,
+    /** Panel following changes layout size without resetting device behavior or density. */
+    preserveEmulation: z.boolean().optional(),
+    /** Resolve automatic density and panel geometry in one controlled transition. */
+    captureDensity: captureDensitySchema.optional(),
   }),
   output: z.object({ state: browserStateSchema }),
 });
