@@ -63,7 +63,11 @@ interface Channel {
   heldButtons: Set<string>;
   heldKeys: Set<string>;
   touchCount: number;
+  /** Conservative monotonic deadline measured before the last acknowledged RPC started. */
+  idleNotAfter: number;
 }
+/** Retire empty client channels before the native service's five-second idle bound. */
+export const BROWSER_INPUT_IDLE_MS = 4_000;
 const MAX_QUEUED_COMMANDS = 64;
 const MAX_WHEEL_DELTA = 4_000;
 const MAX_FRAME_ADMISSION_ATTEMPTS = 3;
@@ -88,6 +92,11 @@ function transportContext(authority: BrowserGestureAuthority) {
     controlToken: authority.controlToken,
     expected: authority.expected,
   };
+}
+
+/** An idle channel can reopen only after every physical press has been acknowledged as released. */
+function hasHeldInput(channel: Channel): boolean {
+  return channel.heldButtons.size > 0 || channel.heldKeys.size > 0 || channel.touchCount > 0;
 }
 /** A qualified reply completes old input; it never authorizes input on the new page. */
 function isAcknowledgedNavigation(original: BrowserGestureAuthority, state: BrowserState): boolean {
@@ -167,10 +176,24 @@ export function createBrowserInputQueue(options: QueueOptions) {
       while (commands.length && currentEpoch === epoch) {
         const command = commands.shift();
         if (!command) break;
+        if (
+          owned &&
+          performance.now() >= owned.idleNotAfter &&
+          !hasHeldInput(owned) &&
+          sameAuthority(owned.authority, currentControl())
+        ) {
+          // Background suspension can delay the hook's idle timer beyond native
+          // expiry. Never send an unsent event or a late normal end to that ID.
+          // Keep only its acknowledged geometry grant: beginGesture cancels the
+          // old channel and checks the exact native document before publishing.
+          owned = null;
+          channel = null;
+          options.onFinish();
+        }
         if ("end" in command) {
           if (!owned) continue;
           // A pointer release must not release a still-held keyboard chord.
-          if (owned.heldKeys.size || owned.heldButtons.size || owned.touchCount) continue;
+          if (hasHeldInput(owned)) continue;
           const ending = owned;
           if (!sameAuthority(ending.authority, currentControl())) {
             throw new Error("Browser input context changed. Release the gesture and try again.");
@@ -210,7 +233,7 @@ export function createBrowserInputQueue(options: QueueOptions) {
         if (owned && owned.pointerKind !== pointerKind) {
           // Changing input devices is ordinary on touch laptops. Close only this
           // exact old channel before sending the still-unsent event on a new one.
-          if (owned.heldButtons.size || owned.heldKeys.size || owned.touchCount) {
+          if (hasHeldInput(owned)) {
             await cancelChannel(owned);
           } else {
             // Empty mouse/touch modality changes retain only ACKed same-context
@@ -241,6 +264,7 @@ export function createBrowserInputQueue(options: QueueOptions) {
             for (let attempt = 0; attempt < MAX_FRAME_ADMISSION_ATTEMPTS; attempt += 1) {
               if (Date.now() >= admissionDeadline) break;
               const sentAuthority = current;
+              const startedAt = performance.now();
               const result = await options.transport.begin({ ...sentAuthority, pointerKind });
               if (!("admission" in result)) {
                 owned = {
@@ -251,6 +275,7 @@ export function createBrowserInputQueue(options: QueueOptions) {
                   heldButtons: new Set(),
                   heldKeys: new Set(),
                   touchCount: 0,
+                  idleNotAfter: startedAt + BROWSER_INPUT_IDLE_MS,
                 };
               }
               if (currentEpoch !== epoch || !sameAuthority(sentAuthority, currentControl())) break;
@@ -305,6 +330,7 @@ export function createBrowserInputQueue(options: QueueOptions) {
         if (command.event.kind === "down") owned.heldButtons.add(command.event.button);
         if (command.event.kind === "up") owned.heldButtons.delete(command.event.button);
         const expectedNextSequence = owned.sequence + 1;
+        const startedAt = performance.now();
         const result = await options.transport.update({
           ...transportContext(owned.authority),
           gestureId: owned.gestureId,
@@ -312,6 +338,7 @@ export function createBrowserInputQueue(options: QueueOptions) {
           event: command.event,
         });
         owned.sequence = result.nextSequence;
+        owned.idleNotAfter = startedAt + BROWSER_INPUT_IDLE_MS;
         if (currentEpoch !== epoch || !sameAuthority(owned.authority, currentControl())) break;
         if (result.gestureId !== owned.gestureId)
           throw new Error("Browser gesture identity changed.");

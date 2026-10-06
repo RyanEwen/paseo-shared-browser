@@ -19,6 +19,7 @@ import { createBrowserCanvasInput } from "./browser-canvas-input";
 import type { CanvasKeyboardEvent } from "./browser-canvas-keyboard";
 import { bindBrowserCanvasKeyboard, type KeyboardCanvasNode } from "./browser-canvas-keyboard-web";
 import {
+  BROWSER_INPUT_IDLE_MS,
   type BrowserGestureAuthority,
   type BrowserGesturePoint,
   type BrowserGestureTransport,
@@ -197,7 +198,7 @@ export function useBrowserCanvasInput(options: CanvasOptions) {
               current.current.onActivity(false);
               queue.finish();
             }
-          }, 4_000);
+          }, BROWSER_INPUT_IDLE_MS);
         }
         return accepted;
       },
@@ -205,7 +206,7 @@ export function useBrowserCanvasInput(options: CanvasOptions) {
         clearIdle();
         // Release was enqueued immediately. Keep the empty exact channel for
         // ordinary repeat input, closing before the server's five-second idle bound.
-        idleTimer.current = setTimeout(() => queue.finish(), 4_000);
+        idleTimer.current = setTimeout(() => queue.finish(), BROWSER_INPUT_IDLE_MS);
       },
       cancel: () => {
         clearIdle();
@@ -244,7 +245,7 @@ export function useBrowserCanvasInput(options: CanvasOptions) {
     // Keep one channel through ordinary inter-key gaps. New typing clears this
     // timer, while blur/control loss cancels immediately through the input model.
     clearIdle();
-    idleTimer.current = setTimeout(() => queue.finish(), 4_000);
+    idleTimer.current = setTimeout(() => queue.finish(), BROWSER_INPUT_IDLE_MS);
   }, [queue]);
   const nativeKeyboard = useBrowserNativeKeyboard({
     enabled: () => alive.current && current.current.enabled,
