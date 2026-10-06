@@ -305,13 +305,6 @@ export function createStyles(theme: Theme, compact: boolean) {
       alignItems: "center",
       gap: SPACE.xs,
     },
-    dialogViewport: {
-      flexGrow: 0,
-      flexShrink: 1,
-    },
-    dialogSheetContent: {
-      flexGrow: 0,
-    },
     dialogBody: {
       gap: SPACE.md,
       paddingBottom: SPACE.xs,

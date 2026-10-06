@@ -37,10 +37,7 @@ export function BrowserControlDialog({
         if (!open && !pending) onCancel();
       }}
     >
-      <Modal.Content
-        style={styles.dialogViewport}
-        contentContainerStyle={styles.dialogSheetContent}
-      >
+      <Modal.Content>
         <BrowserDialogBody
           styles={styles}
           actions={

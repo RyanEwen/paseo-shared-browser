@@ -1816,10 +1816,7 @@ export function SharedBrowserPanel({
           if (!tabMutationPending) setTabCloseConfirmationOpen(open);
         }}
       >
-        <Modal.Content
-          style={styles.dialogViewport}
-          contentContainerStyle={styles.dialogSheetContent}
-        >
+        <Modal.Content>
           <BrowserDialogBody
             styles={styles}
             actions={
@@ -1858,10 +1855,7 @@ export function SharedBrowserPanel({
           if (!closePending) setCloseConfirmationOpen(open);
         }}
       >
-        <Modal.Content
-          style={styles.dialogViewport}
-          contentContainerStyle={styles.dialogSheetContent}
-        >
+        <Modal.Content>
           <BrowserDialogBody
             styles={styles}
             actions={
