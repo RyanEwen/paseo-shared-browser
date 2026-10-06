@@ -27,6 +27,7 @@ interface ControlButtonStyles {
   buttonFocused: ViewStyle;
   buttonDisabled: ViewStyle;
   buttonLarge: ViewStyle;
+  buttonIconOnly: ViewStyle;
   buttonFill: ViewStyle;
   buttonText: TextStyle;
   buttonTextSelected: TextStyle;
@@ -59,6 +60,7 @@ interface ControlButtonProps {
   primary?: boolean;
   danger?: boolean;
   large?: boolean;
+  iconOnly?: boolean;
   fill?: boolean;
   disabled?: boolean;
   onPress(): void;
@@ -75,6 +77,7 @@ export function ControlButton({
   primary = false,
   danger = false,
   large = false,
+  iconOnly = false,
   fill = false,
   disabled = false,
   onPress,
@@ -82,8 +85,13 @@ export function ControlButton({
   const [focused, setFocused] = useState(false);
   const [hovered, setHovered] = useState(false);
   const highlighted = selected || primary;
+  const tooltipRef = useCallback(
+    (node: unknown) => setBrowserControlTooltip(node, accessibilityLabel ?? label),
+    [accessibilityLabel, label],
+  );
   return (
     <Pressable
+      ref={iconOnly ? tooltipRef : undefined}
       accessibilityRole="button"
       accessibilityLabel={accessibilityLabel ?? label}
       accessibilityState={{ disabled, selected }}
@@ -95,6 +103,7 @@ export function ControlButton({
       onPress={onPress}
       style={({ pressed }) => [
         styles.button,
+        iconOnly ? styles.buttonIconOnly : null,
         selected ? styles.buttonSelected : null,
         primary ? styles.buttonPrimary : null,
         danger ? styles.buttonDanger : null,
@@ -113,9 +122,11 @@ export function ControlButton({
           color={highlighted ? theme.colors.accentForeground : theme.colors.foregroundMuted}
         />
       ) : null}
-      <Text style={[styles.buttonText, highlighted ? styles.buttonTextSelected : null]}>
-        {label}
-      </Text>
+      {iconOnly ? null : (
+        <Text style={[styles.buttonText, highlighted ? styles.buttonTextSelected : null]}>
+          {label}
+        </Text>
+      )}
     </Pressable>
   );
 }
@@ -297,18 +308,21 @@ export function CanvasPlaceholder({
   title,
   detail,
   loading = false,
+  children,
 }: {
   styles: CanvasPlaceholderStyles;
   theme: Theme;
   title: string;
   detail: string;
   loading?: boolean;
+  children?: ReactNode;
 }) {
   return (
     <View style={styles.canvasState}>
       {loading ? <ActivityIndicator color={theme.colors.accent} /> : null}
       <Text style={styles.canvasTitle}>{title}</Text>
       <Text style={styles.canvasDetail}>{detail}</Text>
+      {children}
     </View>
   );
 }

@@ -16,33 +16,44 @@ export function NativeKeyboardControls({
   relay,
   enabled,
   ownershipKey,
+  documentKey,
   request,
   onRequestHandled,
+  onRequestControlForCompose,
+  canRequestControl,
 }: {
   styles: ReturnType<typeof createStyles>;
   theme: Theme;
   relay: ReturnType<typeof useBrowserCanvasInput>["nativeKeyboard"];
   enabled: boolean;
   ownershipKey: string;
-  request: { id: number; kind: "keyboard" | "compose"; ownershipKey: string } | null;
+  documentKey: string;
+  request: { id: number; kind: "keyboard" | "compose" | "commit"; ownershipKey: string } | null;
   onRequestHandled(id: number): void;
+  onRequestControlForCompose(): void;
+  canRequestControl: boolean;
 }) {
   const handledRequest = useRef<number | null>(null);
   const [composeOpen, setComposeOpen] = useState(false);
   const [draft, setDraft] = useState("");
   const composeOwner = useRef<string | null>(null);
+  const composeDocument = useRef<string | null>(null);
   const liveAuthority = useRef({ enabled, ownershipKey });
   liveAuthority.current = { enabled, ownershipKey };
   const canCommit = enabled && composeOwner.current === ownershipKey;
+  const canRebindCommit = enabled && composeDocument.current === documentKey;
+  const canRequestCommit = canRequestControl && composeDocument.current === documentKey;
   const closeCompose = () => {
     setComposeOpen(false);
     setDraft("");
     composeOwner.current = null;
+    composeDocument.current = null;
   };
   const openCompose = () => {
     relay.inputRef.current?.blur();
     relay.reset();
     composeOwner.current = ownershipKey;
+    composeDocument.current = documentKey;
     setComposeOpen(true);
   };
   const commit = () => {
@@ -70,10 +81,14 @@ export function NativeKeyboardControls({
     handledRequest.current = request.id;
     if (enabled && request.ownershipKey === ownershipKey) {
       if (request.kind === "keyboard") relay.focus();
-      else openCompose();
+      else if (request.kind === "compose") openCompose();
+      else if (composeOpen && composeDocument.current === documentKey && draft) {
+        composeOwner.current = ownershipKey;
+        commit();
+      }
     }
     onRequestHandled(request.id);
-  }, [request, enabled, ownershipKey, relay, onRequestHandled]);
+  }, [request, enabled, ownershipKey, documentKey, relay, onRequestHandled]);
   return (
     <>
       <NativeTextInput
@@ -119,8 +134,17 @@ export function NativeKeyboardControls({
                 theme={theme}
                 label="Done"
                 primary
-                disabled={!canCommit || !draft}
-                onPress={commit}
+                disabled={(!canCommit && !canRebindCommit && !canRequestCommit) || !draft}
+                onPress={() => {
+                  if (canCommit) {
+                    commit();
+                  } else if (canRebindCommit) {
+                    composeOwner.current = ownershipKey;
+                    commit();
+                  } else {
+                    onRequestControlForCompose();
+                  }
+                }}
               />
             </View>
           </View>

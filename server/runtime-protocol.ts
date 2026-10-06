@@ -37,7 +37,11 @@ export type AgentBrowserOperation =
   | "navigate"
   | "input"
   | "viewport"
-  | "device";
+  | "device"
+  | "tabs.list"
+  | "tabs.create"
+  | "tabs.select"
+  | "tabs.close";
 
 export type RuntimeRequest =
   | (AdminRequestBase & { method: "bridge.claim"; takeover?: boolean })

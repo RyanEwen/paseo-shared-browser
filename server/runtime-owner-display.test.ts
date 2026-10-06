@@ -5,6 +5,7 @@ const fake = vi.hoisted(() => ({
   display: vi.fn(),
   runtime: vi.fn(),
   launch: vi.fn(),
+  identity: vi.fn(),
   shutdown: vi.fn(),
   assertAvailable: vi.fn(),
   stop: vi.fn(),
@@ -16,6 +17,7 @@ vi.mock("./runtime-path", () => ({
 vi.mock("./agent-browser-runtime", () => ({
   AgentBrowserRuntime: class {
     launch = fake.launch;
+    identity = fake.identity;
     shutdown = fake.shutdown;
     constructor(options: unknown) {
       fake.runtime(options);
@@ -25,6 +27,7 @@ vi.mock("./agent-browser-runtime", () => ({
 beforeEach(() => {
   vi.clearAllMocks();
   fake.launch.mockResolvedValue(undefined);
+  fake.identity.mockResolvedValue({ targetId: "owned-page" });
   fake.shutdown.mockResolvedValue(undefined);
   fake.stop.mockResolvedValue(undefined);
   fake.display.mockResolvedValue({

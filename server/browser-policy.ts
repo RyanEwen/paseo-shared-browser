@@ -7,9 +7,11 @@ import {
   type BrowserGestureEvent,
   type BrowserInputEvent,
   type BrowserState,
+  type BrowserTab,
   type beginBrowserGestureRpc,
   browserCursorSchema,
   browserGestureEventSchema,
+  browserTabSchema,
   canUseCaptureDensity,
   type captureBrowserRpc,
   type closeBrowserRpc,
@@ -71,7 +73,7 @@ const FRAME_CACHE_MS = 100;
 const FRAME_TOKEN_TTL_MS = 5_000;
 const MAX_RECENT_FRAMES = 512;
 const MAX_VIEWERS_PER_SESSION = 16;
-const MAX_SESSIONS = 8;
+const MAX_SESSIONS = 64;
 const SCREENCAST_WAIT_MS = 500;
 
 export interface BrowserRuntimeClient {
@@ -115,7 +117,9 @@ type HumanInputAdmission = Pick<
   "viewerToken" | "controlToken" | "expected" | "runtimeInputGeneration"
 > & { frameId: string };
 interface BrowserSession {
+  key: string;
   workspaceId: string;
+  tabId: string | null;
   sessionId: string;
   runtimeId: string;
   runtimeCreatedAt: number;
@@ -224,6 +228,7 @@ export class SessionManager {
   private readonly sessions = new Map<string, BrowserSession>();
   private readonly viewerSessions = new Map<string, BrowserSession>();
   private readonly closedViewerWorkspaces = new Map<string, string>();
+  private readonly closedViewerTabs = new Map<string, number>();
   private readonly sessionCreations = new Map<string, Promise<BrowserSession>>();
   private readonly sessionClosures = new Map<string, Promise<void>>();
   private readonly archived = new Set<string>();
@@ -267,6 +272,7 @@ export class SessionManager {
   async attach(
     workspaceId: string,
     viewerLabel: string,
+    tabId?: string,
   ): Promise<{ viewerToken: string; state: BrowserState }> {
     this.assertOpen();
     const label = viewerLabel.trim();
@@ -274,7 +280,7 @@ export class SessionManager {
     const validation = await this.validateWorkspace(workspaceId);
     if (validation === false) throw new Error("Workspace not found");
     this.assertOpen();
-    const session = await this.getOrCreateSession(workspaceId);
+    const session = await this.getOrCreateSession(workspaceId, tabId);
     return this.serialize(session, async () => {
       if (session.archived) throw new Error("Browser session is closed");
       this.pruneExpired(session);
@@ -315,6 +321,88 @@ export class SessionManager {
     });
   }
 
+  /** Enumerate pages in this viewer's workspace without changing any selected page. */
+  async listTabs(workspaceId: string): Promise<{ tabs: BrowserTab[] }> {
+    if (this.deliberatelyClosed.has(workspaceId)) throw new Error("Browser is closed");
+    const targets = await this.client.requestWorkspace(workspaceId, "tabs.list", null);
+    if (!Array.isArray(targets)) throw new Error("Browser returned an invalid tab list");
+    const tabs = await Promise.all(
+      targets.map(async (target) => {
+        const value = asRecord(target);
+        const tabId = browserTabSchema.shape.id.parse(value.targetId);
+        const session = [...this.sessions.values()].find(
+          (candidate) => candidate.workspaceId === workspaceId && candidate.tabId === tabId,
+        );
+        const presence = session
+          ? await this.serialize(session, async () => {
+              this.pruneExpired(session);
+              const controllerToken = session.controller?.viewerToken;
+              return {
+                viewerCount: session.viewers.size,
+                controllerLabel: controllerToken
+                  ? (session.viewers.get(controllerToken)?.label ?? null)
+                  : null,
+              };
+            })
+          : { viewerCount: 0, controllerLabel: null };
+        return browserTabSchema.parse({
+          id: tabId,
+          title: boundedText(String(value.title ?? ""), 1_024),
+          url: boundedText(String(value.url ?? ""), 8_192),
+          ...presence,
+        });
+      }),
+    );
+    return { tabs };
+  }
+
+  /** Expose tab metadata to a client only through its active viewer lease. */
+  async listTabsForViewer(viewerToken: string): Promise<{ tabs: BrowserTab[] }> {
+    const session = this.requireViewer(viewerToken);
+    return this.listTabs(session.workspaceId);
+  }
+
+  /** A new page shares the workspace profile but does not change any viewer's selection. */
+  async createTab(viewerToken: string): Promise<{ tabId: string }> {
+    const session = this.requireViewer(viewerToken);
+    const value = asRecord(
+      await this.client.requestWorkspace(session.workspaceId, "tabs.create", null),
+    );
+    if (this.requireViewer(viewerToken) !== session || session.archived) {
+      throw new Error("Browser viewer attachment changed during tab creation");
+    }
+    const tabId = browserTabSchema.shape.id.parse(value.targetId);
+    return { tabId };
+  }
+
+  /** Close only the page controlled by this viewer, leaving other pages and viewers alive. */
+  async closeTab(input: {
+    viewerToken: string;
+    controlToken: string;
+    tabId: string;
+  }): Promise<{ closed: true }> {
+    const session = this.requireViewer(input.viewerToken);
+    return this.serialize(session, async () => {
+      this.requireController(session, input.viewerToken, input.controlToken);
+      if (session.tabId !== input.tabId) throw new Error("Browser tab selection is stale");
+      await this.cancelGesture(session);
+      await this.request(session, "tabs.close", { targetId: input.tabId });
+      session.archived = true;
+      session.videoLifetime?.cancel();
+      for (const [token, expiresAt] of this.closedViewerTabs) {
+        if (expiresAt <= this.now()) this.closedViewerTabs.delete(token);
+      }
+      for (const token of session.viewers.keys()) {
+        this.viewerSessions.delete(token);
+        this.closedViewerTabs.set(token, this.now() + this.viewerTtlMs);
+      }
+      session.viewers.clear();
+      session.controller = null;
+      this.sessions.delete(session.key);
+      return { closed: true };
+    });
+  }
+
   /** Stop one runtime and invalidate every viewer without archiving its workspace or profile. */
   async closeBrowser(input: CloseInput): Promise<{ closed: true }> {
     const session = this.requireViewer(input.viewerToken);
@@ -323,20 +411,25 @@ export class SessionManager {
       if (session.sessionId !== input.sessionId || session.runtimeId !== input.runtimeId)
         throw new Error("Browser session is stale");
 
-      session.videoLifetime?.cancel();
-      await this.cancelGesture(session);
-      session.archived = true;
       this.deliberatelyClosed.add(session.workspaceId);
-      for (const token of session.viewers.keys()) {
-        this.viewerSessions.delete(token);
-        this.closedViewerWorkspaces.set(token, session.workspaceId);
+      const workspaceSessions = [...this.sessions.values()].filter(
+        (candidate) => candidate.workspaceId === session.workspaceId,
+      );
+      for (const candidate of workspaceSessions) {
+        candidate.videoLifetime?.cancel();
+        await this.cancelGesture(candidate);
+        candidate.archived = true;
+        for (const token of candidate.viewers.keys()) {
+          this.viewerSessions.delete(token);
+          this.closedViewerWorkspaces.set(token, session.workspaceId);
+        }
+        candidate.viewers.clear();
+        candidate.controller = null;
       }
-      session.viewers.clear();
-      session.controller = null;
       try {
         await this.client.closeWorkspace(session.workspaceId, session.runtimeId);
       } finally {
-        this.sessions.delete(session.workspaceId);
+        for (const candidate of workspaceSessions) this.sessions.delete(candidate.key);
       }
     });
     this.sessionClosures.set(session.workspaceId, closing);
@@ -372,32 +465,35 @@ export class SessionManager {
     this.assertOpen();
     this.archived.add(workspaceId);
     await this.client.archiveWorkspace(workspaceId);
-    const pending = this.sessionCreations.get(workspaceId);
-    if (pending) await pending.catch(() => undefined);
-    const session = this.sessions.get(workspaceId);
-    if (!session) return;
-    session.archived = true;
-    session.videoLifetime?.cancel();
-    await this.cancelGesture(session);
-    for (const token of session.viewers.keys()) this.viewerSessions.delete(token);
-    session.viewers.clear();
-    session.controller = null;
-    this.sessions.delete(workspaceId);
+    const pending = [...this.sessionCreations.entries()]
+      .filter(([key]) => key === workspaceId || key.startsWith(`${workspaceId}/`))
+      .map(([, creation]) => creation);
+    await Promise.allSettled(pending);
+    for (const session of this.sessions.values()) {
+      if (session.workspaceId !== workspaceId) continue;
+      session.archived = true;
+      session.videoLifetime?.cancel();
+      await this.cancelGesture(session);
+      for (const token of session.viewers.keys()) this.viewerSessions.delete(token);
+      session.viewers.clear();
+      session.controller = null;
+      this.sessions.delete(session.key);
+    }
   }
 
   /** List retained browser sessions even after their last viewer leaves or expires. */
   async listOpenWorkspaceIds(): Promise<string[]> {
     this.assertOpen();
-    const result: string[] = [];
+    const result = new Set<string>();
     for (const session of this.sessions.values()) {
       await this.serialize(session, async () => {
         this.pruneExpired(session);
         // Viewer leases control access and capture, not the lifetime of the browser.
         // Keep an idle browser discoverable so another device can reattach to it.
-        if (!session.archived) result.push(session.workspaceId);
+        if (!session.archived) result.add(session.workspaceId);
       });
     }
-    return result;
+    return [...result];
   }
   async status(viewerToken: string): Promise<{ state: BrowserState }> {
     const session = this.requireViewer(viewerToken);
@@ -1136,6 +1232,7 @@ export class SessionManager {
     this.sessionCreations.clear();
     this.viewerSessions.clear();
     this.closedViewerWorkspaces.clear();
+    this.closedViewerTabs.clear();
   }
 
   disconnect(): void {
@@ -1145,51 +1242,65 @@ export class SessionManager {
     this.reset();
   }
 
-  private async getOrCreateSession(workspaceId: string): Promise<BrowserSession> {
+  private async getOrCreateSession(workspaceId: string, tabId?: string): Promise<BrowserSession> {
     if (this.archived.has(workspaceId)) throw new Error("Workspace was archived");
     const closing = this.sessionClosures.get(workspaceId);
     if (closing) await closing.catch(() => undefined);
     if (this.deliberatelyClosed.has(workspaceId)) throw new Error("Browser is closed");
-    const existing = this.sessions.get(workspaceId);
+    const existing = [...this.sessions.values()].find(
+      (session) => session.workspaceId === workspaceId && (!tabId || session.tabId === tabId),
+    );
     if (existing) return existing;
-    const pending = this.sessionCreations.get(workspaceId);
-    if (pending) return pending;
+
+    // The launch page has no known target ID until identity returns. Wait for
+    // another first attachment before deciding whether this target needs a
+    // second policy session, so control and presence cannot split in two.
+    const workspaceCreation = [...this.sessionCreations.entries()].find(
+      ([pendingKey]) => pendingKey === workspaceId || pendingKey.startsWith(`${workspaceId}/`),
+    )?.[1];
+    if (workspaceCreation) {
+      await workspaceCreation.catch(() => undefined);
+      return this.getOrCreateSession(workspaceId, tabId);
+    }
+    const key = tabId ? `${workspaceId}/${tabId}` : workspaceId;
     if (this.sessions.size + this.sessionCreations.size >= this.maxSessions)
       throw new Error(`Shared browser session limit (${this.maxSessions}) reached`);
     const lifecycleGeneration = this.lifecycleGeneration;
-    const creation = this.createSession(workspaceId);
-    this.sessionCreations.set(workspaceId, creation);
+    const creation = this.createSession(workspaceId, key, tabId);
+    this.sessionCreations.set(key, creation);
     try {
       const session = await creation;
-      if (
-        this.closed ||
-        this.archived.has(workspaceId) ||
-        lifecycleGeneration !== this.lifecycleGeneration
-      )
-        throw new Error(
-          this.closed
-            ? "Shared browser manager is closed"
-            : this.archived.has(workspaceId)
-              ? "Workspace was archived"
-              : "Shared browser manager was reset",
-        );
-      this.sessions.set(workspaceId, session);
+      if (this.closed) throw new Error("Shared browser manager is closed");
+      if (this.archived.has(workspaceId)) throw new Error("Workspace was archived");
+      if (this.deliberatelyClosed.has(workspaceId)) throw new Error("Browser is closed");
+      if (lifecycleGeneration !== this.lifecycleGeneration) {
+        throw new Error("Shared browser manager was reset");
+      }
+      this.sessions.set(key, session);
       return session;
     } catch (error) {
       if (this.archived.has(workspaceId)) throw new Error("Workspace was archived");
       throw error;
     } finally {
-      if (this.sessionCreations.get(workspaceId) === creation)
-        this.sessionCreations.delete(workspaceId);
+      if (this.sessionCreations.get(key) === creation) this.sessionCreations.delete(key);
     }
   }
 
-  private async createSession(workspaceId: string): Promise<BrowserSession> {
+  private async createSession(
+    workspaceId: string,
+    key: string,
+    requestedTabId?: string,
+  ): Promise<BrowserSession> {
     let runtimeId: string | null = null;
     try {
       const descriptor = await this.client.ensureWorkspace(workspaceId);
       runtimeId = descriptor.runtimeId;
-      const identity = asRecord(await this.client.requestWorkspace(workspaceId, "identity", null));
+      const initialTarget = requestedTabId ? { targetId: requestedTabId } : null;
+      const identity = asRecord(
+        await this.client.requestWorkspace(workspaceId, "identity", initialTarget),
+      );
+      const tabId =
+        requestedTabId ?? (typeof identity.targetId === "string" ? identity.targetId : null);
       const userAgent = boundedText(String(identity.userAgent ?? "Chromium"), 512);
       await this.client.requestWorkspace(workspaceId, "emulate", {
         ...DEFAULT_VIEWPORT,
@@ -1198,10 +1309,19 @@ export class SessionManager {
         touch: false,
         userAgent,
         platform: "",
+        ...(tabId ? { targetId: tabId } : {}),
       });
-      const state = asRecord(await this.client.requestWorkspace(workspaceId, "state", null));
+      const state = asRecord(
+        await this.client.requestWorkspace(
+          workspaceId,
+          "state",
+          tabId ? { targetId: tabId } : null,
+        ),
+      );
       return {
+        key,
         workspaceId,
+        tabId,
         sessionId: this.issueUniqueToken(),
         runtimeId: descriptor.runtimeId,
         runtimeCreatedAt: descriptor.createdAt,
@@ -1235,8 +1355,19 @@ export class SessionManager {
         inputGeneration: typeof state.inputGeneration === "string" ? state.inputGeneration : null,
       };
     } catch (error) {
-      if (runtimeId)
+      const hasOtherSession = [...this.sessions.values()].some(
+        (session) => session.workspaceId === workspaceId && session.key !== key,
+      );
+      const hasOtherCreation = [...this.sessionCreations.keys()].some(
+        (pendingKey) =>
+          pendingKey !== key &&
+          (pendingKey === workspaceId || pendingKey.startsWith(`${workspaceId}/`)),
+      );
+      // An invalid explicit tab must never tear down a workspace runtime that
+      // another participant may already be using without a policy session.
+      if (runtimeId && !requestedTabId && !hasOtherSession && !hasOtherCreation) {
         await this.client.closeWorkspace(workspaceId, runtimeId).catch(() => undefined);
+      }
       throw error;
     }
   }
@@ -1247,7 +1378,12 @@ export class SessionManager {
     input: JsonValue,
   ): Promise<JsonValue> {
     if (session.archived) throw new Error("Workspace was archived");
-    return this.client.requestWorkspace(session.workspaceId, operation, input);
+    if (!session.tabId) return this.client.requestWorkspace(session.workspaceId, operation, input);
+    const data = input && typeof input === "object" && !Array.isArray(input) ? input : {};
+    return this.client.requestWorkspace(session.workspaceId, operation, {
+      ...data,
+      targetId: session.tabId,
+    });
   }
 
   /** Cleanup depends on viewer ownership, never on whether capture produced pixels. */
@@ -1268,7 +1404,7 @@ export class SessionManager {
           : null,
       onExpired: () =>
         this.serialize(session, async () => {
-          if (this.sessions.get(session.workspaceId) !== session || session.archived) return;
+          if (this.sessions.get(session.key) !== session || session.archived) return;
           this.pruneExpired(session);
           await this.stopUnusedVideo(session);
         }),
@@ -1278,6 +1414,11 @@ export class SessionManager {
 
   private requireViewer(token: string): BrowserSession {
     if (this.closedViewerWorkspaces.has(token)) throw new Error("Browser is closed");
+    const closedTabExpiry = this.closedViewerTabs.get(token);
+    if (closedTabExpiry !== undefined) {
+      if (closedTabExpiry > this.now()) throw new Error("Browser tab is closed");
+      this.closedViewerTabs.delete(token);
+    }
     const session = this.viewerSessions.get(token);
     if (!session || !session.viewers.has(token))
       throw new Error("Viewer token is invalid or expired");
@@ -1715,6 +1856,7 @@ export class SessionManager {
       sessionId: session.sessionId,
       workspaceId: session.workspaceId,
       runtimeId: session.runtimeId,
+      ...(session.tabId ? { tabId: session.tabId } : {}),
       runtimeCreatedAt: session.runtimeCreatedAt,
       bridgeEpoch: session.bridgeEpoch,
       status: session.error ? "error" : "ready",

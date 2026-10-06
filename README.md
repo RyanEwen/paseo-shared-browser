@@ -1,14 +1,14 @@
 # Shared Browser
 
-A Paseo plugin that runs one real Chromium browser per workspace on the daemon host and shares that
-exact live session with every connected Paseo client. Version 1.0 replaces the previous browser
+A Paseo plugin that runs one real Chromium browser per workspace on the daemon host and shares its
+pages with connected Paseo clients and workspace agents. Version 1.0 replaces the previous browser
 runtime in place with a plugin-owned, pinned `agent-browser` runtime; existing installations keep
 the `shared-browser` plugin ID and upgrade without installing a second plugin.
 
-This is not URL synchronization and not a second browser with copied cookies. Every viewer and
-eligible workspace agent acts on the same running page, DOM, navigation state, and login state.
-Many viewers can watch; human control remains server-authoritative and takes priority over agent
-input.
+Each browser tab is a real page in the same Chromium profile, so tabs share site logins and cookies.
+Each client and agent selects a tab independently. Viewers of the same tab share its live page,
+navigation and control state. Human control remains server-authoritative and takes priority over
+agent input on that tab.
 
 ## Demo
 
@@ -33,6 +33,13 @@ organization names.
 - The plugin server runs beside the Paseo daemon and starts one `agent-browser` session and Chromium
   process per open browser workspace. Browser execution, profiles, IPC, and network access are on the
   daemon host, not on the viewing phone, browser, or desktop app.
+- A workspace can have up to eight tabs. Each tab has its own page, capture stream, viewport and
+  controller. Selecting a tab affects only the selecting viewer or agent. Closing a tab removes it
+  for every participant viewing it; the last tab stays open until the browser is closed.
+- Viewers can select a browser action while observing. A dialog offers control, names the current
+  controller when a takeover is needed, and continues the selected action after control is granted.
+  Closing a tab or browser still requires its own confirmation. Actions that need a fresh frame wait
+  for one before sending input.
 - The plugin owns `agent-browser` version `0.38.2`, its IPC directory, and the Chromium executable.
   It strips inherited `AGENT_BROWSER_*` variables and sets `AGENT_BROWSER_SOCKET_DIR`,
   `AGENT_BROWSER_IDLE_TIMEOUT_MS=0`, `AGENT_BROWSER_STREAM_PORT=0`, and
@@ -55,10 +62,10 @@ bridge can reclaim the existing workspace runtime. If no bridge reconnects, the 
 all orphaned runtimes after a 120-second grace period. A missed heartbeat fences the old bridge after
 30 seconds; the bridge sends heartbeats every 10 seconds.
 
-The browser actions menu has **Close shared browser** for the current controller. After confirmation,
+The browser actions menu has **Close shared browser**. After confirmation,
 it stops that workspace's Chromium process and ends every viewer and agent connection to it, even
 when their panels are active. Background reconnects cannot reopen a deliberately closed browser.
-A person can select **Open shared browser** from the closed panel to start a new runtime with the
+A person can select the prominent **Open shared browser** button in the closed panel to start a new runtime with the
 retained profile. Closing the browser does not remove saved cookies or site data.
 
 Each workspace gets a private profile under
@@ -114,16 +121,18 @@ provider accepts session MCP servers from Paseo 0.11, so new OMP agents receive 
 Pi agents also receive the adapter, but require Pi's optional MCP support to
 launch it.
 
-The injected MCP server exposes exactly these tools: `shared_browser_status`,
-`shared_browser_capture`, `shared_browser_device`, `shared_browser_acquire_control`, `shared_browser_release_control`,
-`shared_browser_navigate`, `shared_browser_input`, and `shared_browser_viewport`. It does not
+The injected MCP server exposes `shared_browser_status`, `shared_browser_capture`,
+`shared_browser_device`, `shared_browser_acquire_control`, `shared_browser_release_control`,
+`shared_browser_navigate`, `shared_browser_input`, `shared_browser_viewport`,
+`shared_browser_tabs`, `shared_browser_tab_open`, `shared_browser_tab_select`, and
+`shared_browser_tab_close`. It does not
 expose arbitrary CDP commands, JavaScript or page evaluation, browser profile access, or filesystem
 access.
 
 Each adapter launch receives an opaque credential bound to its workspace. It cannot use that
 credential to operate another workspace's browser. Agent input follows human-priority control: an
-agent cannot force a takeover while a human viewer holds control. The human must release control or
-the lease must expire before agent input can proceed.
+agent cannot force a takeover while a human viewer holds control of the same tab. The human must
+release control or the lease must expire before agent input can proceed on that tab.
 
 The provider launches the stdio adapter on the Paseo daemon host, beside the daemon-owned browser
 runtime. Web, desktop, and mobile clients never own or host the adapter or Chromium, and a client

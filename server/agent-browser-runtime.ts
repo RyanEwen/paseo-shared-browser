@@ -293,6 +293,7 @@ export class AgentBrowserRuntime {
   private stopping = false;
   private video: NativeVideoCapture | null = null;
   private videoRetirement: Promise<void> | null = null;
+  private ownsBrowser = true;
   private readonly videoRecovery = createVideoSourceRecovery();
   private videoTransitionDepth = 0;
   private videoTransitionEpoch = 0;
@@ -334,6 +335,7 @@ export class AgentBrowserRuntime {
     ]
       .filter(Boolean)
       .join(",");
+    this.ownsBrowser = true;
     const opened = await this.invoke([
       "--session",
       this.session,
@@ -356,6 +358,33 @@ export class AgentBrowserRuntime {
     await this.protectIpcMetadata();
     this.assertRuntimeOpen();
     await this.connectCdp(targetId);
+  }
+
+  /** Attach an independent page controller to an existing browser session. */
+  async attachTarget(targetId: string): Promise<void> {
+    this.assertRuntimeOpen();
+    this.ownsBrowser = false;
+    await this.connectCdp(targetId, false);
+  }
+
+  /** Create a page in the existing profile without changing another controller's selected page. */
+  async createTarget(url = "about:blank"): Promise<string> {
+    const result = await this.requireConnection().send<{ targetId: string }>(
+      "Target.createTarget",
+      { url },
+      { mutation: true },
+    );
+    return result.targetId;
+  }
+
+  /** Close only the named page. The caller must keep another page in the browser. */
+  async closeTarget(targetId: string): Promise<void> {
+    const result = await this.requireConnection().send<{ success: boolean }>(
+      "Target.closeTarget",
+      { targetId },
+      { mutation: true },
+    );
+    if (!result.success) throw new CdpUnavailableError("Browser tab could not be closed");
   }
 
   async reconnect(): Promise<void> {
@@ -419,7 +448,7 @@ export class AgentBrowserRuntime {
     );
   }
 
-  async selectTarget(targetId: string): Promise<void> {
+  async selectTarget(targetId: string, activate = true): Promise<void> {
     await this.withVideoTransition(async () => {
       const attachmentGeneration = ++this.attachmentGeneration;
       const connection = this.requireConnection();
@@ -437,8 +466,10 @@ export class AgentBrowserRuntime {
         this.assertAttachmentCurrent(connection, attachmentGeneration);
       }
       this.invalidateScreencastFrame();
-      await connection.send("Target.activateTarget", { targetId }, { mutation: true });
-      this.assertAttachmentCurrent(connection, attachmentGeneration);
+      if (activate) {
+        await connection.send("Target.activateTarget", { targetId }, { mutation: true });
+        this.assertAttachmentCurrent(connection, attachmentGeneration);
+      }
       // CDP emulation is session-owned: detaching the former session restores native
       // window metrics. Publish a replacement only after its retained settings succeed.
       this.page = null;
@@ -1594,7 +1625,7 @@ export class AgentBrowserRuntime {
       if (this.liveInput) await this.endLiveInput(this.liveInput.id);
       await this.releaseHeldInput();
       this.invalidateScreencastFrame();
-      if (!force) {
+      if (this.ownsBrowser && !force) {
         try {
           await this.invoke(["--session", this.session, "--json", "close"]);
         } catch {
@@ -1602,7 +1633,7 @@ export class AgentBrowserRuntime {
           await this.shutdown(true);
           return;
         }
-      } else {
+      } else if (this.ownsBrowser) {
         const pid = await this.daemonPid();
         if (pid !== null) {
           try {
@@ -1668,7 +1699,10 @@ export class AgentBrowserRuntime {
     }
   }
 
-  private async connectCdp(preferredTargetId: string | null = null): Promise<void> {
+  private async connectCdp(
+    preferredTargetId: string | null = null,
+    activate = this.ownsBrowser,
+  ): Promise<void> {
     this.assertRuntimeOpen();
     // A launch-selected page remains the intended target even if its first
     // attachment fails. Otherwise a retry could silently adopt another tab.
@@ -1712,7 +1746,7 @@ export class AgentBrowserRuntime {
       throw new CdpUnavailableError("The selected browser page is no longer available");
     }
     if (!target) throw new CdpUnavailableError("Chromium has no page target");
-    await this.selectTarget(target.targetId);
+    await this.selectTarget(target.targetId, activate);
   }
 
   private async requirePage(): Promise<CdpSession> {

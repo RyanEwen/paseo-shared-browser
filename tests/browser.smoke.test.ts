@@ -345,13 +345,53 @@ it("shares and persists a production agent-browser runtime across supervisor cli
     await vi.waitFor(() => expect(retainedCookie).toContain("shared-browser-profile=retained"));
     console.log("browser-smoke: restored");
 
-    await manager.closeBrowser({
+    const originalPageUrl = (await manager.status(restored.viewerToken)).state.url;
+    const extraTab = await manager.createTab(restored.viewerToken);
+    const extraViewer = await manager.attach(
+      "workspace-smoke",
+      "Second page viewer",
+      extraTab.tabId,
+    );
+    const extraControl = await manager.acquireControl(extraViewer.viewerToken, false);
+    retainedCookie = "";
+    await manager.navigate({
+      viewerToken: extraViewer.viewerToken,
+      controlToken: extraControl.controlToken,
+      expected: expected(extraControl.state),
+      action: { kind: "goto", url: `${origin}/read-cookie` },
+    });
+    await vi.waitFor(() => expect(retainedCookie).toContain("shared-browser-profile=retained"));
+    const extraFrame = await manager.capture(extraViewer.viewerToken, "medium", null);
+    const originalFrame = await manager.capture(restored.viewerToken, "medium", null);
+    expect(extraFrame.frame?.byteLength).toBeGreaterThan(0);
+    expect(originalFrame.frame?.byteLength).toBeGreaterThan(0);
+    expect(extraFrame.state.sessionId).not.toBe(originalFrame.state.sessionId);
+    expect((await manager.status(restored.viewerToken)).state.url).toBe(originalPageUrl);
+    expect((await manager.status(restored.viewerToken)).state.controller).toBe("self");
+    const extraPreset = await manager.applyDevicePreset({
+      viewerToken: extraViewer.viewerToken,
+      controlToken: extraControl.controlToken,
+      expected: expected((await manager.status(extraViewer.viewerToken)).state),
+      presetId: "pixel-7",
+    });
+    expect(extraPreset.state.viewport).toEqual({ width: 412, height: 839 });
+    await manager.closeTab({
       viewerToken: restored.viewerToken,
       controlToken: restoredControl.controlToken,
-      sessionId: restored.state.sessionId,
-      runtimeId: restored.state.runtimeId!,
+      tabId: restored.state.tabId!,
     });
-    await expect(manager.capture(restored.viewerToken, "medium", null)).rejects.toThrow(
+    await expect(manager.status(restored.viewerToken)).rejects.toThrow("Browser tab is closed");
+    expect((await manager.status(extraViewer.viewerToken)).state.url).toBe(`${origin}/read-cookie`);
+    expect((await manager.capture(extraViewer.viewerToken, "medium", null)).frame?.width).toBe(412);
+    console.log("browser-smoke: independent-tabs");
+
+    await manager.closeBrowser({
+      viewerToken: extraViewer.viewerToken,
+      controlToken: extraControl.controlToken,
+      sessionId: extraViewer.state.sessionId,
+      runtimeId: extraViewer.state.runtimeId!,
+    });
+    await expect(manager.capture(extraViewer.viewerToken, "medium", null)).rejects.toThrow(
       "Browser is closed",
     );
     await expect(manager.attach("workspace-smoke", "Background viewer")).rejects.toThrow(

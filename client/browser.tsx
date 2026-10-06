@@ -27,12 +27,16 @@ import {
   beginBrowserGestureRpc,
   captureBrowserRpc,
   closeBrowserRpc,
+  closeBrowserTabRpc,
+  createBrowserTabRpc,
   DEVICE_PRESETS,
   type DevicePresetId,
   detachBrowserRpc,
   didBrowserRuntimeRestart,
   endBrowserGestureRpc,
   isBrowserStateCurrent,
+  listBrowserTabsRpc,
+  MAX_BROWSER_TABS,
   MAX_VIEWPORT,
   MIN_VIEWPORT,
   navigateBrowserRpc,
@@ -54,12 +58,21 @@ import {
   ErrorNotice,
   Field,
 } from "./browser-chrome";
+import { BrowserControlDialog } from "./browser-control-dialog";
+import {
+  type ControlRequest,
+  type ControlRequestBasis,
+  controlRequestBasis,
+  isControlRequestCurrent,
+} from "./browser-control-request";
+import { BrowserDialogBody } from "./browser-dialog-body";
 import { type EmulationSelection, matchingResolutionPresetId } from "./browser-emulation-mode";
 import type { FrameCandidate } from "./browser-frame-buffer";
 import { BrowserFrameImage } from "./browser-frame-image";
 import { NativeKeyboardControls } from "./browser-native-keyboard-controls";
 import { createStyles, DIMENSION, SPACE } from "./browser-panel-styles";
 import { BrowserResolutionPicker } from "./browser-resolution-picker";
+import { BrowserTabs } from "./browser-tabs";
 import {
   BrowserMenuHeading,
   BrowserMenuItem,
@@ -91,6 +104,20 @@ type SpecialKey = Extract<BrowserInputEvent, { kind: "key" }>["key"];
 interface Size {
   width: number;
   height: number;
+}
+
+interface ControlledActions {
+  navigate(action: "back" | "forward" | "reload" | "goto", url?: string): void;
+  applyViewport(): void;
+  selectDevicePreset(id: DevicePresetId): void;
+  changeDensity(value: 1 | 2): void;
+  toggleEmulation(): void;
+  sendKey(key: SpecialKey): void;
+  openNativeKeyboard(kind: "keyboard" | "compose" | "commit"): void;
+  closeTab(): void;
+  closeBrowser(): void;
+  confirmCloseTab(): void;
+  confirmCloseBrowser(): void;
 }
 
 const SPECIAL_KEYS: readonly { key: SpecialKey; label: string }[] = [
@@ -177,6 +204,9 @@ export function SharedBrowserPanel({
   const detachBrowser = useRpc(detachBrowserRpc);
   const captureBrowser = useRpc(captureBrowserRpc);
   const closeBrowser = useRpc(closeBrowserRpc);
+  const closeTab = useRpc(closeBrowserTabRpc);
+  const createTab = useRpc(createBrowserTabRpc);
+  const listTabs = useRpc(listBrowserTabsRpc);
   const reopenBrowser = useRpc(reopenBrowserRpc);
   const acquireControl = useRpc(acquireControlRpc);
   const releaseControl = useRpc(releaseControlRpc);
@@ -217,6 +247,16 @@ export function SharedBrowserPanel({
   const [operationError, setOperationError] = useState<string | null>(null);
   const [reconnecting, setReconnecting] = useState(false);
   const [browserClosed, setBrowserClosed] = useState(false);
+  const [selectedTabId, setSelectedTabId] = useState<string | null>(null);
+  const selectedTabIdRef = useRef(selectedTabId);
+  selectedTabIdRef.current = selectedTabId;
+  const [tabMutationPending, setTabMutationPending] = useState(false);
+  const [tabCloseConfirmationOpen, setTabCloseConfirmationOpen] = useState(false);
+  const [controlRequest, setControlRequest] = useState<ControlRequest | null>(null);
+  const [pendingControlAction, setPendingControlAction] = useState<ControlRequest | null>(null);
+  const [controlRequestPending, setControlRequestPending] = useState(false);
+  const controlRequestPendingRef = useRef(false);
+  const controlledActionsRef = useRef<ControlledActions | null>(null);
   const [closeConfirmationOpen, setCloseConfirmationOpen] = useState(false);
   const [closePending, setClosePending] = useState(false);
   const [reopenPending, setReopenPending] = useState(false);
@@ -251,7 +291,7 @@ export function SharedBrowserPanel({
   };
   const [nativeRequest, setNativeRequest] = useState<{
     id: number;
-    kind: "keyboard" | "compose";
+    kind: "keyboard" | "compose" | "commit";
     ownershipKey: string;
   } | null>(null);
   const nextNativeRequest = useRef(0);
@@ -318,9 +358,13 @@ export function SharedBrowserPanel({
   );
 
   const attachQuery = useQuery({
-    queryKey: ["shared-browser", "attach", host.id, workspaceId, viewerLabel],
+    queryKey: ["shared-browser", "attach", host.id, workspaceId, viewerLabel, selectedTabId],
     queryFn: async () => {
-      const result = await attachBrowser({ workspaceId, viewerLabel });
+      const result = await attachBrowser({
+        workspaceId,
+        viewerLabel,
+        ...(selectedTabId ? { tabId: selectedTabId } : {}),
+      });
       if (!mountedRef.current) {
         await detachBrowser({ viewerToken: result.viewerToken }).catch(() => undefined);
         throw new Error("The browser panel closed before attachment completed.");
@@ -335,11 +379,36 @@ export function SharedBrowserPanel({
   });
 
   const closedView = browserClosed || isBrowserClosedError(attachQuery.error);
-  const viewerToken = reconnecting || closedView ? null : (attachQuery.data?.viewerToken ?? null);
+  const closedViewRef = useRef(closedView);
+  closedViewRef.current = closedView;
+  const attachedTabMatches = !selectedTabId || attachQuery.data?.state.tabId === selectedTabId;
+  const viewerToken =
+    reconnecting || closedView || !attachedTabMatches
+      ? null
+      : (attachQuery.data?.viewerToken ?? null);
+  const tabsQuery = useQuery({
+    queryKey: ["shared-browser", "tabs", host.id, workspaceId],
+    queryFn: () => listTabs({ viewerToken: viewerToken! }),
+    enabled: Boolean(viewerToken) && active,
+    refetchInterval: 2_000,
+  });
+
+  useEffect(() => {
+    const tabs = tabsQuery.data?.tabs;
+    const selected = selectedTabId ?? stateRef.current?.tabId;
+    if (!tabs || !selected || tabs.some((tab) => tab.id === selected)) return;
+    setSelectedTabId(tabs[0]?.id ?? null);
+  }, [selectedTabId, tabsQuery.data]);
 
   useEffect(() => {
     if (isBrowserClosedError(attachQuery.error)) setBrowserClosed(true);
   }, [attachQuery.error]);
+
+  useEffect(() => {
+    if (!closedView) return;
+    setControlRequest(null);
+    setPendingControlAction(null);
+  }, [closedView]);
 
   useEffect(() => {
     if (!viewerToken) return;
@@ -366,8 +435,28 @@ export function SharedBrowserPanel({
     setOperationError(null);
     setRuntimeNotice(null);
     setBrowserClosed(false);
+    setSelectedTabId(null);
+    setTabCloseConfirmationOpen(false);
+    setControlRequest(null);
+    setPendingControlAction(null);
     setCloseConfirmationOpen(false);
   }, [reset, workspaceId, host.id, inputLifecycle]);
+
+  useEffect(() => {
+    // A tab selection changes the viewer's page and frame authority, even
+    // though the underlying Chromium process and saved profile stay shared.
+    inputLifecycle.bump();
+    activeViewerTokenRef.current = null;
+    stateRef.current = null;
+    frameRef.current = null;
+    reset();
+    setState(null);
+    setControlToken(null);
+    setControlRequest(null);
+    setPendingControlAction(null);
+    setOperationError(null);
+    setReconnecting(false);
+  }, [selectedTabId, inputLifecycle, reset]);
 
   useLayoutEffect(() => {
     committedViewport.current = state
@@ -618,6 +707,7 @@ export function SharedBrowserPanel({
     densityControl.pending ||
     deviceMutation.isPending ||
     inputMutation.isPending ||
+    controlRequestPending ||
     closePending;
   const videoViewerExpired =
     video.errorViewerToken === viewerToken && isExpiredBrowserViewerError(video.error);
@@ -627,7 +717,11 @@ export function SharedBrowserPanel({
       setBrowserClosed(true);
   }, [captureQuery.error, video.error]);
   const canControl = Boolean(
-    viewerToken && controlToken && state?.controller === "self" && !viewingExpired,
+    viewerToken &&
+      controlToken &&
+      state?.controller === "self" &&
+      (!selectedTabId || state.tabId === selectedTabId) &&
+      !viewingExpired,
   );
   const frontLayer = buffer.front === null ? null : buffer.layers[buffer.front];
   useLayoutEffect(() => {
@@ -693,7 +787,14 @@ export function SharedBrowserPanel({
   const controlContext = useCallback(() => {
     const viewer = activeViewerTokenRef.current;
     const current = stateRef.current;
-    if (viewingExpired || !viewer || !controlToken || !current || current.controller !== "self")
+    if (
+      viewingExpired ||
+      !viewer ||
+      !controlToken ||
+      !current ||
+      current.controller !== "self" ||
+      (selectedTabId && current.tabId !== selectedTabId)
+    )
       return null;
     return {
       viewerToken: viewer,
@@ -704,7 +805,7 @@ export function SharedBrowserPanel({
         viewportGeneration: current.viewportGeneration,
       },
     };
-  }, [controlToken, viewingExpired]);
+  }, [controlToken, viewingExpired, selectedTabId]);
 
   const inputContext = useCallback(() => {
     const context = controlContext();
@@ -835,7 +936,15 @@ export function SharedBrowserPanel({
     state?.navigationGeneration,
     state?.viewportGeneration,
   ]);
-  const requestNativeKeyboard = (kind: "keyboard" | "compose") => {
+  const nativeDocumentKey = JSON.stringify([
+    viewerToken,
+    state?.sessionId,
+    state?.runtimeId,
+    state?.bridgeEpoch,
+    state?.navigationGeneration,
+    state?.viewportGeneration,
+  ]);
+  const requestNativeKeyboard = (kind: "keyboard" | "compose" | "commit") => {
     if (!canSendInput) return;
     nextNativeRequest.current += 1;
     closeToolbarMenu(false);
@@ -860,6 +969,131 @@ export function SharedBrowserPanel({
     },
     [acquireMutation, viewerToken],
   );
+
+  /** Ask for authority before running an action, preserving its exact tab and page basis. */
+  const requestControlled = (label: string, run: () => void, needsFrame = false) => {
+    if (anyMutationPending || controlRequestPendingRef.current) return;
+    if (controlContext()) {
+      run();
+      return;
+    }
+    const current = stateRef.current;
+    const viewer = activeViewerTokenRef.current;
+    if (!current || !viewer || (selectedTabId && current.tabId !== selectedTabId) || viewingExpired)
+      return;
+    setControlRequest({
+      label,
+      basis: controlRequestBasis(
+        panelScope,
+        viewer,
+        current,
+        controllerObservationRevision.current,
+      ),
+      needsFrame,
+      run,
+    });
+  };
+
+  const requestIsCurrent = useCallback(
+    (basis: ControlRequestBasis) =>
+      !closedViewRef.current &&
+      (!selectedTabIdRef.current || selectedTabIdRef.current === basis.tabId) &&
+      isControlRequestCurrent(
+        basis,
+        panelScopeRef.current,
+        activeViewerTokenRef.current,
+        stateRef.current,
+        controllerObservationRevision.current,
+      ),
+    [],
+  );
+
+  /** Acquire once, then let the committed controlled render run the queued action once. */
+  const confirmControlRequest = async () => {
+    const request = controlRequest;
+    if (!request || controlRequestPendingRef.current) return;
+    const current = stateRef.current;
+    if (!requestIsCurrent(request.basis)) {
+      setControlRequest(null);
+      setOperationError("The browser changed. Select the action again.");
+      return;
+    }
+
+    controlRequestPendingRef.current = true;
+    setControlRequestPending(true);
+    setOperationError(null);
+    try {
+      inputLifecycle.bump();
+      const result = await acquireControl({
+        viewerToken: request.basis.viewerToken,
+        takeover: current?.controller === "other",
+      });
+      if (!mountedRef.current || !requestIsCurrent(request.basis)) {
+        await releaseControl({
+          viewerToken: request.basis.viewerToken,
+          controlToken: result.controlToken,
+        }).catch(() => undefined);
+        return;
+      }
+      setControlRequest(null);
+      if (!acceptState(result.state)) {
+        await releaseControl({
+          viewerToken: request.basis.viewerToken,
+          controlToken: result.controlToken,
+        }).catch(() => undefined);
+        setOperationError("The browser changed. Select the action again.");
+        return;
+      }
+      setControlToken(result.controlToken);
+      refreshCapture();
+      if (
+        requestIsCurrent(request.basis) &&
+        isControlRequestCurrent(
+          request.basis,
+          panelScopeRef.current,
+          activeViewerTokenRef.current,
+          result.state,
+          controllerObservationRevision.current,
+        )
+      ) {
+        setPendingControlAction(request);
+      } else {
+        setOperationError("The browser changed. Select the action again.");
+      }
+    } catch (error) {
+      setControlRequest(null);
+      mutationFailed(error);
+    } finally {
+      controlRequestPendingRef.current = false;
+      if (mountedRef.current) setControlRequestPending(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!pendingControlAction || controlRequestPending) return;
+    if (!requestIsCurrent(pendingControlAction.basis)) {
+      setPendingControlAction(null);
+      setOperationError("The browser changed. Select the action again.");
+      return;
+    }
+    if (
+      !canControl ||
+      (pendingControlAction.needsFrame &&
+        (!canSendInput || admittedPaint?.epoch !== inputLifecycle.epoch))
+    )
+      return;
+    setPendingControlAction(null);
+    pendingControlAction.run();
+  }, [
+    pendingControlAction,
+    controlRequestPending,
+    canControl,
+    canSendInput,
+    admittedPaint,
+    state,
+    requestIsCurrent,
+  ]);
+
   const release = useCallback(() => {
     const viewer = activeViewerTokenRef.current;
     if (
@@ -941,7 +1175,7 @@ export function SharedBrowserPanel({
     platform: layout.platform,
     state,
     canControl,
-    pending: anyMutationPending,
+    pending: anyMutationPending || Boolean(pendingControlAction),
     apply: applyEmulationSelection,
   });
 
@@ -957,6 +1191,43 @@ export function SharedBrowserPanel({
       if (!result.error) setReconnecting(false);
     });
   }, [attachQuery.isFetching, attachQuery.refetch]);
+
+  /** Add a page to the shared profile and select it only for this panel. */
+  const createBrowserTab = async () => {
+    const viewerToken = activeViewerTokenRef.current;
+    if (!viewerToken || tabMutationPending) return;
+    setTabMutationPending(true);
+    setOperationError(null);
+    try {
+      const created = await createTab({ viewerToken });
+      setSelectedTabId(created.tabId);
+      void tabsQuery.refetch();
+    } catch (error) {
+      setOperationError(errorMessage(error));
+    } finally {
+      setTabMutationPending(false);
+    }
+  };
+
+  /** Close only the controlled page; other tabs and their viewers stay attached. */
+  const confirmCloseSelectedTab = async () => {
+    const viewerToken = activeViewerTokenRef.current;
+    const tabId = selectedTabId ?? stateRef.current?.tabId;
+    if (!viewerToken || !controlToken || !tabId || tabMutationPending) return;
+    setTabMutationPending(true);
+    setOperationError(null);
+    try {
+      await closeTab({ viewerToken, controlToken, tabId });
+      setTabCloseConfirmationOpen(false);
+      const fallback = tabsQuery.data?.tabs.find((tab) => tab.id !== tabId);
+      setSelectedTabId(fallback?.id ?? null);
+      void tabsQuery.refetch();
+    } catch (error) {
+      setOperationError(errorMessage(error));
+    } finally {
+      setTabMutationPending(false);
+    }
+  };
 
   /** Confirmed close ends every viewer's runtime and immediately drops this panel's media. */
   const confirmCloseBrowser = async () => {
@@ -987,6 +1258,22 @@ export function SharedBrowserPanel({
     } finally {
       setClosePending(false);
     }
+  };
+
+  // Queued actions always resolve through this render's scoped mutation callbacks.
+  // A callback captured before acquisition must never reuse its old control identity.
+  controlledActionsRef.current = {
+    navigate,
+    applyViewport,
+    selectDevicePreset,
+    changeDensity: (value) => densityControl.select(value),
+    toggleEmulation: emulation.toggle,
+    sendKey: (key) => sendEvent({ kind: "key", key }),
+    openNativeKeyboard: requestNativeKeyboard,
+    closeTab: () => setTabCloseConfirmationOpen(true),
+    closeBrowser: () => setCloseConfirmationOpen(true),
+    confirmCloseTab: () => void confirmCloseSelectedTab(),
+    confirmCloseBrowser: () => void confirmCloseBrowser(),
   };
 
   /** Explicit user action is the only way to clear the server's closed fence. */
@@ -1027,7 +1314,8 @@ export function SharedBrowserPanel({
     operationError ??
     recoveryError ??
     state?.error ??
-    (connectionError ? errorMessage(connectionError) : null);
+    (connectionError ? errorMessage(connectionError) : null) ??
+    (tabsQuery.error ? errorMessage(tabsQuery.error) : null);
   const statusColor =
     state?.status === "ready"
       ? theme.colors.statusSuccess
@@ -1036,18 +1324,6 @@ export function SharedBrowserPanel({
         : theme.colors.statusWarning;
   const statusLabel =
     state?.status === "ready" ? "Ready" : state?.status === "error" ? "Error" : "Starting";
-  const leaseExpiry = state?.controllerExpiresAt
-    ? new Date(state.controllerExpiresAt).toLocaleTimeString()
-    : null;
-  const leaseDetail = leaseExpiry ? ` · lease until ${leaseExpiry}` : "";
-  const controllerLabel =
-    state?.controller === "self"
-      ? controlToken
-        ? `You have control${leaseDetail}`
-        : "Control token unavailable"
-      : state?.controller === "other"
-        ? `${state.controllerLabel ?? "Another viewer"} has control${leaseDetail}`
-        : "Observe-only · no controller";
   const activeDevicePreset = state?.devicePresetId
     ? DEVICE_PRESETS.find(({ id }) => id === state.devicePresetId)
     : null;
@@ -1080,6 +1356,7 @@ export function SharedBrowserPanel({
         theme={theme}
         label="Release"
         icon="LogOut"
+        iconOnly
         disabled={anyMutationPending}
         onPress={release}
       />
@@ -1091,6 +1368,7 @@ export function SharedBrowserPanel({
         theme={theme}
         label="Take over"
         icon="Crown"
+        iconOnly
         danger
         disabled={!viewerToken || anyMutationPending}
         onPress={() => takeControl(true)}
@@ -1103,6 +1381,7 @@ export function SharedBrowserPanel({
         theme={theme}
         label={state?.controller === "self" ? "Reacquire" : "Take control"}
         icon="MousePointer2"
+        iconOnly
         primary
         disabled={!viewerToken || anyMutationPending}
         onPress={() => takeControl(false)}
@@ -1130,19 +1409,21 @@ export function SharedBrowserPanel({
           theme={theme}
           title="Shared browser closed"
           detail="The browser was closed for everyone. Its saved site data is available when you reopen it."
-        />
-        {operationError ? (
-          <ErrorNotice styles={styles} theme={theme} message={operationError} />
-        ) : null}
-        <View style={styles.controlStrip}>
+        >
           <ControlButton
             styles={styles}
             theme={theme}
             label={reopenPending ? "Opening…" : "Open shared browser"}
+            icon="PanelsTopLeft"
+            primary
+            large
             disabled={reopenPending}
             onPress={() => void reopenClosedBrowser()}
           />
-        </View>
+        </CanvasPlaceholder>
+        {operationError ? (
+          <ErrorNotice styles={styles} theme={theme} message={operationError} />
+        ) : null}
       </View>
     );
   }
@@ -1159,6 +1440,30 @@ export function SharedBrowserPanel({
         );
       }}
     >
+      <BrowserTabs
+        styles={styles}
+        theme={theme}
+        tabs={tabsQuery.data?.tabs ?? []}
+        selectedId={selectedTabId ?? state?.tabId ?? null}
+        selectedState={state}
+        statusColor={statusColor}
+        statusLabel={statusLabel}
+        controlAction={controlAction}
+        canCreate={
+          Boolean(viewerToken) &&
+          !tabMutationPending &&
+          (tabsQuery.data?.tabs.length ?? 0) < MAX_BROWSER_TABS
+        }
+        canClose={
+          Boolean(viewerToken) && !tabMutationPending && (tabsQuery.data?.tabs.length ?? 0) > 1
+        }
+        onSelect={setSelectedTabId}
+        onCreate={() => void createBrowserTab()}
+        onClose={() =>
+          requestControlled("close this tab", () => controlledActionsRef.current?.closeTab())
+        }
+      />
+
       <View style={styles.chrome}>
         <View style={styles.addressRow}>
           <ChromeIconButton
@@ -1166,24 +1471,34 @@ export function SharedBrowserPanel({
             theme={theme}
             label="Back"
             icon="ArrowLeft"
-            disabled={!canControl || !state?.canGoBack || navigateMutation.isPending}
-            onPress={() => navigate("back")}
+            disabled={!viewerToken || !state?.canGoBack || anyMutationPending}
+            onPress={() =>
+              requestControlled("go back", () => controlledActionsRef.current?.navigate("back"))
+            }
           />
           <ChromeIconButton
             styles={styles}
             theme={theme}
             label="Forward"
             icon="ArrowRight"
-            disabled={!canControl || !state?.canGoForward || navigateMutation.isPending}
-            onPress={() => navigate("forward")}
+            disabled={!viewerToken || !state?.canGoForward || anyMutationPending}
+            onPress={() =>
+              requestControlled("go forward", () =>
+                controlledActionsRef.current?.navigate("forward"),
+              )
+            }
           />
           <ChromeIconButton
             styles={styles}
             theme={theme}
             label="Reload"
             icon="RotateCw"
-            disabled={!canControl || navigateMutation.isPending}
-            onPress={() => navigate("reload")}
+            disabled={!viewerToken || anyMutationPending}
+            onPress={() =>
+              requestControlled("reload the page", () =>
+                controlledActionsRef.current?.navigate("reload"),
+              )
+            }
           />
           <Field
             styles={styles}
@@ -1191,7 +1506,7 @@ export function SharedBrowserPanel({
             value={addressDraft}
             accessibilityLabel="Browser address"
             placeholder="Enter a URL"
-            editable={canControl && !navigateMutation.isPending}
+            editable={Boolean(viewerToken) && !navigateMutation.isPending}
             dimWhenReadOnly={false}
             keyboardType="url"
             maxLength={MAX_URL_LENGTH}
@@ -1200,7 +1515,12 @@ export function SharedBrowserPanel({
             onChangeText={setAddressDraft}
             onFocus={() => setAddressFocused(true)}
             onBlur={() => setAddressFocused(false)}
-            onSubmit={() => navigate("goto", addressDraft)}
+            onSubmit={() => {
+              const target = addressDraft;
+              requestControlled("open this address", () =>
+                controlledActionsRef.current?.navigate("goto", target),
+              );
+            }}
           />
           <View ref={displayAnchorRef} collapsable={false}>
             <ChromeIconButton
@@ -1219,8 +1539,12 @@ export function SharedBrowserPanel({
             label={`${emulation.mode === "mobile" ? "Disable" : "Enable"} mobile emulation`}
             icon="Smartphone"
             selected={emulation.mode === "mobile"}
-            disabled={!canControl || anyMutationPending}
-            onPress={emulation.toggle}
+            disabled={!viewerToken || anyMutationPending}
+            onPress={() =>
+              requestControlled("change mobile emulation", () =>
+                controlledActionsRef.current?.toggleEmulation(),
+              )
+            }
           />
           <View ref={actionsAnchorRef} collapsable={false}>
             <ChromeIconButton
@@ -1234,22 +1558,6 @@ export function SharedBrowserPanel({
             />
           </View>
         </View>
-      </View>
-
-      <View style={styles.statusRow}>
-        <View style={styles.statusSummary}>
-          <View style={[styles.statusDot, { backgroundColor: statusColor }]} />
-          <Text style={styles.statusText}>{state ? statusLabel : "Connecting"}</Text>
-          <Text style={styles.mutedText}>
-            {state
-              ? `${state.viewerCount} viewer${state.viewerCount === 1 ? "" : "s"}`
-              : viewerLabel}
-          </Text>
-          <Text numberOfLines={1} style={styles.controllerText}>
-            {state ? controllerLabel : "Attaching to workspace browser"}
-          </Text>
-        </View>
-        <View style={styles.actionRow}>{controlAction}</View>
       </View>
 
       {runtimeNotice || visibleError ? (
@@ -1374,8 +1682,17 @@ export function SharedBrowserPanel({
           relay={canvasInput.nativeKeyboard}
           enabled={canSendInput}
           ownershipKey={nativeOwnershipKey}
+          documentKey={nativeDocumentKey}
           request={nativeRequest}
           onRequestHandled={nativeRequestHandled}
+          canRequestControl={Boolean(viewerToken) && !canControl}
+          onRequestControlForCompose={() =>
+            requestControlled(
+              "insert the composed text",
+              () => controlledActionsRef.current?.openNativeKeyboard("commit"),
+              true,
+            )
+          }
         />
       ) : null}
 
@@ -1392,20 +1709,25 @@ export function SharedBrowserPanel({
               groups={groupResolutionPresets()}
               selectedPresetId={selectedResolutionPresetId}
               favoritePresetIds={preferences.favoritePresetIds}
-              selectDisabled={!canControl || anyMutationPending}
+              selectDisabled={!viewerToken || anyMutationPending}
               favoriteDisabled={preferences.disabled}
               density={state?.captureScale ?? 1}
               viewport={state?.viewport ?? null}
               onDensityChange={(density) => {
-                if (!requireControlContext() || anyMutationPending) return;
-                densityControl.select(density);
+                requestControlled("change capture density", () =>
+                  controlledActionsRef.current?.changeDensity(density),
+                );
               }}
               captureQuality={preferences.captureQuality}
               videoBitrate={preferences.videoBitrate}
               videoFps={preferences.videoFps}
               onVideoBitrateChange={preferences.changeVideoBitrate}
               onVideoFpsChange={preferences.changeVideoFps}
-              onSelect={selectDevicePreset}
+              onSelect={(id) =>
+                requestControlled("change the browser resolution", () =>
+                  controlledActionsRef.current?.selectDevicePreset(id),
+                )
+              }
               onToggleFavorite={(id) => {
                 void preferences.toggleFavorite(id);
               }}
@@ -1436,14 +1758,18 @@ export function SharedBrowserPanel({
                 theme={theme}
                 value={viewportWidth}
                 accessibilityLabel="Canonical viewport width"
-                editable={canControl && !resizeMutation.isPending}
+                editable={Boolean(viewerToken) && !resizeMutation.isPending}
                 keyboardType="number-pad"
                 inputMode="numeric"
                 maxLength={4}
                 selectTextOnFocus
                 style={styles.viewportField}
                 onChangeText={setViewportWidth}
-                onSubmit={applyViewport}
+                onSubmit={() =>
+                  requestControlled("resize the browser", () =>
+                    controlledActionsRef.current?.applyViewport(),
+                  )
+                }
               />
               <Text style={styles.multiply}>×</Text>
               <Field
@@ -1451,27 +1777,77 @@ export function SharedBrowserPanel({
                 theme={theme}
                 value={viewportHeight}
                 accessibilityLabel="Canonical viewport height"
-                editable={canControl && !resizeMutation.isPending}
+                editable={Boolean(viewerToken) && !resizeMutation.isPending}
                 keyboardType="number-pad"
                 inputMode="numeric"
                 maxLength={4}
                 selectTextOnFocus
                 style={styles.viewportField}
                 onChangeText={setViewportHeight}
-                onSubmit={applyViewport}
+                onSubmit={() =>
+                  requestControlled("resize the browser", () =>
+                    controlledActionsRef.current?.applyViewport(),
+                  )
+                }
               />
               <ControlButton
                 styles={styles}
                 theme={theme}
                 label="Apply"
-                disabled={!canControl || resizeMutation.isPending}
-                onPress={applyViewport}
+                disabled={!viewerToken || anyMutationPending}
+                onPress={() =>
+                  requestControlled("resize the browser", () =>
+                    controlledActionsRef.current?.applyViewport(),
+                  )
+                }
               />
             </View>
             <Text style={styles.devicePresetDetail}>
               Presets change viewport, touch behavior, and user agent. Rendering remains Chromium.
             </Text>
           </View>
+        </Modal.Content>
+      </Modal>
+      <Modal
+        title="Close browser tab?"
+        icon={<Icon name="X" size={18} color={theme.colors.statusDanger} />}
+        open={tabCloseConfirmationOpen}
+        onOpenChange={(open) => {
+          if (!tabMutationPending) setTabCloseConfirmationOpen(open);
+        }}
+      >
+        <Modal.Content
+          style={styles.dialogViewport}
+          contentContainerStyle={styles.dialogSheetContent}
+        >
+          <BrowserDialogBody
+            styles={styles}
+            actions={
+              <>
+                <ControlButton
+                  styles={styles}
+                  theme={theme}
+                  label="Cancel"
+                  disabled={tabMutationPending}
+                  onPress={() => setTabCloseConfirmationOpen(false)}
+                />
+                <ControlButton
+                  styles={styles}
+                  theme={theme}
+                  label={tabMutationPending ? "Closing…" : "Close tab"}
+                  danger
+                  disabled={!viewerToken || tabMutationPending}
+                  onPress={() =>
+                    requestControlled("close this tab", () =>
+                      controlledActionsRef.current?.confirmCloseTab(),
+                    )
+                  }
+                />
+              </>
+            }
+          >
+            This removes the tab for everyone viewing it, including agents. Other tabs stay open.
+          </BrowserDialogBody>
         </Modal.Content>
       </Modal>
       <Modal
@@ -1482,31 +1858,50 @@ export function SharedBrowserPanel({
           if (!closePending) setCloseConfirmationOpen(open);
         }}
       >
-        <Modal.Content>
-          <View style={styles.deviceModalContent}>
-            <Text style={styles.canvasDetail}>
-              This closes the browser for every viewer and agent in this workspace. The saved site
-              data stays available when someone explicitly reopens it.
-            </Text>
-            <View style={styles.controlStrip}>
-              <ControlButton
-                styles={styles}
-                theme={theme}
-                label="Cancel"
-                disabled={closePending}
-                onPress={() => setCloseConfirmationOpen(false)}
-              />
-              <ControlButton
-                styles={styles}
-                theme={theme}
-                label={closePending ? "Closing…" : "Close browser"}
-                disabled={!canControl || closePending}
-                onPress={() => void confirmCloseBrowser()}
-              />
-            </View>
-          </View>
+        <Modal.Content
+          style={styles.dialogViewport}
+          contentContainerStyle={styles.dialogSheetContent}
+        >
+          <BrowserDialogBody
+            styles={styles}
+            actions={
+              <>
+                <ControlButton
+                  styles={styles}
+                  theme={theme}
+                  label="Cancel"
+                  disabled={closePending}
+                  onPress={() => setCloseConfirmationOpen(false)}
+                />
+                <ControlButton
+                  styles={styles}
+                  theme={theme}
+                  label={closePending ? "Closing…" : "Close browser"}
+                  disabled={!viewerToken || closePending}
+                  onPress={() =>
+                    requestControlled("close the shared browser", () =>
+                      controlledActionsRef.current?.confirmCloseBrowser(),
+                    )
+                  }
+                />
+              </>
+            }
+          >
+            This closes the browser for every viewer and agent in this workspace. The saved site
+            data stays available when someone explicitly reopens it.
+          </BrowserDialogBody>
         </Modal.Content>
       </Modal>
+      <BrowserControlDialog
+        styles={styles}
+        theme={theme}
+        state={state}
+        request={controlRequest}
+        pending={controlRequestPending}
+        available={Boolean(viewerToken)}
+        onCancel={() => setControlRequest(null)}
+        onConfirm={() => void confirmControlRequest()}
+      />
       {toolbarMenu ? (
         <BrowserToolbarMenu
           key={toolbarMenu}
@@ -1541,10 +1936,15 @@ export function SharedBrowserPanel({
                       theme={theme}
                       compact={layout.compact}
                       label={label}
-                      disabled={!canSendInput}
+                      disabled={!viewerToken || (canControl && !canSendInput)}
                       onPress={() => {
                         canvasInput.nativeKeyboard.reset();
-                        sendEvent({ kind: "key", key });
+                        closeToolbarMenu();
+                        requestControlled(
+                          `send ${label}`,
+                          () => controlledActionsRef.current?.sendKey(key),
+                          true,
+                        );
                       }}
                     />
                   )),
@@ -1603,10 +2003,12 @@ export function SharedBrowserPanel({
                       label={preset.label}
                       icon={preset.isMobile ? "Smartphone" : "Monitor"}
                       selected={selectedResolutionPresetId === id}
-                      disabled={!canControl || anyMutationPending}
+                      disabled={!viewerToken || anyMutationPending}
                       onPress={() => {
                         closeToolbarMenu();
-                        selectDevicePreset(id);
+                        requestControlled("change the browser resolution", () =>
+                          controlledActionsRef.current?.selectDevicePreset(id),
+                        );
                       }}
                     />
                   ) : null;
@@ -1633,16 +2035,30 @@ export function SharedBrowserPanel({
                     compact={layout.compact}
                     label="Keyboard"
                     icon="Keyboard"
-                    disabled={!canSendInput}
-                    onPress={() => requestNativeKeyboard("keyboard")}
+                    disabled={!viewerToken || (canControl && !canSendInput)}
+                    onPress={() => {
+                      closeToolbarMenu();
+                      requestControlled(
+                        "open the browser keyboard",
+                        () => controlledActionsRef.current?.openNativeKeyboard("keyboard"),
+                        true,
+                      );
+                    }}
                   />
                   <BrowserMenuItem
                     theme={theme}
                     compact={layout.compact}
                     label="Compose text"
                     icon="Pencil"
-                    disabled={!canSendInput}
-                    onPress={() => requestNativeKeyboard("compose")}
+                    disabled={!viewerToken || (canControl && !canSendInput)}
+                    onPress={() => {
+                      closeToolbarMenu();
+                      requestControlled(
+                        "compose browser text",
+                        () => controlledActionsRef.current?.openNativeKeyboard("compose"),
+                        true,
+                      );
+                    }}
                   />
                 </>
               ) : null}
@@ -1653,8 +2069,10 @@ export function SharedBrowserPanel({
                   label="Send keys"
                   icon="Keyboard"
                   expanded={keysSubmenuOpen}
-                  disabled={!canSendInput}
-                  onPress={() => setKeysSubmenuOpen(true)}
+                  disabled={!viewerToken || (canControl && !canSendInput)}
+                  onPress={() =>
+                    requestControlled("send browser keys", () => setKeysSubmenuOpen(true))
+                  }
                 />
               </View>
               <BrowserMenuItem
@@ -1674,10 +2092,12 @@ export function SharedBrowserPanel({
                 compact={layout.compact}
                 label="Close shared browser"
                 icon="X"
-                disabled={!canControl || anyMutationPending}
+                disabled={!viewerToken || anyMutationPending}
                 onPress={() => {
                   closeToolbarMenu(false);
-                  setCloseConfirmationOpen(true);
+                  requestControlled("close the shared browser", () =>
+                    controlledActionsRef.current?.closeBrowser(),
+                  );
                 }}
               />
             </>
