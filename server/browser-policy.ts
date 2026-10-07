@@ -44,6 +44,7 @@ import {
   DEFAULT_CAPTURE_QUALITY,
   JPEG_QUALITY,
 } from "../shared/capture-settings";
+import { frameMatchesBrowserContext } from "./browser-frame-context";
 import { BrowserGesture } from "./browser-gesture";
 import { runWithInputCleanup } from "./input-cleanup";
 import { sameRuntimeInputAttachment } from "./input-generation";
@@ -65,7 +66,6 @@ type UpdateGestureReply = Omit<RpcOutput<typeof updateBrowserGestureRpc>, "state
   state: BrowserState;
 };
 type EndGestureInput = RpcInput<typeof endBrowserGestureRpc>;
-type InputTarget = SendInput["target"];
 
 const VIEWER_TTL_MS = 45_000;
 const CONTROL_LEASE_MS = 30_000;
@@ -514,12 +514,29 @@ export class SessionManager {
     return this.serialize(session, async () => {
       this.pruneExpired(session);
       this.heartbeatViewer(session, viewerToken);
+      // Reconcile native document identity before capturing and again before
+      // issuing authority. A same-URL reload can invalidate the captured pixels.
+      const before = await this.snapshotState(session, viewerToken);
+      if (before.error) throw new Error(`Browser capture metadata failed: ${before.error}`);
+      const inputGeneration = session.inputGeneration;
+      const revision = session.frameRevision;
       const frame = await this.frameForQuality(session, quality);
-      this.rememberFrame(session, frame);
-      return {
-        state: await this.snapshotState(session, viewerToken),
-        frame: knownFrameId === frame.frameId ? null : frame,
-      };
+      const observedAt = this.now();
+      const state = await this.snapshotState(session, viewerToken);
+      if (state.error) throw new Error(`Browser capture metadata failed: ${state.error}`);
+      if (
+        inputGeneration !== session.inputGeneration ||
+        revision !== session.frameRevision ||
+        !frameMatchesBrowserContext(frame, before) ||
+        !frameMatchesBrowserContext(frame, state)
+      ) {
+        throw new Error("Browser changed during capture; request another frame");
+      }
+      if (observedAt + FRAME_TOKEN_TTL_MS <= this.now()) {
+        throw new Error("Browser capture expired during validation; request another frame");
+      }
+      this.rememberFrame(session, frame, undefined, observedAt);
+      return { state, frame: knownFrameId === frame.frameId ? null : frame };
     });
   }
 
@@ -848,9 +865,10 @@ export class SessionManager {
     return this.serialize(session, async () => {
       this.requireMutationAccess(session, input);
       this.requireRecentFrame(session, input.target);
+      const assertTargetCurrent = this.discreteInputGuard(session, input);
       await this.cancelGesture(session);
       try {
-        await this.dispatchDiscreteInput(session, input.event, input.target);
+        await this.dispatchDiscreteInput(session, input.event, assertTargetCurrent);
       } finally {
         const hadVideo = session.videoReceipts.size > 0 || session.videoReads.size > 0;
         // Revoke authority even if auxiliary capture fails. Source-age fencing
@@ -1595,11 +1613,7 @@ export class SessionManager {
     const cached = session.frameCache.get(quality);
     if (
       cached &&
-      cached.frame.sessionId === session.sessionId &&
-      cached.frame.runtimeId === session.runtimeId &&
-      cached.frame.captureEpoch === session.bridgeEpoch &&
-      cached.frame.navigationGeneration === session.navigationGeneration &&
-      cached.frame.viewportGeneration === session.viewportGeneration &&
+      frameMatchesBrowserContext(cached.frame, session) &&
       this.now() - cached.cachedAt <= this.frameCacheMs
     )
       return cached.frame;
@@ -1617,13 +1631,7 @@ export class SessionManager {
         waitMs: SCREENCAST_WAIT_MS,
       }),
     );
-    if (
-      generation.sessionId !== session.sessionId ||
-      generation.runtimeId !== session.runtimeId ||
-      generation.captureEpoch !== session.bridgeEpoch ||
-      generation.navigationGeneration !== session.navigationGeneration ||
-      generation.viewportGeneration !== session.viewportGeneration
-    )
+    if (!frameMatchesBrowserContext(generation, session))
       throw new Error("Browser changed during capture; request another frame");
     const byteLength = Number(raw.byteLength);
     const dataBase64 = String(raw.dataBase64 ?? "");
@@ -1682,6 +1690,7 @@ export class SessionManager {
     session: BrowserSession,
     frame: BrowserFrameAuthority,
     capturedAtMonotonicMs?: number,
+    observedAt = this.now(),
   ): void {
     if (capturedAtMonotonicMs !== undefined && session.videoInputNotBefore !== null) {
       const exclusiveFloor = session.videoInputNotBefore + VIDEO_SOURCE_CLOCK_TOLERANCE_MS;
@@ -1694,7 +1703,7 @@ export class SessionManager {
     session.recentFrames.set(frame.frameId, {
       navigationGeneration: frame.navigationGeneration,
       viewportGeneration: frame.viewportGeneration,
-      expiresAt: this.now() + FRAME_TOKEN_TTL_MS,
+      expiresAt: observedAt + FRAME_TOKEN_TTL_MS,
       ...(capturedAtMonotonicMs === undefined
         ? {}
         : {
@@ -1708,16 +1717,49 @@ export class SessionManager {
     }
   }
 
+  /**
+   * Retain one freshly admitted observation for this operation only. Runtime
+   * latency cannot expire it after publication; control, native document and
+   * every attachment/display fence still revoke it. No continuation is exposed.
+   */
+  private discreteInputGuard(session: BrowserSession, input: SendInput): () => Promise<void> {
+    const context = {
+      viewerToken: input.viewerToken,
+      controlToken: input.controlToken,
+      expected: {
+        sessionId: session.sessionId,
+        runtimeId: session.runtimeId,
+        bridgeEpoch: session.bridgeEpoch,
+        navigationGeneration: session.navigationGeneration,
+        viewportGeneration: session.viewportGeneration,
+      },
+    };
+    const inputGeneration = session.inputGeneration;
+    const revision = session.frameRevision;
+    return async () => {
+      await this.refreshPageMetadata(session);
+      if (
+        inputGeneration !== session.inputGeneration ||
+        revision !== session.frameRevision ||
+        context.expected.navigationGeneration !== session.navigationGeneration ||
+        context.expected.viewportGeneration !== session.viewportGeneration
+      ) {
+        throw new Error("Browser frame is stale");
+      }
+      this.requireMutationAccess(session, context);
+    };
+  }
+
   /** A strict discrete press owns one private native cleanup channel. The ID is
    * never returned to callers and grants no agent continuation. Native end uses
    * the original page even after navigation, revocation or a lost down ACK. */
   private async dispatchDiscreteInput(
     session: BrowserSession,
     event: BrowserInputEvent,
-    target: InputTarget,
+    assertTargetCurrent: () => Promise<void>,
   ): Promise<void> {
     if (event.kind !== "key" && event.kind !== "click" && event.kind !== "drag") {
-      await this.dispatchInput(session, event, target);
+      await this.dispatchInput(session, event, assertTargetCurrent);
       return;
     }
     if (session.inputGeneration === null) {
@@ -1730,7 +1772,7 @@ export class SessionManager {
           gestureId,
           expectedInputGeneration: session.inputGeneration,
         });
-        await this.dispatchInput(session, event, target, gestureId);
+        await this.dispatchInput(session, event, assertTargetCurrent, gestureId);
       },
       () => this.request(session, "input.end", { gestureId }),
     );
@@ -1739,13 +1781,17 @@ export class SessionManager {
   private async dispatchInput(
     session: BrowserSession,
     event: BrowserInputEvent,
-    target: InputTarget,
+    assertTargetCurrent: () => Promise<void>,
     gestureId?: string,
   ): Promise<void> {
-    const assertTargetCurrent = async () => {
-      await this.refreshPageMetadata(session);
-      this.requireRecentFrame(session, target);
-    };
+    // Hover keeps its existing fast path. It must not wait behind page metadata
+    // while video is pending; the initial control/frame checks still apply.
+    if (event.kind === "move") {
+      const point = mapDisplayedPoint(event.point, session.viewport);
+      await this.request(session, "mouse.move", { x: point.x, y: point.y });
+      return;
+    }
+    await assertTargetCurrent();
     if (event.kind === "type") {
       await this.request(session, "text.insert", { text: event.text });
       return;
@@ -1761,11 +1807,6 @@ export class SessionManager {
           ...(gestureId ? { gestureId } : {}),
         }),
       );
-      return;
-    }
-    if (event.kind === "move") {
-      const point = mapDisplayedPoint(event.point, session.viewport);
-      await this.request(session, "mouse.move", { x: point.x, y: point.y });
       return;
     }
     if (event.kind === "scroll") {

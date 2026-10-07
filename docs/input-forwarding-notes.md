@@ -44,8 +44,18 @@ drag/drop; file-drop and cross-application drag payloads are not implemented.
 
 A stale decoded frame can fail initial admission. Only confirmed unpublished
 admission is refreshed and retried within one bounded budget. Published updates
-are never replayed. Discrete MCP input retains its strict frame validation and is
-a different path from the human pane's ordered gesture channel.
+are never replayed. Discrete MCP input requires a frame under five seconds old
+at initial admission. An admitted operation retains its exact control,
+document, frame revision, viewport, runtime and bridge context through compound
+release; elapsed frame age alone cannot turn a published click into a stale
+failure. Native idle expiry and unknown outcomes remain separate failures, and
+neither grants replay. This is a different path from the human pane's ordered
+gesture channel.
+
+Capture reconciles document metadata before and after obtaining pixels. Changed
+identity or failed metadata refuses the capture before issuing authority. Its
+deadline still starts when the pixels are received, so metadata latency cannot
+extend the five-second observation window or return an already expired token.
 
 ## Evidence and remaining acceptance
 
@@ -54,6 +64,12 @@ focus traversal, Ctrl+click and held-key cleanup. Mounted DOM checks cover IME,
 AltGraph, Option insertion, paste and control replacement. Native phone relay
 checks validate event routing and lifecycle, but do not replace physical-device
 software-keyboard acceptance. Human pane scrollbar dragging was confirmed.
+
+Deterministic policy fixtures cover delayed capture validation, document and
+attachment changes, control expiry and unknown publication. Actual native
+fixtures confirm an admitted operation can exceed five seconds in total while
+retaining the separate native idle limit; idle expiry releases once and grants
+no replay.
 
 Headless Linux Chromium can lack pointer/hover media even when mouse events work.
 When existing Xvfb is available, a private authenticated display supplies native
