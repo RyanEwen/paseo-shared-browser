@@ -265,6 +265,10 @@ User-supplied `AGENT_BROWSER_*` variables are deliberately ignored.
 - Clicking a link or submitting a form may navigate before its input reply arrives. A completed
   input returns the new viewing state without a false failure or repeating the action.
   Replaced controls, targets and uncertain sends remain rejected.
+- A document change during metadata reads discards both partial observations and
+  permits one fresh read on the same attachment within the original timeout.
+  Repeated changes, failed reads and replacement attachments remain errors;
+  browser input is never replayed to obtain metadata.
 - Agent stale-frame errors identify initial admission or a context change during admitted
   input. Known receipt age is bounded to 60 seconds and uses its original clock; missing
   receipts report missing-or-revoked without inventing an age. These diagnostics contain

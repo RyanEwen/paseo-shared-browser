@@ -520,9 +520,10 @@ export class AgentBrowserRuntime {
       }
     }
   }
-  /** Read fresh metadata concurrently; never combine observations across document changes.
-   * Internal navigation callers can shorten the per-read budget in milliseconds.
-   * Unavailable metadata rejects; it never becomes a fabricated ready receipt. */
+  /** Read fresh metadata concurrently, discarding both replies if the document changes.
+   * One same-attachment reread shares the original monotonic timeout budget in
+   * milliseconds. Failed reads, replacement attachments and repeated document
+   * changes reject; this read-only recovery never repeats a native mutation. */
   async state(options: { timeoutMs?: number } = {}): Promise<RuntimePageState> {
     if (
       options.timeoutMs !== undefined &&
@@ -535,39 +536,52 @@ export class AgentBrowserRuntime {
     const timeoutMs = Math.min(options.timeoutMs ?? this.timeoutMs, this.timeoutMs);
     const page = await this.requirePage();
     const attachmentGeneration = this.attachmentGeneration;
-    const documentGeneration = this.documentGeneration;
-    // Native history and fixed DOM metadata are independent reads. Overlap their
-    // CDP round trips without caching metadata or weakening input attachment checks.
-    const [history, evaluated] = await Promise.all([
-      this.navigationHistory(page, timeoutMs),
-      page.send<{
-        result: { value?: { url?: string; title?: string } };
-      }>(
-        "Runtime.evaluate",
-        {
-          expression: "({url: location.href, title: document.title})",
-          returnByValue: true,
-        },
-        { timeoutMs },
-      ),
-    ]);
-    if (
-      page !== this.page ||
-      attachmentGeneration !== this.attachmentGeneration ||
-      documentGeneration !== this.documentGeneration
-    ) {
-      throw new CdpUnavailableError("Browser metadata changed while being read");
+    const deadline = performance.now() + timeoutMs;
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+      this.assertRuntimeOpen();
+      const remaining = attempt === 0 ? timeoutMs : deadline - performance.now();
+      if (remaining <= 0) {
+        throw new CdpUnavailableError("Browser metadata observation timed out");
+      }
+      const documentGeneration = this.documentGeneration;
+      // Both observations must describe the same document. A navigation discards
+      // the entire pair; neither native history nor DOM metadata is cached.
+      const [history, evaluated] = await Promise.all([
+        this.navigationHistory(page, remaining),
+        page.send<{
+          result: { value?: { url?: string; title?: string } };
+        }>(
+          "Runtime.evaluate",
+          {
+            expression: "({url: location.href, title: document.title})",
+            returnByValue: true,
+          },
+          { timeoutMs: remaining },
+        ),
+      ]);
+      this.assertRuntimeOpen();
+      if (page !== this.page || attachmentGeneration !== this.attachmentGeneration) {
+        throw new CdpUnavailableError("Browser metadata changed while being read");
+      }
+      // Successful replies can beat an overdue CDP timer in the event queue.
+      // Their metadata still cannot outlive the original shared phase budget.
+      if (performance.now() >= deadline) {
+        throw new CdpUnavailableError("Browser metadata observation timed out");
+      }
+      if (documentGeneration !== this.documentGeneration) {
+        if (attempt === 0) continue;
+        throw new CdpUnavailableError("Browser metadata changed while being read");
+      }
+      return {
+        url: evaluated.result.value?.url ?? history.entries[history.currentIndex]?.url ?? "",
+        title: evaluated.result.value?.title ?? history.entries[history.currentIndex]?.title ?? "",
+        canGoBack: history.currentIndex > 0,
+        canGoForward: history.currentIndex < history.entries.length - 1,
+        inputGeneration: formatRuntimeInputGeneration(attachmentGeneration, documentGeneration),
+      };
     }
-    return {
-      url: evaluated.result.value?.url ?? history.entries[history.currentIndex]?.url ?? "",
-      title: evaluated.result.value?.title ?? history.entries[history.currentIndex]?.title ?? "",
-      canGoBack: history.currentIndex > 0,
-      canGoForward: history.currentIndex < history.entries.length - 1,
-      inputGeneration: formatRuntimeInputGeneration(
-        this.attachmentGeneration,
-        this.documentGeneration,
-      ),
-    };
+    throw new CdpUnavailableError("Browser metadata changed while being read");
   }
 
   /** Await native ACK and its main-frame commit, without waiting for scripts or
