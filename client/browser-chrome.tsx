@@ -12,24 +12,13 @@ import {
   View,
   type ViewStyle,
 } from "react-native";
+import { ControlButton, type ControlButtonStyles } from "./browser-control-button";
+import { setBrowserControlTooltip } from "./browser-control-tooltip-web";
 import { DIMENSION } from "./browser-panel-styles";
 
 type Theme = PluginWorkspacePanelProps["theme"];
 
-interface ControlButtonStyles {
-  button: ViewStyle;
-  buttonSelected: ViewStyle;
-  buttonPrimary: ViewStyle;
-  buttonDanger: ViewStyle;
-  buttonHovered: ViewStyle;
-  buttonPressed: ViewStyle;
-  buttonFocused: ViewStyle;
-  buttonDisabled: ViewStyle;
-  buttonLarge: ViewStyle;
-  buttonFill: ViewStyle;
-  buttonText: TextStyle;
-  buttonTextSelected: TextStyle;
-}
+export { ControlButton } from "./browser-control-button";
 
 interface FieldStyles {
   field: TextStyle;
@@ -46,77 +35,6 @@ interface CanvasPlaceholderStyles {
   canvasState: ViewStyle;
   canvasTitle: TextStyle;
   canvasDetail: TextStyle;
-}
-
-interface ControlButtonProps {
-  styles: ControlButtonStyles;
-  theme: Theme;
-  label: string;
-  accessibilityLabel?: string;
-  icon?: string;
-  selected?: boolean;
-  primary?: boolean;
-  danger?: boolean;
-  large?: boolean;
-  fill?: boolean;
-  disabled?: boolean;
-  onPress(): void;
-}
-
-/** Themed button leaf using public SDK/RN primitives. */
-export function ControlButton({
-  styles,
-  theme,
-  label,
-  accessibilityLabel,
-  icon,
-  selected = false,
-  primary = false,
-  danger = false,
-  large = false,
-  fill = false,
-  disabled = false,
-  onPress,
-}: ControlButtonProps) {
-  const [focused, setFocused] = useState(false);
-  const [hovered, setHovered] = useState(false);
-  const highlighted = selected || primary;
-  return (
-    <Pressable
-      accessibilityRole="button"
-      accessibilityLabel={accessibilityLabel ?? label}
-      accessibilityState={{ disabled, selected }}
-      disabled={disabled}
-      onFocus={() => setFocused(true)}
-      onBlur={() => setFocused(false)}
-      onHoverIn={() => setHovered(true)}
-      onHoverOut={() => setHovered(false)}
-      onPress={onPress}
-      style={({ pressed }) => [
-        styles.button,
-        selected ? styles.buttonSelected : null,
-        primary ? styles.buttonPrimary : null,
-        danger ? styles.buttonDanger : null,
-        hovered && !highlighted ? styles.buttonHovered : null,
-        pressed ? styles.buttonPressed : null,
-        focused ? styles.buttonFocused : null,
-        disabled ? styles.buttonDisabled : null,
-        large ? styles.buttonLarge : null,
-        fill ? styles.buttonFill : null,
-      ]}
-    >
-      {icon ? (
-        <Icon
-          name={icon}
-          size={DIMENSION.icon}
-          color={highlighted ? theme.colors.accentForeground : theme.colors.foregroundMuted}
-        />
-      ) : null}
-      <Text style={[styles.buttonText, highlighted ? styles.buttonTextSelected : null]}>
-        {label}
-      </Text>
-    </Pressable>
-  );
 }
 
 interface ChromeIconButtonStyles {
@@ -151,6 +69,7 @@ export function ChromeIconButton({
   const [hovered, setHovered] = useState(false);
   return (
     <Pressable
+      ref={(node) => setBrowserControlTooltip(node, label)}
       accessibilityRole="button"
       accessibilityLabel={label}
       accessibilityState={{ disabled, selected, ...(expanded === undefined ? {} : { expanded }) }}

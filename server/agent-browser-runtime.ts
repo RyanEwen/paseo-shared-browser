@@ -28,6 +28,7 @@ import {
   MAX_HELD_BROWSER_KEYS,
 } from "../shared/browser";
 import { resolveVideoEncoderSettings } from "../shared/video-settings";
+import { browserCursorExpression } from "./browser-cursor";
 import { GESTURE_IDLE_MS, GESTURE_LIFETIME_MS } from "./browser-gesture";
 import { CAPTURE_MAX_AGE_MS, createCaptureTransportPolicy } from "./capture-transport-policy";
 import { formatRuntimeInputGeneration } from "./input-generation";
@@ -1517,7 +1518,7 @@ export class AgentBrowserRuntime {
       const result = await page.send<{ result: { value?: unknown } }>(
         "Runtime.evaluate",
         {
-          expression: `(() => { const e = document.elementFromPoint(${x}, ${y}); return e ? getComputedStyle(e).cursor : null; })()`,
+          expression: browserCursorExpression(x, y),
           returnByValue: true,
         },
         { timeoutMs: Math.min(this.timeoutMs, CURSOR_SAMPLE_TIMEOUT_MS) },

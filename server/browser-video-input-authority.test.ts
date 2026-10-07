@@ -6,6 +6,7 @@ it.each([-1, 0, 40])(
   async (sourceSkew) => {
     let ids = 0;
     let now = Date.parse("2026-10-03T12:00:00Z");
+    let monotonicNow = 1_000;
     let blocked: Promise<void> | null = null;
     const arrived = Promise.withResolvers<void>();
     const release = Promise.withResolvers<void>();
@@ -21,10 +22,12 @@ it.each([-1, 0, 40])(
       width: 1280,
       height: 800,
       capturedAt: new Date(now + sourceSkew).toISOString(),
+      capturedAtMonotonicMs: monotonicNow + sourceSkew,
       dataBase64: "AA==",
     };
     const manager = new SessionManager({
       now: () => now,
+      monotonicNow: () => monotonicNow,
       validateWorkspace: async () => true,
       issueToken: () => String(++ids).padStart(32, "0"),
       client: {
@@ -173,6 +176,8 @@ it.each([-1, 0, 40])(
       expect(calls.filter((value) => value === "input.begin")).toHaveLength(2);
       // A later genuine source frame admits input without resetting the video codec.
       now += 100;
+      monotonicNow += 100;
+      packet.capturedAtMonotonicMs = monotonicNow;
       packet.sequence += 1;
       packet.timestampUs += 100000;
       packet.capturedAt = new Date(now).toISOString();

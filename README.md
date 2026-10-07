@@ -378,8 +378,10 @@ Release Please maintains the version, changelog, component tag, and GitHub relea
 Conventional Commits in the monorepo.
 
 Both the Paseo daemon and app must satisfy the version range in `paseo-plugin.json`.
-Paseo 0.11 is required; the tested `0.11.0-beta.3` prerelease is also allowed.
-Earlier releases are not advertised because the plugin uses the 0.11 SDK contract. The client surface uses React Native primitives
+The upstream 0.9, 0.10 and 0.11 ranges remain supported by the manifest;
+the tested `0.11.0-beta.3` prerelease is also allowed. Older daemon/client
+combinations still need runtime qualification. Encoded video requires the
+optional host decoding capability and retains JPEG fallback when unavailable. The client surface uses React Native primitives
 and works in desktop, web, iOS, and Android Paseo clients.
 
 For an initial, not-yet-admitted channel, a wheel capture can finish decoding
@@ -397,3 +399,7 @@ bounds, input admission and recovery. [Remote-control research](REMOTE_BROWSER_R
 records primary-source comparisons and the trade-offs behind continuous human
 input. These describe the implementation's guarantees, not a promise of a
 particular frame rate or remote-network latency.
+
+On Linux, set `PASEO_SHARED_BROWSER_XVFB=0` in the daemon environment to
+retain headless launch behavior for new workspace runtimes. The plugin does
+not install Xvfb or change host display settings.

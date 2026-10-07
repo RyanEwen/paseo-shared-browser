@@ -19,6 +19,8 @@ interface OwnedRuntime {
 interface RuntimeOwnerOptions {
   initialUrl?: string;
   headed?: boolean;
+  /** Explicit false keeps upstream headless launch behavior, including on Linux with Xvfb installed. */
+  virtualDisplay?: boolean;
 }
 
 function paseoHome(): string {
@@ -62,7 +64,11 @@ export async function createRuntimeOwner(
       // Explicit headed mode uses the caller's real display. Hidden Linux mode
       // gets a private virtual mouse so native pointer media survive emulation.
       let display: PrivateVirtualDisplay | null = null;
-      if (!options.headed) {
+      if (
+        !options.headed &&
+        options.virtualDisplay !== false &&
+        process.env.PASEO_SHARED_BROWSER_XVFB !== "0"
+      ) {
         try {
           display = await createPrivateVirtualDisplay();
         } catch {

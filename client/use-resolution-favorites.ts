@@ -11,7 +11,11 @@ import {
 } from "../shared/browser-display-preferences";
 import { DEFAULT_CAPTURE_QUALITY } from "../shared/capture-settings";
 import type { DevicePresetId } from "../shared/device-presets";
-import { normalizeResolutionFavorites, toggleResolutionFavorite } from "../shared/resolution-menu";
+import {
+  normalizeResolutionFavorites,
+  orderedResolutionFavorites,
+  toggleResolutionFavorite,
+} from "../shared/resolution-menu";
 import { DEFAULT_VIDEO_BITRATE, DEFAULT_VIDEO_FPS } from "../shared/video-settings";
 
 /** Call with the surface's host.id; persistence itself is scoped by Paseo. */
@@ -25,7 +29,7 @@ export function useResolutionFavorites(hostId: string) {
   const disabled = settings.status !== "ready" || saving;
   const favoritePresetIds =
     settings.status === "ready"
-      ? normalizeResolutionFavorites(settings.values.favoritePresetIds)
+      ? orderedResolutionFavorites(settings.values.favoritePresetIds)
       : [];
   const error =
     settings.status === "error" || settings.status === "invalid"
