@@ -39,8 +39,6 @@ import {
   updateBrowserGestureRpc,
 } from "./shared/browser";
 
-import { browserDisplayPreferences } from "./shared/browser-display-preferences";
-
 const TICKET_ENV = "PASEO_SHARED_BROWSER_TICKET";
 const MCP_SERVER_ID = "shared-browser";
 const TICKET_ISSUE_TIMEOUT_MS = 2_000;
@@ -75,7 +73,6 @@ function mcpBundlePath(): string {
 }
 
 export default function contribute(server: PluginServerContext) {
-  server.registerSettings(browserDisplayPreferences);
   server.handle(attachBrowserRpc, handleAttachBrowser);
   server.handle(detachBrowserRpc, handleDetachBrowser);
   server.handle(captureBrowserRpc, handleCaptureBrowser);

@@ -1,23 +1,71 @@
 import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
-import {
-  DEFAULT_CAPTURE_QUALITY,
-  FRAME_MAX_BASE64_CHARS,
-  FRAME_MAX_BYTES,
-} from "./capture-settings";
-import { DEVICE_PRESET_IDS } from "./device-presets";
-import { MAX_VIEWPORT, MIN_VIEWPORT } from "./viewport-limits";
-
-export {
-  DEFAULT_CAPTURE_QUALITY,
-  FRAME_MAX_BASE64_CHARS,
-  FRAME_MAX_BYTES,
-} from "./capture-settings";
-export { DEVICE_PRESET_IDS, DEVICE_PRESETS, type DevicePresetId } from "./device-presets";
 
 export const DEFAULT_VIEWPORT = { width: 1280, height: 800 } as const;
-export { MAX_VIEWPORT, MIN_VIEWPORT } from "./viewport-limits";
+export const MIN_VIEWPORT = { width: 320, height: 480 } as const;
+export const MAX_VIEWPORT = { width: 1600, height: 1200 } as const;
+export const FRAME_MAX_BYTES = 800_000;
+export const FRAME_MAX_BASE64_CHARS = Math.ceil(FRAME_MAX_BYTES / 3) * 4;
 
+export const DEVICE_PRESETS = [
+  {
+    id: "desktop-chrome",
+    label: "Desktop Chrome",
+    shortLabel: "Desktop",
+    viewport: { width: 1280, height: 720 },
+    deviceScaleFactor: 1,
+    isMobile: false,
+    hasTouch: false,
+    platform: "Win32",
+    userAgent:
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.8010.12 Safari/537.36",
+  },
+  {
+    id: "iphone-15-pro",
+    label: "iPhone 15 Pro",
+    shortLabel: "iPhone 15",
+    viewport: { width: 393, height: 659 },
+    deviceScaleFactor: 3,
+    isMobile: true,
+    hasTouch: true,
+    platform: "iPhone",
+    userAgent:
+      "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.6 Mobile/15E148 Safari/604.1",
+  },
+  {
+    id: "pixel-7",
+    label: "Pixel 7",
+    shortLabel: "Pixel 7",
+    viewport: { width: 412, height: 839 },
+    deviceScaleFactor: 2.625,
+    isMobile: true,
+    hasTouch: true,
+    platform: "Linux armv81",
+    userAgent:
+      "Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.8010.12 Mobile Safari/537.36",
+  },
+  {
+    id: "ipad-pro-11",
+    label: "iPad Pro 11",
+    shortLabel: "iPad 11",
+    viewport: { width: 834, height: 1194 },
+    deviceScaleFactor: 2,
+    isMobile: true,
+    hasTouch: true,
+    platform: "iPad",
+    userAgent:
+      "Mozilla/5.0 (iPad; CPU OS 12_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.6 Mobile/15E148 Safari/604.1",
+  },
+] as const;
+
+export const DEVICE_PRESET_IDS = [
+  "desktop-chrome",
+  "iphone-15-pro",
+  "pixel-7",
+  "ipad-pro-11",
+] as const;
+
+export type DevicePresetId = (typeof DEVICE_PRESET_IDS)[number];
 const devicePresetIdSchema = z.enum(DEVICE_PRESET_IDS);
 
 const workspaceIdSchema = z
@@ -54,7 +102,6 @@ export const browserStateSchema = z.object({
   canGoBack: z.boolean(),
   canGoForward: z.boolean(),
   viewport: viewportSchema,
-  captureScale: z.number().min(1).max(2).default(1),
   navigationGeneration: generationSchema,
   viewportGeneration: generationSchema,
   devicePresetId: devicePresetIdSchema.nullable(),
@@ -114,7 +161,7 @@ export const captureBrowserRpc = defineRpc({
   name: "shared-browser.capture",
   input: z.object({
     viewerToken: opaqueTokenSchema,
-    quality: z.enum(["low", "medium", "high"]).default(DEFAULT_CAPTURE_QUALITY),
+    quality: z.enum(["low", "medium", "high"]).default("medium"),
     knownFrameId: opaqueTokenSchema.nullable().default(null),
   }),
   output: z.object({
@@ -189,8 +236,6 @@ export const applyDevicePresetRpc = defineRpc({
     controlToken: opaqueTokenSchema,
     expected: expectedStateSchema,
     presetId: devicePresetIdSchema,
-    /** Mode-only changes retain current CSS dimensions and JPEG capture density. */
-    preserveDisplay: z.boolean().optional(),
   }),
   output: z.object({ state: browserStateSchema }),
 });

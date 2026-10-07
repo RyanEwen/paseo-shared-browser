@@ -55,7 +55,6 @@ type AgentCreateHook = (input: { request: AgentCreateRequest }) => Promise<Agent
 function captureAgentCreateHook(host: "0.10" | "0.11" = "0.11"): AgentCreateHook {
   let hook: AgentCreateHook | undefined;
   contribute({
-    registerSettings: vi.fn(),
     handle: vi.fn(),
     before: vi.fn((name: string, handler: unknown) => {
       if (name === "agent.create") hook = handler as AgentCreateHook;
@@ -80,7 +79,6 @@ const BASE_STATE: BrowserState = {
   navigationGeneration: 4,
   viewportGeneration: 2,
   devicePresetId: null,
-  captureScale: 1,
   userAgent: "Chromium",
   controller: "none",
   controllerLabel: null,
@@ -114,10 +112,7 @@ describe("shared RPC validation", () => {
     expect(viewportSchema.safeParse(MIN_VIEWPORT).success).toBe(true);
     expect(viewportSchema.safeParse(MAX_VIEWPORT).success).toBe(true);
     expect(viewportSchema.safeParse({ width: 320, height: 240 }).success).toBe(false);
-    expect(viewportSchema.safeParse({ width: 2560, height: 1440 }).success).toBe(true);
-    expect(viewportSchema.safeParse({ width: 2560, height: 2560 }).success).toBe(true);
-    expect(viewportSchema.safeParse({ width: 2561, height: 1440 }).success).toBe(false);
-    expect(viewportSchema.safeParse({ width: 1280, height: 2561 }).success).toBe(false);
+    expect(viewportSchema.safeParse({ width: 2560, height: 1440 }).success).toBe(false);
   });
 
   it("rejects unbounded input text and scroll deltas", () => {

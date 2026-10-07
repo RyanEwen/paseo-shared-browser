@@ -3,19 +3,12 @@ import { chmod, mkdir, open, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer, type Socket } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import type {
-  BrowserFrame,
-  BrowserInputEvent,
-  BrowserState,
-  DevicePresetId,
-  Viewport,
-} from "../shared/browser";
+import type { BrowserFrame, BrowserState, Viewport } from "../shared/browser";
 import {
   beginBrowserGestureRpc,
   endBrowserGestureRpc,
   updateBrowserGestureRpc,
 } from "../shared/browser";
-import { DEFAULT_CAPTURE_QUALITY } from "../shared/capture-settings";
 import { SessionManager } from "./browser-policy";
 import { CdpUnknownOutcomeError } from "./cdp";
 import {
@@ -309,9 +302,7 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
       case "capture":
         result = await this.browserPolicy.capture(
           requireText(data, "viewerToken"),
-          data.quality === "low" || data.quality === "medium"
-            ? data.quality
-            : DEFAULT_CAPTURE_QUALITY,
+          data.quality === "low" || data.quality === "high" ? data.quality : "medium",
           typeof data.knownFrameId === "string" ? data.knownFrameId : null,
         );
         break;
@@ -497,23 +488,6 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
           expected,
           viewport: data.viewport as Viewport,
         });
-      } else if (operation === "device") {
-        result = await this.browserPolicy.applyDevicePreset({
-          viewerToken,
-          controlToken,
-          expected,
-          presetId: data.presetId as DevicePresetId,
-        });
-      } else if (operation === "input") {
-        if (!binding.lastFrame)
-          throw new RuntimeProtocolError("INVALID_REQUEST", "Capture a frame before sending input");
-        result = await this.browserPolicy.sendInput({
-          viewerToken,
-          controlToken,
-          expected,
-          target: binding.lastFrame,
-          event: data.event as BrowserInputEvent,
-        });
       } else {
         throw new RuntimeProtocolError("INVALID_REQUEST", `Unknown agent operation: ${operation}`);
       }
@@ -537,9 +511,7 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
         ? await this.browserPolicy.status(viewerToken)
         : await this.browserPolicy.capture(
             viewerToken,
-            input.quality === "low" || input.quality === "medium"
-              ? input.quality
-              : DEFAULT_CAPTURE_QUALITY,
+            input.quality === "low" || input.quality === "high" ? input.quality : "medium",
             null,
           );
     let result: { state: BrowserState; frame?: BrowserFrame | null };

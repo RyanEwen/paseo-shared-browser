@@ -22,7 +22,7 @@ const authority: BrowserGestureAuthority = {
     viewportGeneration: 1,
   },
 };
-const state = { captureScale: 1 } as BrowserState;
+const state = {} as BrowserState;
 const point = (x: number) => ({ x, y: 1, width: 800, height: 600 });
 const move = (x: number): BrowserGestureEvent => ({
   kind: "move",

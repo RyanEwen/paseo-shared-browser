@@ -116,7 +116,7 @@ const point = (x = 50, y = 40) => ({ x, y, width: 640, height: 400 });
 afterEach(() => vi.useRealTimers());
 
 describe("owned ordered live input", () => {
-  it("releases held input before a mode-only change with unchanged display dimensions", async () => {
+  it("releases held input before changing device emulation", async () => {
     const state = await fixture();
     try {
       await state.begin();
@@ -124,12 +124,10 @@ describe("owned ordered live input", () => {
       const beforeChange = state.calls.length;
       const changed = await state.manager.applyDevicePreset({
         ...state.context,
-        presetId: "pixel-7-sharp",
-        preserveDisplay: true,
+        presetId: "pixel-7",
       });
 
-      expect(changed.state.viewport).toEqual({ width: 1280, height: 800 });
-      expect(changed.state.captureScale).toBe(1);
+      expect(changed.state.viewport).toEqual({ width: 412, height: 839 });
       // The runtime's input.end owns release of every held mouse/touch/key input.
       const changeCalls = state.calls.slice(beforeChange);
       const released = changeCalls.findIndex(({ operation }) => operation === "input.end");
@@ -531,7 +529,7 @@ it("streams keyboard edges and committed text without a fresh frame per keystrok
   ]);
 });
 
-it("cancels a held gesture on device mode changes without reloading or inventing navigation", async () => {
+it("cancels a held gesture before the upstream device-change reload", async () => {
   const state = await fixture();
   await state.begin();
   await state.update({
@@ -543,12 +541,11 @@ it("cancels a held gesture on device mode changes without reloading or inventing
     repeat: false,
   });
   const reply = await state.manager.applyDevicePreset({ ...state.context, presetId: "pixel-7" });
-  expect(reply.state.navigationGeneration).toBe(state.context.expected.navigationGeneration);
+  expect(reply.state.navigationGeneration).toBe(state.context.expected.navigationGeneration + 1);
   expect(reply.state.viewportGeneration).toBe(state.context.expected.viewportGeneration + 1);
   expect(state.calls.filter((call) => call.operation === "input.end")).toHaveLength(1);
-  expect(
-    state.calls.filter((call) => call.operation === "reload" || call.operation === "navigate"),
-  ).toEqual([]);
+  expect(state.calls.filter((call) => call.operation === "reload")).toHaveLength(1);
+  expect(state.calls.filter((call) => call.operation === "navigate")).toHaveLength(0);
   expect(state.calls.filter((call) => call.operation === "emulate").at(-1)?.input).toMatchObject({
     mobile: true,
     touch: true,

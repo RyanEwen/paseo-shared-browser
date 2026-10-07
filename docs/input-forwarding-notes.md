@@ -1,8 +1,8 @@
 # Input forwarding constraints and checks
 
-The shared canvas forwards input only while its viewer owns control. Page state
-survives display-mode changes. Control loss, focus loss, navigation and display
-changes release held input against its original browser attachment. Never replay
+The shared canvas forwards input only while its viewer owns control. Control
+loss, focus loss, navigation and display changes release held input against its
+original browser attachment. Never replay
 an action whose publication or outcome is uncertain.
 
 ## Keyboard and text
@@ -49,18 +49,14 @@ a different path from the human pane's ordered gesture channel.
 
 ## Evidence and remaining acceptance
 
-Actual isolated Chromium checks cover trusted typing, Unicode, repeat, shortcuts,
-focus traversal, Ctrl+click and held-key cleanup. Mounted DOM checks cover IME,
-AltGraph, Option insertion, paste and control replacement. Native phone relay
-checks validate event routing and lifecycle, but do not replace physical-device
-software-keyboard acceptance. Human pane scrollbar dragging was confirmed.
+Unit fixtures cover keyboard translation, composition event routing, ordered
+input, cancellation and viewer recovery. The isolated Chromium smoke covers
+cursor reporting, typing, shared control, stale-frame rejection and device
+emulation. Physical-phone software-keyboard behavior and wide/compact visual
+acceptance remain separate checks for these split candidates.
 
 Headless Linux Chromium can lack pointer/hover media even when mouse events work.
-When existing Xvfb is available, a private authenticated display supplies native
-desktop mouse capabilities and survives touch-disable and CDP reconnect. Desktop
--> phone -> desktop preserves the current document and draft. Missing Xvfb retains
-headless behavior; other operating systems are outside this verified correction.
-Do not compensate by changing PrintStream styling or resetting the page per toggle.
+Private Xvfb support is a separate follow-up with an explicit opt-out.
 
 ## Primary references
 

@@ -9,7 +9,6 @@ import { resolveBrowserRuntimeRoot } from "../server/runtime-path";
 import { resolveSupervisorPaths, startSupervisorServer } from "../server/supervisor";
 import { SupervisorClient } from "../server/supervisor-client";
 import type { BrowserFrame, BrowserState } from "../shared/browser";
-import { DEFAULT_CAPTURE_QUALITY } from "../shared/capture-settings";
 
 const roots: string[] = [];
 afterEach(async () => {
@@ -321,11 +320,7 @@ it("shares and persists a production agent-browser runtime across supervisor cli
     await vi.waitFor(async () => {
       // Only the default quality requests the shared CDP stream. Other viewer
       // qualities intentionally use screenshots without restarting that stream.
-      const resumedCapture = await manager.capture(
-        resumed.viewerToken,
-        DEFAULT_CAPTURE_QUALITY,
-        null,
-      );
+      const resumedCapture = await manager.capture(resumed.viewerToken, "medium", null);
       expect(resumedCapture.frame?.transport).toBe("cdp-screencast");
     });
     console.log("browser-smoke: emulated");

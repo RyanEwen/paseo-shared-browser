@@ -2,8 +2,6 @@ import { execFile } from "node:child_process";
 import { chmod, mkdir, readFile, rm } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
 import { promisify } from "node:util";
-import { captureDimensions, DEFAULT_JPEG_QUALITY } from "../shared/capture-settings";
-import { MAX_VIEWPORT } from "../shared/viewport-limits";
 import {
   attachToTarget,
   CdpConnection,
@@ -26,7 +24,6 @@ import {
 } from "../shared/browser";
 import { browserCursorExpression } from "./browser-cursor";
 import { GESTURE_IDLE_MS, GESTURE_LIFETIME_MS } from "./browser-gesture";
-import { CAPTURE_MAX_AGE_MS, createCaptureTransportPolicy } from "./capture-transport-policy";
 import { formatRuntimeInputGeneration } from "./input-generation";
 import { heldKeyModifiers, nativeKeyEvent } from "./keyboard-input";
 
@@ -51,8 +48,6 @@ export interface BrowserViewport {
   width: number;
   height: number;
   deviceScaleFactor: number;
-  /** Capture density does not change the emulated layout or pointer coordinate system. */
-  captureScale?: number;
   mobile: boolean;
   touch: boolean;
   userAgent?: string;
@@ -115,8 +110,6 @@ export interface AgentBrowserRuntimeOptions {
   session: string;
   initialUrl?: string;
   headed?: boolean;
-  /** Trusted per-instance private X11 context, only DISPLAY/XAUTHORITY; never mutates host environment. */
-  launchEnvironment?: Readonly<Record<string, string>>;
   timeoutMs?: number;
 }
 
@@ -147,10 +140,7 @@ function requireAbsolute(path: string, label: string): string {
   return resolve(path);
 }
 
-function runtimeEnvironment(
-  ipcDirectory: string,
-  launchEnvironment?: Readonly<Record<string, string>>,
-): NodeJS.ProcessEnv {
+function runtimeEnvironment(ipcDirectory: string): NodeJS.ProcessEnv {
   const environment: NodeJS.ProcessEnv = {};
   for (const key of [
     "PATH",
@@ -178,26 +168,6 @@ function runtimeEnvironment(
   ]) {
     const value = process.env[key];
     if (value !== undefined) environment[key] = value;
-  }
-  if (launchEnvironment !== undefined) {
-    const keys = Object.keys(launchEnvironment);
-    const display = launchEnvironment.DISPLAY;
-    const authority = launchEnvironment.XAUTHORITY;
-    if (
-      keys.length !== 2 ||
-      keys.some((key) => key !== "DISPLAY" && key !== "XAUTHORITY") ||
-      typeof display !== "string" ||
-      !/^:[0-9]{1,5}(?:\.[0-9]{1,2})?$/.test(display) ||
-      typeof authority !== "string" ||
-      !isAbsolute(authority)
-    ) {
-      // Do not include display/authentication values in errors or child arguments.
-      throw new AgentBrowserIncompatibleError("Private browser display environment is invalid");
-    }
-    environment.DISPLAY = display;
-    environment.XAUTHORITY = authority;
-    // A private X11 display must not inherit an unrelated host Wayland session.
-    delete environment.WAYLAND_DISPLAY;
   }
   environment.AGENT_BROWSER_SOCKET_DIR = ipcDirectory;
   environment.AGENT_BROWSER_IDLE_TIMEOUT_MS = "0";
@@ -245,13 +215,11 @@ export class AgentBrowserRuntime {
   private viewport: DeviceEmulation | null = null;
   private emulationAppliedPage: CdpSession | null = null;
   private attachmentGeneration = 0;
-  private readonly capturePolicy = createCaptureTransportPolicy();
-  private streamEventSequence = 0;
+  private captureGeneration = 0;
   private screencastFrame: RuntimeFrame | null = null;
-  private screencastFrameReceivedAt: number | null = null;
   private screencastWaiters = new Set<(frame: RuntimeFrame | null) => void>();
   private screencastActive = false;
-  private screencastQuality: number = DEFAULT_JPEG_QUALITY;
+  private screencastQuality: number = 65;
   private heldButtons = new Set<MouseButton>();
   private heldKeys = new Map<string, { key: string; code: string }>();
   private heldTouches = false;
@@ -279,7 +247,7 @@ export class AgentBrowserRuntime {
     this.session = options.session;
     this.headed = options.headed ?? false;
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-    this.environment = runtimeEnvironment(this.ipcDirectory, options.launchEnvironment);
+    this.environment = runtimeEnvironment(this.ipcDirectory);
     this.initialUrl = options.initialUrl ?? "about:blank";
   }
 
@@ -604,7 +572,7 @@ export class AgentBrowserRuntime {
     }
   }
 
-  async startScreencast(quality: number = DEFAULT_JPEG_QUALITY): Promise<void> {
+  async startScreencast(quality: number = 65): Promise<void> {
     if (!Number.isInteger(quality) || quality < 1 || quality > 100) {
       throw new RangeError("Screencast quality must be an integer from 1 to 100");
     }
@@ -625,162 +593,113 @@ export class AgentBrowserRuntime {
     }
   }
 
-  /** Return truthful fresh stream/fallback pixels; mutation/session changes revoke pending captures. */
-  async frame(
-    maxBytes: number,
-    quality: number = DEFAULT_JPEG_QUALITY,
-    waitMs = 500,
-  ): Promise<RuntimeFrame> {
+  /** Capture only the current page and mutation generation; never return superseded pixels. */
+  async frame(maxBytes: number, quality = 65, waitMs = 500): Promise<RuntimeFrame> {
     if (!Number.isInteger(maxBytes) || maxBytes < 1) {
       throw new RangeError("maxBytes must be positive");
     }
     if (!Number.isFinite(quality)) throw new RangeError("JPEG quality must be finite");
-    await this.requirePage();
-    const requestedQuality = Math.max(1, Math.min(100, Math.round(quality)));
-    if (requestedQuality !== this.screencastQuality) {
-      // Viewers choose their own quality; never restart the shared stream or
-      // classify its health from another viewer's screenshot preference.
-      const cached = this.capturePolicy.readScreenshot(
-        performance.now(),
-        requestedQuality,
-        maxBytes,
-      );
-      return cached ?? (await this.captureScreenshot(maxBytes, requestedQuality, true));
-    }
-    // Expiry discards pixels without resetting fallback dwell/recovery evidence.
-    // Mutations and connection changes use the stronger invalidation below.
-    const generation = this.capturePolicy.currentGeneration();
-    const receivedAt = this.screencastFrameReceivedAt;
-    if (receivedAt === null || performance.now() - receivedAt > CAPTURE_MAX_AGE_MS) {
-      this.screencastFrame = null;
-      this.screencastFrameReceivedAt = null;
-    }
-    if (this.capturePolicy.canUseStream(performance.now())) {
-      const streamed = this.screencastFrame ?? (await this.waitForFrame(waitMs));
-      if (!this.capturePolicy.isCurrent(generation)) {
-        throw new CdpUnavailableError("Browser capture was invalidated while waiting for a frame");
-      }
-      if (streamed && streamed.byteLength <= maxBytes) {
-        return streamed;
-      }
-    }
-
-    this.capturePolicy.enterFallback(performance.now());
-    const cached = this.capturePolicy.readScreenshot(performance.now(), requestedQuality, maxBytes);
-    if (cached) {
-      return cached;
-    }
-    return this.captureScreenshot(maxBytes, requestedQuality);
+    const page = await this.requirePage();
+    const generation = this.captureGeneration;
+    const streamed = this.screencastFrame ?? (await this.waitForFrame(waitMs));
+    this.assertCaptureCurrent(page, generation);
+    if (streamed && streamed.byteLength <= maxBytes) return streamed;
+    return this.captureScreenshot(maxBytes, quality);
   }
 
-  /** Capture the configured viewport and cache only an unchanged-session/mutation completion. */
+  /** Normalize screenshot pixels to the CSS viewport so native input targets the displayed geometry. */
   private async captureScreenshot(
     maxBytes: number,
     requestedQuality: number,
-    preserveStreamRecovery = false,
   ): Promise<RuntimeFrame> {
     const page = await this.requirePage();
-    const screenshotGeneration = this.capturePolicy.beginScreenshot({
-      preserveRecovery: preserveStreamRecovery,
-    });
-    try {
-      const viewport = this.requireViewport();
-      const expectedPixels = captureDimensions(viewport, viewport.captureScale);
-      const readClip = async () => {
-        const metrics = await page.send<{ cssVisualViewport: { pageX: number; pageY: number } }>(
-          "Page.getLayoutMetrics",
-        );
-        this.assertCaptureCurrent(page, screenshotGeneration);
-        return {
-          x: metrics.cssVisualViewport.pageX,
-          y: metrics.cssVisualViewport.pageY,
-          width: viewport.width,
-          height: viewport.height,
-          scale: (viewport.captureScale ?? 1) / viewport.deviceScaleFactor,
-        };
-      };
-      // Explicitly capture the visible CSS viewport, independent of the native window size.
-      // Preserve scroll position and normalize device pixel ratio to the frame/input contract.
-      let clip = await readClip();
-      let resynced = false;
-      // Reduce quality gradually only when a detailed frame exceeds the byte budget.
-      const initialQuality = requestedQuality;
-      const candidates = [...new Set([initialQuality, 90, 85, 75, 65, 50, 35, 20, 10, 1])].filter(
-        (candidate) => candidate <= initialQuality,
+    const screenshotGeneration = this.captureGeneration;
+    const viewport = this.requireViewport();
+    const expectedPixels = { width: viewport.width, height: viewport.height };
+    const readClip = async () => {
+      const metrics = await page.send<{ cssVisualViewport: { pageX: number; pageY: number } }>(
+        "Page.getLayoutMetrics",
       );
-      const capture = async (quality: number) => {
-        this.assertCaptureCurrent(page, screenshotGeneration);
-        const result = await page.send<{ data: string }>("Page.captureScreenshot", {
-          format: "jpeg",
-          quality,
-          fromSurface: true,
-          // Beyond-viewport capture replaces emulation and resets enabled touch.
-          captureBeyondViewport: false,
-          clip,
-        });
-        this.assertCaptureCurrent(page, screenshotGeneration);
-        const dimensions = readJpegFrameDimensions(result.data);
-        if (!dimensions) throw new Error("Chromium returned a malformed JPEG screenshot");
-        return {
-          data: result.data,
-          dimensions,
-          byteLength: Buffer.byteLength(result.data, "base64"),
-        };
+      this.assertCaptureCurrent(page, screenshotGeneration);
+      return {
+        x: metrics.cssVisualViewport.pageX,
+        y: metrics.cssVisualViewport.pageY,
+        width: viewport.width,
+        height: viewport.height,
+        scale: 1 / viewport.deviceScaleFactor,
       };
-      const matchesViewport = (dimensions: { width: number; height: number }) =>
-        dimensions.width === expectedPixels.width && dimensions.height === expectedPixels.height;
+    };
+    // Explicitly capture the visible CSS viewport, independent of the native window size.
+    // Preserve scroll position and normalize device pixel ratio to the frame/input contract.
+    let clip = await readClip();
+    let resynced = false;
+    // Reduce quality gradually only when a detailed frame exceeds the byte budget.
+    const initialQuality = requestedQuality;
+    const candidates = [...new Set([initialQuality, 50, 35, 20, 10, 1])].filter(
+      (candidate) => candidate <= initialQuality,
+    );
+    const capture = async (quality: number) => {
+      this.assertCaptureCurrent(page, screenshotGeneration);
+      const result = await page.send<{ data: string }>("Page.captureScreenshot", {
+        format: "jpeg",
+        quality,
+        fromSurface: true,
+        // Beyond-viewport capture replaces emulation and resets enabled touch.
+        captureBeyondViewport: false,
+        clip,
+      });
+      this.assertCaptureCurrent(page, screenshotGeneration);
+      const dimensions = readJpegFrameDimensions(result.data);
+      if (!dimensions) throw new Error("Chromium returned a malformed JPEG screenshot");
+      return {
+        data: result.data,
+        dimensions,
+        byteLength: Buffer.byteLength(result.data, "base64"),
+      };
+    };
+    const matchesViewport = (dimensions: { width: number; height: number }) =>
+      dimensions.width === expectedPixels.width && dimensions.height === expectedPixels.height;
 
-      for (const candidate of candidates) {
-        const boundedQuality = Math.max(1, Math.min(100, Math.round(candidate)));
-        let pixels = await capture(boundedQuality);
-        if (!matchesViewport(pixels.dimensions) && !resynced) {
-          // Retain upstream viewport recovery, with captureScale rather than DPR:
-          // mobile CSS emulation and image density are independently configured.
-          // Recapture pixels only; uncertain input is never replayed.
-          resynced = true;
-          const attachmentGeneration = this.attachmentGeneration;
-          await this.applyEmulation(page, viewport);
-          this.assertAttachmentCurrent(page.connection, attachmentGeneration);
-          this.assertCaptureCurrent(page, screenshotGeneration);
-          if (viewport !== this.viewport)
-            throw new CdpUnavailableError("Browser viewport changed during resync");
-          this.emulationAppliedPage = page;
-          clip = await readClip();
-          pixels = await capture(boundedQuality);
-        }
-        if (!matchesViewport(pixels.dimensions)) {
-          throw new Error(
-            `Chromium returned a ${pixels.dimensions.width}x${pixels.dimensions.height} JPEG instead of ${expectedPixels.width}x${expectedPixels.height}`,
-          );
-        }
-        if (pixels.byteLength > maxBytes) continue;
-
-        const frame: RuntimeFrame = {
-          dataBase64: pixels.data,
-          byteLength: pixels.byteLength,
-          width: pixels.dimensions.width,
-          height: pixels.dimensions.height,
-          transport: "screenshot",
-          capturedAt: new Date().toISOString(),
-        };
-        this.capturePolicy.rememberScreenshot(
-          screenshotGeneration,
-          frame,
-          performance.now(),
-          requestedQuality,
-          maxBytes,
-        );
-        return frame;
+    for (const candidate of candidates) {
+      const boundedQuality = Math.max(1, Math.min(100, Math.round(candidate)));
+      let pixels = await capture(boundedQuality);
+      if (!matchesViewport(pixels.dimensions) && !resynced) {
+        // Restore emulation once when Chromium returns inconsistent viewport pixels.
+        // Recapture pixels only; uncertain input is never replayed.
+        resynced = true;
+        const attachmentGeneration = this.attachmentGeneration;
+        await this.applyEmulation(page, viewport);
+        this.assertAttachmentCurrent(page.connection, attachmentGeneration);
+        this.assertCaptureCurrent(page, screenshotGeneration);
+        if (viewport !== this.viewport)
+          throw new CdpUnavailableError("Browser viewport changed during resync");
+        this.emulationAppliedPage = page;
+        clip = await readClip();
+        pixels = await capture(boundedQuality);
       }
-      throw new Error(`JPEG screenshot exceeds ${maxBytes} bytes at minimum quality`);
-    } finally {
-      this.capturePolicy.endScreenshot(screenshotGeneration, performance.now());
+      if (!matchesViewport(pixels.dimensions)) {
+        throw new Error(
+          `Chromium returned a ${pixels.dimensions.width}x${pixels.dimensions.height} JPEG instead of ${expectedPixels.width}x${expectedPixels.height}`,
+        );
+      }
+      if (pixels.byteLength > maxBytes) continue;
+
+      const frame: RuntimeFrame = {
+        dataBase64: pixels.data,
+        byteLength: pixels.byteLength,
+        width: pixels.dimensions.width,
+        height: pixels.dimensions.height,
+        transport: "screenshot",
+        capturedAt: new Date().toISOString(),
+      };
+      return frame;
     }
+    throw new Error(`JPEG screenshot exceeds ${maxBytes} bytes at minimum quality`);
   }
 
   /** Refuse async pixels from a superseded session or mutation, without silently replaying capture. */
   private assertCaptureCurrent(page: CdpSession, generation: number): void {
-    if (page !== this.page || !this.capturePolicy.isCurrent(generation)) {
+    if (page !== this.page || generation !== this.captureGeneration) {
       throw new CdpUnavailableError("Browser capture was invalidated while taking a screenshot");
     }
   }
@@ -1410,9 +1329,8 @@ export class AgentBrowserRuntime {
 
   /** Clear both sources and revoke every in-flight capture after input or transport changes. */
   private invalidateScreencastFrame(): void {
-    this.capturePolicy.invalidate();
+    this.captureGeneration += 1;
     this.screencastFrame = null;
-    this.screencastFrameReceivedAt = null;
     this.resolveFrameWaiters(null);
   }
 
@@ -1427,7 +1345,7 @@ export class AgentBrowserRuntime {
     // Chromium can report the new device dimensions while emitting a clipped transition image.
     // Reject those pixels and use the bounded screenshot fallback rather than mislabeling them.
     if (!viewport || !dimensions) return;
-    const expectedPixels = captureDimensions(viewport, viewport.captureScale);
+    const expectedPixels = { width: viewport.width, height: viewport.height };
     if (dimensions.width !== expectedPixels.width || dimensions.height !== expectedPixels.height)
       return;
     const { width, height } = dimensions;
@@ -1439,15 +1357,7 @@ export class AgentBrowserRuntime {
       transport: "cdp-screencast",
       capturedAt: new Date().toISOString(),
     };
-    const now = performance.now();
-    const timestamp = event.metadata.timestamp;
-    const identity =
-      typeof timestamp === "number" && Number.isFinite(timestamp)
-        ? `provider:${timestamp}`
-        : `event:${++this.streamEventSequence}`;
-    this.capturePolicy.observeStream(identity, now);
     this.screencastFrame = frame;
-    this.screencastFrameReceivedAt = now;
     this.resolveFrameWaiters(frame);
   }
 
@@ -1472,17 +1382,6 @@ export class AgentBrowserRuntime {
   }
 
   private assertViewport(viewport: BrowserViewport): void {
-    const captureScale = viewport.captureScale ?? 1;
-    const pixels = captureDimensions(viewport, captureScale);
-    if (
-      !Number.isFinite(captureScale) ||
-      captureScale < 1 ||
-      captureScale > 2 ||
-      pixels.width > MAX_VIEWPORT.width ||
-      pixels.height > MAX_VIEWPORT.height
-    ) {
-      throw new RangeError("Capture density exceeds the supported image bounds");
-    }
     if (
       !Number.isInteger(viewport.width) ||
       viewport.width < 1 ||

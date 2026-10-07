@@ -36,8 +36,7 @@ export type AgentBrowserOperation =
   | "release-control"
   | "navigate"
   | "input"
-  | "viewport"
-  | "device";
+  | "viewport";
 
 export type RuntimeRequest =
   | (AdminRequestBase & { method: "bridge.claim"; takeover?: boolean })
@@ -268,8 +267,7 @@ function requireAgentOperation(value: unknown): AgentBrowserOperation {
     value === "release-control" ||
     value === "navigate" ||
     value === "input" ||
-    value === "viewport" ||
-    value === "device"
+    value === "viewport"
   )
     return value;
   throw new RuntimeProtocolError("INVALID_REQUEST", "Unknown agent browser operation");
