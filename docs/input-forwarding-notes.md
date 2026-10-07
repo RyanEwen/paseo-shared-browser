@@ -44,8 +44,18 @@ drag/drop; file-drop and cross-application drag payloads are not implemented.
 
 A stale decoded frame can fail initial admission. Only confirmed unpublished
 admission is refreshed and retried within one bounded budget. Published updates
-are never replayed. Discrete MCP input retains its strict frame validation and is
-a different path from the human pane's ordered gesture channel.
+are never replayed. Discrete MCP input requires a frame under five seconds old
+at initial admission. An admitted operation retains its exact control,
+document, frame revision, viewport, runtime and bridge context through compound
+release; elapsed frame age alone cannot turn a published click into a stale
+failure. Native idle expiry and unknown outcomes remain separate failures, and
+neither grants replay. This is a different path from the human pane's ordered
+gesture channel.
+
+Capture reconciles document metadata before and after obtaining pixels. Changed
+identity or failed metadata refuses the capture before issuing authority. Its
+deadline still starts when the pixels are received, so metadata latency cannot
+extend the five-second observation window or return an already expired token.
 
 ## Evidence and remaining acceptance
 
@@ -54,6 +64,11 @@ input, cancellation and viewer recovery. The isolated Chromium smoke covers
 cursor reporting, typing, shared control, stale-frame rejection and device
 emulation. Physical-phone software-keyboard behavior and wide/compact visual
 acceptance remain separate checks for these split candidates.
+Deterministic policy fixtures also cover delayed capture validation and admitted
+input replies, same-URL document replacement, bridge replacement, control
+expiry and revocation after unknown publication. These fixtures do not prove a
+native channel can survive an eight-second idle gap; its separate expiry still
+applies.
 
 Headless Linux Chromium can lack pointer/hover media even when mouse events work.
 Private Xvfb support is a separate follow-up with an explicit opt-out.

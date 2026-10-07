@@ -23,6 +23,7 @@ import {
   type updateBrowserGestureRpc,
   type Viewport,
 } from "../shared/browser";
+import { frameMatchesBrowserContext } from "./browser-frame-context";
 import { BrowserGesture } from "./browser-gesture";
 import { sameRuntimeInputAttachment } from "./input-generation";
 import type { JsonValue } from "./runtime-protocol";
@@ -38,7 +39,6 @@ type UpdateGestureReply = Omit<RpcOutput<typeof updateBrowserGestureRpc>, "state
 };
 type EndGestureInput = RpcInput<typeof endBrowserGestureRpc>;
 type CaptureQuality = "low" | "medium" | "high";
-type InputTarget = SendInput["target"];
 
 const VIEWER_TTL_MS = 45_000;
 const CONTROL_LEASE_MS = 30_000;
@@ -118,6 +118,7 @@ interface BrowserSession {
   archived: boolean;
   gesture: BrowserGesture | null;
   inputGeneration: string | null;
+  frameRevision: number;
 }
 
 function defaultToken(): string {
@@ -300,12 +301,29 @@ export class SessionManager {
     return this.serialize(session, async () => {
       this.pruneExpired(session);
       this.heartbeatViewer(session, viewerToken);
+      // Reconcile native document identity before capturing and again before
+      // issuing authority. A same-URL reload can invalidate the captured pixels.
+      const before = await this.snapshotState(session, viewerToken);
+      if (before.error) throw new Error(`Browser capture metadata failed: ${before.error}`);
+      const inputGeneration = session.inputGeneration;
+      const revision = session.frameRevision;
       const frame = await this.frameForQuality(session, quality);
-      this.rememberFrame(session, frame);
-      return {
-        state: await this.snapshotState(session, viewerToken),
-        frame: knownFrameId === frame.frameId ? null : frame,
-      };
+      const observedAt = this.now();
+      const state = await this.snapshotState(session, viewerToken);
+      if (state.error) throw new Error(`Browser capture metadata failed: ${state.error}`);
+      if (
+        inputGeneration !== session.inputGeneration ||
+        revision !== session.frameRevision ||
+        !frameMatchesBrowserContext(frame, before) ||
+        !frameMatchesBrowserContext(frame, state)
+      ) {
+        throw new Error("Browser changed during capture; request another frame");
+      }
+      if (observedAt + FRAME_TOKEN_TTL_MS <= this.now()) {
+        throw new Error("Browser capture expired during validation; request another frame");
+      }
+      this.rememberFrame(session, frame, observedAt);
+      return { state, frame: knownFrameId === frame.frameId ? null : frame };
     });
   }
 
@@ -435,9 +453,15 @@ export class SessionManager {
     return this.serialize(session, async () => {
       this.requireMutationAccess(session, input);
       this.requireRecentFrame(session, input.target);
+      const assertTargetCurrent = this.discreteInputGuard(session, input);
       await this.cancelGesture(session);
-      await this.dispatchInput(session, input.event, input.target);
-      this.invalidateFrames(session);
+      try {
+        await this.dispatchInput(session, input.event, assertTargetCurrent);
+      } finally {
+        // An uncertain publication must not leave its observation available for
+        // another action. Paired release still follows the original input path.
+        this.invalidateFrames(session);
+      }
       this.renewController(session, input.viewerToken);
       return { state: await this.snapshotState(session, input.viewerToken) };
     });
@@ -843,6 +867,7 @@ export class SessionManager {
         archived: false,
         gesture: null,
         inputGeneration: typeof state.inputGeneration === "string" ? state.inputGeneration : null,
+        frameRevision: 0,
       };
     } catch (error) {
       if (ensured) await this.client.archiveWorkspace(workspaceId).catch(() => undefined);
@@ -994,6 +1019,7 @@ export class SessionManager {
     return result;
   }
   private invalidateFrames(session: BrowserSession): void {
+    session.frameRevision += 1;
     session.frameCache.clear();
     session.recentFrames.clear();
   }
@@ -1005,11 +1031,7 @@ export class SessionManager {
     const cached = session.frameCache.get(quality);
     if (
       cached &&
-      cached.frame.sessionId === session.sessionId &&
-      cached.frame.runtimeId === session.runtimeId &&
-      cached.frame.captureEpoch === session.bridgeEpoch &&
-      cached.frame.navigationGeneration === session.navigationGeneration &&
-      cached.frame.viewportGeneration === session.viewportGeneration &&
+      frameMatchesBrowserContext(cached.frame, session) &&
       this.now() - cached.cachedAt <= this.frameCacheMs
     )
       return cached.frame;
@@ -1027,13 +1049,7 @@ export class SessionManager {
         waitMs: SCREENCAST_WAIT_MS,
       }),
     );
-    if (
-      generation.sessionId !== session.sessionId ||
-      generation.runtimeId !== session.runtimeId ||
-      generation.captureEpoch !== session.bridgeEpoch ||
-      generation.navigationGeneration !== session.navigationGeneration ||
-      generation.viewportGeneration !== session.viewportGeneration
-    )
+    if (!frameMatchesBrowserContext(generation, session))
       throw new Error("Browser changed during capture; request another frame");
     const byteLength = Number(raw.byteLength);
     const dataBase64 = String(raw.dataBase64 ?? "");
@@ -1063,12 +1079,16 @@ export class SessionManager {
     return frame;
   }
 
-  private rememberFrame(session: BrowserSession, frame: BrowserFrame): void {
+  private rememberFrame(
+    session: BrowserSession,
+    frame: BrowserFrame,
+    observedAt = this.now(),
+  ): void {
     this.pruneRecentFrames(session);
     session.recentFrames.set(frame.frameId, {
       navigationGeneration: frame.navigationGeneration,
       viewportGeneration: frame.viewportGeneration,
-      expiresAt: this.now() + FRAME_TOKEN_TTL_MS,
+      expiresAt: observedAt + FRAME_TOKEN_TTL_MS,
     });
     while (session.recentFrames.size > MAX_RECENT_FRAMES) {
       const oldest = session.recentFrames.keys().next().value;
@@ -1077,15 +1097,52 @@ export class SessionManager {
     }
   }
 
+  /**
+   * Retain one freshly admitted observation for this operation only. Runtime
+   * latency cannot expire it after publication; control, native document and
+   * every attachment/display fence still revoke it. No continuation is exposed.
+   */
+  private discreteInputGuard(session: BrowserSession, input: SendInput): () => Promise<void> {
+    const context = {
+      viewerToken: input.viewerToken,
+      controlToken: input.controlToken,
+      expected: {
+        sessionId: session.sessionId,
+        runtimeId: session.runtimeId,
+        bridgeEpoch: session.bridgeEpoch,
+        navigationGeneration: session.navigationGeneration,
+        viewportGeneration: session.viewportGeneration,
+      },
+    };
+    const inputGeneration = session.inputGeneration;
+    const revision = session.frameRevision;
+    return async () => {
+      await this.refreshPageMetadata(session);
+      if (
+        inputGeneration !== session.inputGeneration ||
+        revision !== session.frameRevision ||
+        context.expected.navigationGeneration !== session.navigationGeneration ||
+        context.expected.viewportGeneration !== session.viewportGeneration
+      ) {
+        throw new Error("Browser frame is stale");
+      }
+      this.requireMutationAccess(session, context);
+    };
+  }
+
   private async dispatchInput(
     session: BrowserSession,
     event: BrowserInputEvent,
-    target: InputTarget,
+    assertTargetCurrent: () => Promise<void>,
   ): Promise<void> {
-    const assertTargetCurrent = async () => {
-      await this.refreshPageMetadata(session);
-      this.requireRecentFrame(session, target);
-    };
+    // Hover keeps its existing fast path. It must not wait behind page metadata
+    // while video is pending; the initial control/frame checks still apply.
+    if (event.kind === "move") {
+      const point = mapDisplayedPoint(event.point, session.viewport);
+      await this.request(session, "mouse.move", { x: point.x, y: point.y });
+      return;
+    }
+    await assertTargetCurrent();
     if (event.kind === "type") {
       await this.request(session, "text.insert", { text: event.text });
       return;
@@ -1097,11 +1154,6 @@ export class SessionManager {
       } finally {
         await this.request(session, "key.up", { key: event.key });
       }
-      return;
-    }
-    if (event.kind === "move") {
-      const point = mapDisplayedPoint(event.point, session.viewport);
-      await this.request(session, "mouse.move", { x: point.x, y: point.y });
       return;
     }
     if (event.kind === "scroll") {
