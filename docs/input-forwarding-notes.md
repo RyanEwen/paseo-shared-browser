@@ -1,8 +1,8 @@
 # Input forwarding constraints and checks
 
-The shared canvas forwards input only while its viewer owns control. Control
-loss, focus loss, navigation and display changes release held input against its
-original browser attachment. Never replay
+The shared canvas forwards input only while its viewer owns control. Page state
+survives display-mode changes. Control loss, focus loss, navigation and display
+changes release held input against its original browser attachment. Never replay
 an action whose publication or outcome is uncertain.
 
 ## Keyboard and text
@@ -56,7 +56,7 @@ emulation. Physical-phone software-keyboard behavior and wide/compact visual
 acceptance remain separate checks for these split candidates.
 
 Headless Linux Chromium can lack pointer/hover media even when mouse events work.
-Private Xvfb support is a separate follow-up with an explicit opt-out.
+Private Xvfb support is a separate follow-up.
 
 ## Primary references
 

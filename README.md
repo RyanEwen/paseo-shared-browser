@@ -38,7 +38,8 @@ organization names.
   `AGENT_BROWSER_IDLE_TIMEOUT_MS=0`, `AGENT_BROWSER_STREAM_PORT=0`, and
   `AGENT_BROWSER_NO_AUTO_DIALOG=1` itself.
 - Frames stream from Chromium through CDP `Page.startScreencast`, with a bounded screenshot fallback.
-  Remote input supports tap, double-tap, right-click, drag, swipe scrolling, text, and special keys.
+  Remote input supports mouse hover, wheel scrolling, continuous dragging, native touch pan/pinch,
+  tap, double-tap, right-click, text, and special keys.
 - Device presets for Desktop Chrome, iPhone 15 Pro, Pixel 7, and iPad Pro 11 change Chromium's
   viewport, device pixel ratio, touch behavior, platform, and user agent. A phone can view and
   control the shared browser, but the rendered browser remains Chromium. An iPhone preset is mobile
@@ -103,12 +104,11 @@ The plugin automatically injects its stdio MCP adapter only when a new, non-inte
 created with a provider that accepts external MCP servers. Agents that already exist, resumed
 sessions, imported sessions, and Paseo's internal agents are not modified. Paseo's built-in OMP
 provider accepts session MCP servers from Paseo 0.11, so new OMP agents receive the adapter there.
-On Paseo 0.9 and 0.10 the built-in OMP adapter rejects external MCP servers, so OMP agents are left
-unchanged. Pi agents continue to receive the adapter, but they require Pi's optional MCP support to
+Pi agents also receive the adapter, but require Pi's optional MCP support to
 launch it.
 
 The injected MCP server exposes exactly these tools: `shared_browser_status`,
-`shared_browser_capture`, `shared_browser_acquire_control`, `shared_browser_release_control`,
+`shared_browser_capture`, `shared_browser_device`, `shared_browser_acquire_control`, `shared_browser_release_control`,
 `shared_browser_navigate`, `shared_browser_input`, and `shared_browser_viewport`. It does not
 expose arbitrary CDP commands, JavaScript or page evaluation, browser profile access, or filesystem
 access.
@@ -137,17 +137,87 @@ User-supplied `AGENT_BROWSER_*` variables are deliberately ignored.
 
 ## Controls
 
-- Toolbar: back, forward, reload, address bar, and device emulation.
+- Toolbar: back, forward, reload, address bar, a combined monitor menu, mobile emulation toggle
+  and a vertical-dots browser actions menu. Icon controls expose their action name
+  as a hover tooltip on desktop/web and retain native accessibility labels.
+- Custom viewports support 320 to 2560 pixels wide and 480 to 2560 pixels high. Invalid sizes
+  show their error inside the device dialog; a successful Apply closes it.
+- Desktop presets also include 1280 × 800 (16:10) and 1280 × 1280 (1:1).
+- Pixel 7 (high resolution) keeps the same 412 × 839 phone layout and input coordinates,
+  with a sharper 824 × 1678 capture.
+- Desktop presets include 1920 × 1080 and 2560 × 1440 (16:9), 1920 × 1200 and
+  2560 × 1600 (16:10), and 1920 × 1920 and 2560 × 2560 (1:1).
+- Desktop choices use height names such as 720p, 1080p, 1200p and 1440p, with
+  dimensions shown alongside. Square choices name their width explicitly.
+  The 1440-wide choices are 1440 × 810, 1440 × 900 and 1440 × 1440.
+- The Resolution and quality menu groups desktop choices by 16:9, 16:10 and 1:1,
+  then mobile. Each group sorts by width. Filled stars mark favorites; the monitor
+  menu provides favorites in that same grouped order and access to the full
+  resolution and quality list.
+- Monitor and browser actions open compact anchored menus rather than dialogs. Menus stay
+  within the pane, scroll long lists, and dismiss with an outside press, Escape or native Back.
+- The monitor menu offers **Fit to panel** (default) and **Actual size (100%)**. Actual size
+  uses browser layout pixels, not the larger JPEG dimensions of sharper phone captures.
+  This choice affects only the current viewer, without resizing the shared browser.
+  Desktop local scrollbars reveal overflow while wheel events on a controlled frame go to
+  the remote page. Phone viewers can pan while observing; controlling sends swipes to the
+  page instead. Fitting images stay centered without empty scroll ranges; a scrollbar on
+  one axis does not force one on the other. Returning to Fit resets local offsets without
+  reloading the page or image.
+- Quality choices Low, Medium and High request JPEG quality 70, 90 and 95 respectively.
+  Detailed large views use more bandwidth; frames reduce quality further only if they
+  exceed the 800 KB frame limit. Preferences persist on the connected Paseo host.
+- Captures refresh after input. A stalled screencast falls back to a fresh screenshot instead
+  of indefinitely showing an old image.
+- Captures use individual JPEG frames. The transport label identifies streamed
+  frames or screenshot fallback. Encoded video and source caching are separate
+  transport work.
+- Actual JPEG dimensions must match the selected capture resolution before a frame is accepted.
+  The fallback captures the complete visible viewport, preserves scroll position, and accounts
+  for device pixel ratio and capture scale so inputs still use the original layout coordinates.
+- The last decoded frame stays visible while its replacement loads, with native image fading
+  disabled. Input targets the displayed frame, and obsolete image callbacks cannot replace it.
 - Status row: session state, viewer count, controller, and lease expiry.
+- Returning after viewer expiry reattaches viewing once automatically while preserving the
+  page. Expired control is cleared; take control again to send input. Expected expiry is not
+  shown as an action failure; a failed reattachment still offers manual retry.
+- Clicking a link or submitting a form may navigate before its input reply arrives. A completed
+  input returns the new viewing state without a false failure or repeating the action.
+  Replaced controls, targets and uncertain sends remain rejected.
 - Human control: **Take control**, **Release**, and **Take over** for explicit handoff. Agent MCP
   calls have no forced-takeover operation.
-- Mouse: hover with cursor feedback, wheel scrolling, right-click, double-click and continuous drag.
-- Touch: continuous pan and pinch gestures; held contacts cancel on control or page changes.
-- Keyboard: focus the canvas for direct typing, shortcuts, paste and committed composition text.
-  On native phones, **Keyboard** relays basic typing and Backspace; **Compose** inserts a local
-  draft once when you choose **Done**. Software-keyboard behavior needs physical-device testing.
-- Expired viewing tokens reattach viewing once automatically. Recovery never takes control or
-  repeats an input action whose outcome is unknown.
+- With control, mouse movement forwards real hover effects and standard browser cursor changes.
+  Automatic cursors resolve selectable text to an I-beam while respecting explicit
+  cursor styles and non-selectable areas.
+  Wheel scrolling stays inside the browser canvas; held drags update before release. Leaving the
+  canvas clears remote hover, while dragging beyond its edges still releases the held button.
+- Native touch forwards active fingers continuously, including pan and pinch on desktop and mobile
+  presets. Physical mouse buttons and double clicks retain their natural actions; touch never
+  changes into a synthetic mouse gesture.
+  Losing control, changing page or resizing cancels held input; old contacts must lift before a
+  fresh touch can target the replacement page. No uncertain input is replayed after a failure.
+- Desktop viewports show native scrollbars. Dragging a scrollbar thumb scrolls the page
+  continuously before release. Wheel scrolling and touch panning remain available;
+  mobile emulation retains its normal mobile scrollbar behavior.
+- Click the controlled canvas to type directly on desktop and web. Shortcuts, repeat,
+  modifier clicks and committed composition text are forwarded; other Paseo inputs stay local.
+- The address-bar Browser menu contains a Send keys submenu and reconnect actions. On desktop,
+  keys open beside the menu; on compact screens, Back returns to the parent menu. Extra keys
+  are no longer shown below the canvas or in a separate dialog.
+- On native phones, Keyboard in that menu opens the software keyboard for basic live typing
+  and Backspace
+  without a visible text box. Autocorrection is disabled. Compose opens an explicit local
+  draft for IME text, inserted once with Done. Native hardware shortcuts are not supported
+  by this software-keyboard relay. Extra keys remain available in the Send keys submenu.
+- Local plain-text paste is forwarded; remote copy/cut are not synchronized to the local clipboard.
+- The address-bar mobile toggle changes shared emulation while preserving the current display
+  dimensions and capture density. Choose a resolution explicitly to change the display.
+  Your device default applies the first time you take control, never while observing, and
+  also preserves the current display. Narrow desktop layouts do not count as phones.
+- The mobile address field keeps a full text line with compact padding. Read-only addresses
+  stay legible while observing; taking control is still required to edit or navigate.
+- Mode changes preserve the current page and unsaved fields. Sites that select layouts only
+  at page load may need an explicit Reload. There are no click, swipe or scroll mode controls.
 
 ## Security boundary
 
@@ -182,22 +252,26 @@ bun run test:unit
 PASEO_HOME="$(mktemp -d)" bun run prepare:runtime
 ```
 
-Treat the default Paseo daemon and profile as live user state. Keep the prepared
-test home and run `PASEO_HOME=<prepared-test-home> bun run test:smoke` against it.
-Do not run development lifecycle commands against the default daemon. Any daemon
-integration checks must use an isolated home and explicit `--home` and `--host`.
+Treat the default Paseo daemon and profile as live user state. Use an isolated
+`PASEO_HOME` for runtime preparation and tests; do not run development lifecycle
+commands against the default daemon. Keep the prepared home available for smoke
+tests so they can resolve its runtime assets.
 
-The smoke test launches the configured real Chromium runtime and exercises two viewers,
+`PASEO_HOME=<prepared-test-home> bun run test:smoke` launches the configured real Chromium runtime and exercises two viewers,
 control handoff, reconnect, stale-frame rejection, viewport changes, device emulation, profile
 persistence, and archive teardown.
 
 Release Please maintains the version, changelog, component tag, and GitHub release from
 Conventional Commits in the monorepo.
 
-The upstream Paseo 0.9, 0.10 and stable 0.11 compatibility ranges remain declared,
-alongside the tested `0.11.0-beta.3` allowance. The sidebar entry remains guarded
-on clients that lack its newer API. The current checks do not establish runtime
-compatibility across every older daemon and client version.
+Both the Paseo daemon and app must satisfy the version range in `paseo-plugin.json`.
+The upstream 0.9, 0.10 and stable 0.11 ranges and the tested `0.11.0-beta.3` allowance
+are retained. The sidebar entry appears only on clients that expose its API.
+The client surface uses React Native primitives and works in desktop, web, iOS,
+and Android Paseo clients.
 
-Both the Paseo daemon and app must satisfy `^0.9.0 || ^0.10.0 || ^0.11.0`. The client surface uses React Native primitives
-and works in desktop, web, iOS, and Android Paseo clients.
+A wheel capture can finish decoding after input revoked its frame token. The server
+returns a known non-admission receipt before creating a new channel; the canvas waits
+for another decoded frame before admitting that still-unsent gesture. Recovery allows
+up to three admission attempts within one four-second decoded-frame wait budget.
+Published input, unknown outcomes, expired leases, and replaced contexts are never retried.

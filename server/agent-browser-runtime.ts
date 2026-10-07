@@ -2,6 +2,8 @@ import { execFile } from "node:child_process";
 import { chmod, mkdir, readFile, rm } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
 import { promisify } from "node:util";
+import { captureDimensions } from "../shared/capture-settings";
+import { MAX_VIEWPORT } from "../shared/viewport-limits";
 import {
   attachToTarget,
   CdpConnection,
@@ -48,6 +50,8 @@ export interface BrowserViewport {
   width: number;
   height: number;
   deviceScaleFactor: number;
+  /** Image density is independent of CSS input geometry. */
+  captureScale?: number;
   mobile: boolean;
   touch: boolean;
   userAgent?: string;
@@ -600,6 +604,10 @@ export class AgentBrowserRuntime {
     }
     if (!Number.isFinite(quality)) throw new RangeError("JPEG quality must be finite");
     const page = await this.requirePage();
+    // Quality is a viewer choice; do not reuse the shared stream for a different request.
+    if (quality !== this.screencastQuality) {
+      return this.captureScreenshot(maxBytes, quality);
+    }
     const generation = this.captureGeneration;
     const streamed = this.screencastFrame ?? (await this.waitForFrame(waitMs));
     this.assertCaptureCurrent(page, generation);
@@ -615,7 +623,7 @@ export class AgentBrowserRuntime {
     const page = await this.requirePage();
     const screenshotGeneration = this.captureGeneration;
     const viewport = this.requireViewport();
-    const expectedPixels = { width: viewport.width, height: viewport.height };
+    const expectedPixels = captureDimensions(viewport, viewport.captureScale);
     const readClip = async () => {
       const metrics = await page.send<{ cssVisualViewport: { pageX: number; pageY: number } }>(
         "Page.getLayoutMetrics",
@@ -626,7 +634,7 @@ export class AgentBrowserRuntime {
         y: metrics.cssVisualViewport.pageY,
         width: viewport.width,
         height: viewport.height,
-        scale: 1 / viewport.deviceScaleFactor,
+        scale: (viewport.captureScale ?? 1) / viewport.deviceScaleFactor,
       };
     };
     // Explicitly capture the visible CSS viewport, independent of the native window size.
@@ -1345,7 +1353,7 @@ export class AgentBrowserRuntime {
     // Chromium can report the new device dimensions while emitting a clipped transition image.
     // Reject those pixels and use the bounded screenshot fallback rather than mislabeling them.
     if (!viewport || !dimensions) return;
-    const expectedPixels = { width: viewport.width, height: viewport.height };
+    const expectedPixels = captureDimensions(viewport, viewport.captureScale);
     if (dimensions.width !== expectedPixels.width || dimensions.height !== expectedPixels.height)
       return;
     const { width, height } = dimensions;
@@ -1382,6 +1390,17 @@ export class AgentBrowserRuntime {
   }
 
   private assertViewport(viewport: BrowserViewport): void {
+    const captureScale = viewport.captureScale ?? 1;
+    const pixels = captureDimensions(viewport, captureScale);
+    if (
+      !Number.isFinite(captureScale) ||
+      captureScale < 1 ||
+      captureScale > 2 ||
+      pixels.width > MAX_VIEWPORT.width ||
+      pixels.height > MAX_VIEWPORT.height
+    ) {
+      throw new RangeError("Capture density exceeds the supported image bounds");
+    }
     if (
       !Number.isInteger(viewport.width) ||
       viewport.width < 1 ||

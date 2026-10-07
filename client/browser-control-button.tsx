@@ -16,7 +16,7 @@ export interface ControlButtonStyles {
   buttonDisabled: ViewStyle;
   buttonLarge: ViewStyle;
   buttonFill: ViewStyle;
-  buttonPad: ViewStyle;
+  buttonPad?: ViewStyle;
   buttonText: TextStyle;
   buttonTextSelected: TextStyle;
 }

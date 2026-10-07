@@ -57,6 +57,7 @@ const pixel: DeviceEmulation = {
   width: 412,
   height: 839,
   deviceScaleFactor: 2.625,
+  captureScale: 2,
   mobile: true,
   touch: true,
   screenWidth: 430,
@@ -120,6 +121,7 @@ describe("session-owned device emulation restoration", () => {
     expect(publications).toEqual([null, null, null]);
     expect(control.page?.targetId).toBe("b");
     expect(control.emulationAppliedPage).toBe(control.page);
+    expect(control.viewport.captureScale).toBe(2);
     assertDeviceRestored(connection, control.page!.sessionId);
   });
 

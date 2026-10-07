@@ -3,7 +3,7 @@ import {
   type PluginWorkspacePanelProps,
   useRpc,
 } from "@getpaseo/plugin/client";
-import { Icon, Modal, ScrollView, TextInput } from "@getpaseo/plugin/client/react-native";
+import { Icon, Modal, TextInput } from "@getpaseo/plugin/client/react-native";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -27,7 +27,6 @@ import {
   type BrowserState,
   beginBrowserGestureRpc,
   captureBrowserRpc,
-  containedRect,
   DEVICE_PRESETS,
   type DevicePresetId,
   detachBrowserRpc,
@@ -43,16 +42,30 @@ import {
   sendBrowserInputRpc,
   updateBrowserGestureRpc,
 } from "../shared/browser";
+import { groupResolutionPresets } from "../shared/resolution-menu";
+import { type BrowserCanvasDisplayMode, getBrowserCanvasLayout } from "./browser-canvas-layout";
+import { BrowserCanvasViewport } from "./browser-canvas-viewport";
 import { browserCaptureInterval } from "./browser-capture-cadence";
 import { ControlButton, type ControlButtonStyles } from "./browser-control-button";
+import { setBrowserControlTooltip } from "./browser-control-tooltip-web";
+import { type EmulationSelection, matchingResolutionPresetId } from "./browser-emulation-mode";
 import type { FrameCandidate } from "./browser-frame-buffer";
 import { BrowserFrameImage } from "./browser-frame-image";
 import { NativeKeyboardControls } from "./browser-native-keyboard-controls";
+import { BrowserResolutionPicker } from "./browser-resolution-picker";
+import {
+  BrowserMenuHeading,
+  BrowserMenuItem,
+  BrowserMenuSeparator,
+  BrowserToolbarMenu,
+} from "./browser-toolbar-menu";
 import { isExpiredBrowserViewerError } from "./browser-viewer-recovery";
 import { createFrameLifecycle } from "./frame-lifecycle";
 import { useBrowserCanvasInput } from "./use-browser-canvas-input";
+import { useBrowserEmulationMode } from "./use-browser-emulation-mode";
 import { useBrowserFrameBuffer } from "./use-browser-frame-buffer";
 import { useBrowserViewerRecovery } from "./use-browser-viewer-recovery";
+import { useResolutionFavorites } from "./use-resolution-favorites";
 
 const SPACE = {
   xxs: 2,
@@ -66,23 +79,18 @@ const TYPE = { caption: 11, body: 13, title: 14 } as const;
 const DIMENSION = {
   control: 34,
   touch: 44,
-  pad: 60,
   icon: 15,
-  addressCompact: 120,
   addressRegular: 220,
   canvasCompact: 220,
   canvasRegular: 320,
   helperMax: 420,
   viewportField: 72,
-  typeField: 180,
   screenRadius: 20,
 } as const;
-const SCROLL_STEP = 520;
 const MAX_VIEWER_LABEL_LENGTH = 64;
 const PILL_PRESENCE_POLL_MS = 2_000;
 const AGENT_DIRECTORY_PAGE_LIMIT = 200;
 const MAX_URL_LENGTH = 8_192;
-const MAX_TEXT_LENGTH = 4_000;
 const BYTES_PER_KIBIBYTE = 1_024;
 
 type Theme = PluginWorkspacePanelProps["theme"];
@@ -208,12 +216,20 @@ function createStyles(theme: Theme, compact: boolean) {
     },
     addressInput: {
       flex: 1,
-      minWidth: compact ? DIMENSION.addressCompact : DIMENSION.addressRegular,
+      minWidth: compact ? 40 : DIMENSION.addressRegular,
     },
     chromeAddressInput: {
-      height: 28,
+      height: compact ? 34 : 28,
       borderRadius: RADIUS.md,
       backgroundColor: theme.colors.surface1,
+      // Compact chrome must override the themed input's form-sized padding.
+      // Keep a full text line even on native hosts with their own font padding.
+      paddingVertical: 0,
+      paddingHorizontal: SPACE.xs,
+      fontSize: TYPE.body,
+      lineHeight: 18,
+      includeFontPadding: false,
+      textAlignVertical: "center",
     },
     chromeIconButton: {
       width: 28,
@@ -231,11 +247,7 @@ function createStyles(theme: Theme, compact: boolean) {
     chromeIconButtonDisabled: {
       opacity: 0.45,
     },
-    toolbarContent: {
-      flexDirection: "row",
-      alignItems: "center",
-      gap: SPACE.xs,
-    },
+
     button: {
       minHeight: DIMENSION.control,
       minWidth: DIMENSION.control,
@@ -327,10 +339,6 @@ function createStyles(theme: Theme, compact: boolean) {
       minHeight: 0,
       overflow: "hidden",
     },
-    frame: {
-      position: "absolute",
-      borderRadius: compact ? DIMENSION.screenRadius - SPACE.xs : 0,
-    },
     interactionLayer: {
       position: "absolute",
     },
@@ -369,15 +377,7 @@ function createStyles(theme: Theme, compact: boolean) {
       fontSize: TYPE.caption,
       flexShrink: 1,
     },
-    controls: {
-      paddingHorizontal: compact ? SPACE.md : SPACE.sm,
-      paddingTop: compact ? SPACE.md : SPACE.sm,
-      paddingBottom: compact ? SPACE.lg : SPACE.sm,
-      gap: compact ? SPACE.sm : SPACE.xs,
-      borderTopWidth: 1,
-      borderTopColor: theme.colors.border,
-      backgroundColor: theme.colors.surface0,
-    },
+
     mobileRow: {
       flexDirection: "row",
       alignItems: "center",
@@ -392,19 +392,6 @@ function createStyles(theme: Theme, compact: boolean) {
       flexWrap: "wrap",
       gap: SPACE.sm,
     },
-    sheetPad: {
-      alignItems: "center",
-      gap: SPACE.sm,
-    },
-    sheetPadRow: {
-      flexDirection: "row",
-      alignItems: "center",
-      justifyContent: "center",
-      gap: SPACE.sm,
-    },
-    padSpacer: {
-      width: DIMENSION.pad,
-    },
     controlStrip: {
       minHeight: DIMENSION.control,
       flexDirection: "row",
@@ -417,13 +404,6 @@ function createStyles(theme: Theme, compact: boolean) {
       fontWeight: "600",
       marginRight: SPACE.xs,
     },
-    separator: {
-      width: 1,
-      alignSelf: "stretch",
-      marginVertical: SPACE.xs,
-      marginHorizontal: SPACE.xs,
-      backgroundColor: theme.colors.border,
-    },
     viewportField: {
       width: DIMENSION.viewportField,
       textAlign: "center",
@@ -432,20 +412,7 @@ function createStyles(theme: Theme, compact: boolean) {
       color: theme.colors.foregroundMuted,
       fontSize: TYPE.body,
     },
-    typeRow: {
-      flexDirection: compact ? "column" : "row",
-      gap: SPACE.xs,
-    },
-    typeInput: {
-      flex: 1,
-      minWidth: compact ? undefined : DIMENSION.typeField,
-    },
-    keysContent: {
-      flexDirection: "row",
-      alignItems: "center",
-      gap: SPACE.xs,
-      paddingTop: SPACE.xs,
-    },
+
     deviceModalContent: {
       gap: SPACE.sm,
       padding: SPACE.sm,
@@ -489,10 +456,6 @@ function createStyles(theme: Theme, compact: boolean) {
     buttonFill: {
       flex: 1,
     },
-    buttonPad: {
-      width: DIMENSION.pad,
-      minHeight: DIMENSION.touch,
-    },
   });
 }
 
@@ -519,12 +482,15 @@ interface ChromeIconButtonStyles {
   chromeIconButtonPressed: ViewStyle;
   chromeIconButtonDisabled: ViewStyle;
 }
+
 function ChromeIconButton({
   styles,
   theme,
   label,
   icon,
+  iconNode,
   selected = false,
+  expanded,
   disabled = false,
   onPress,
 }: {
@@ -532,16 +498,20 @@ function ChromeIconButton({
   theme: Theme;
   label: string;
   icon: string;
+  iconNode?: ReactNode;
+  expanded?: boolean;
   selected?: boolean;
   disabled?: boolean;
   onPress(): void;
 }) {
   const [hovered, setHovered] = useState(false);
+  const tooltipRef = useCallback((node: unknown) => setBrowserControlTooltip(node, label), [label]);
   return (
     <Pressable
+      ref={tooltipRef}
       accessibilityRole="button"
       accessibilityLabel={label}
-      accessibilityState={{ disabled, selected }}
+      accessibilityState={{ disabled, selected, ...(expanded === undefined ? {} : { expanded }) }}
       disabled={disabled}
       onHoverIn={() => setHovered(true)}
       onHoverOut={() => setHovered(false)}
@@ -553,11 +523,13 @@ function ChromeIconButton({
         disabled ? styles.chromeIconButtonDisabled : null,
       ]}
     >
-      <Icon
-        name={icon}
-        size={16}
-        color={selected ? theme.colors.accent : theme.colors.foregroundMuted}
-      />
+      {iconNode ?? (
+        <Icon
+          name={icon}
+          size={16}
+          color={selected ? theme.colors.accent : theme.colors.foregroundMuted}
+        />
+      )}
     </Pressable>
   );
 }
@@ -569,6 +541,8 @@ interface FieldProps {
   accessibilityLabel: string;
   placeholder?: string;
   editable?: boolean;
+  /** Read-only information can stay legible without implying it is editable. */
+  dimWhenReadOnly?: boolean;
   maxLength?: number;
   keyboardType?: TextInputProps["keyboardType"];
   inputMode?: TextInputProps["inputMode"];
@@ -588,6 +562,7 @@ function Field({
   accessibilityLabel,
   placeholder,
   editable = true,
+  dimWhenReadOnly = true,
   maxLength,
   keyboardType,
   inputMode,
@@ -629,7 +604,7 @@ function Field({
         styles.field,
         style,
         focused ? styles.fieldFocused : null,
-        !editable ? styles.fieldDisabled : null,
+        !editable && dimWhenReadOnly ? styles.fieldDisabled : null,
       ]}
       value={value}
     />
@@ -911,8 +886,26 @@ export function SharedBrowserPanel({
   const [viewportWidth, setViewportWidth] = useState("");
   const [viewportHeight, setViewportHeight] = useState("");
   const [devicePickerOpen, setDevicePickerOpen] = useState(false);
-  const [typeDraft, setTypeDraft] = useState("");
-  const [keysSheetOpen, setKeysSheetOpen] = useState(false);
+  const preferences = useResolutionFavorites(host.id);
+  const [keysSubmenuOpen, setKeysSubmenuOpen] = useState(false);
+  const keysAnchorRef = useRef<View | null>(null);
+  const [toolbarMenu, setToolbarMenu] = useState<"display" | "actions" | null>(null);
+  const [scaleMode, setScaleMode] = useState<BrowserCanvasDisplayMode>("fit");
+  const paneRef = useRef<View | null>(null);
+  const displayAnchorRef = useRef<View | null>(null);
+  const actionsAnchorRef = useRef<View | null>(null);
+  const [paneSize, setPaneSize] = useState<Size>({ width: 0, height: 0 });
+  const menuRestoreFocus = useRef(true);
+  const closeToolbarMenu = useCallback((restoreFocus = true) => {
+    menuRestoreFocus.current = restoreFocus;
+    setKeysSubmenuOpen(false);
+    setToolbarMenu(null);
+  }, []);
+  const toggleToolbarMenu = (menu: "display" | "actions") => {
+    menuRestoreFocus.current = true;
+    setKeysSubmenuOpen(false);
+    setToolbarMenu((current) => (current === menu ? null : menu));
+  };
   const [nativeRequest, setNativeRequest] = useState<{
     id: number;
     kind: "keyboard" | "compose";
@@ -1013,7 +1006,7 @@ export function SharedBrowserPanel({
   }, [reset, workspaceId, host.id, inputLifecycle]);
 
   const captureQuery = useQuery({
-    queryKey: ["shared-browser", "capture", viewerToken, "medium"],
+    queryKey: ["shared-browser", "capture", viewerToken, preferences.captureQuality],
     queryFn: async () => {
       if (!viewerToken) throw new Error("The browser viewer is not attached.");
       const mutationEpoch = inputLifecycle.epoch;
@@ -1022,14 +1015,14 @@ export function SharedBrowserPanel({
       try {
         const result = await captureBrowser({
           viewerToken,
-          quality: "medium",
+          quality: preferences.captureQuality,
           knownFrameId: knownFrame?.frameId ?? null,
         });
         return {
           ...result,
           mutationEpoch,
           viewerToken,
-          captureQuality: "medium",
+          captureQuality: preferences.captureQuality,
         };
       } finally {
         captureInFlightRef.current = false;
@@ -1048,7 +1041,7 @@ export function SharedBrowserPanel({
     if (
       !result ||
       result.viewerToken !== activeViewerTokenRef.current ||
-      result.captureQuality !== "medium" ||
+      result.captureQuality !== preferences.captureQuality ||
       result.mutationEpoch !== inputLifecycle.epoch ||
       !acceptState(result.state)
     ) {
@@ -1062,7 +1055,7 @@ export function SharedBrowserPanel({
         mutationEpoch: result.mutationEpoch,
       });
     }
-  }, [acceptState, captureQuery.data, "medium", receive]);
+  }, [acceptState, captureQuery.data, preferences.captureQuality, receive]);
 
   useEffect(() => {
     if (state?.controller !== "self" && controlToken) setControlToken(null);
@@ -1161,11 +1154,7 @@ export function SharedBrowserPanel({
   const inputMutation = useMutation({
     mutationFn: sendBrowserInput,
     retry: false,
-    onSuccess: (result, variables) => {
-      if (variables.event.kind === "type") {
-        const sentText = variables.event.text;
-        setTypeDraft((current) => (current === sentText ? "" : current));
-      }
+    onSuccess: (result) => {
       settleLegacyInput();
       mutationSucceeded(result.state);
     },
@@ -1203,10 +1192,21 @@ export function SharedBrowserPanel({
   const canSendInput =
     canControl && Boolean(currentFrame) && !inputMutation.isPending && !legacyInputBusy;
 
-  const displayRect = useMemo(
-    () => (frame ? containedRect(containerSize, frame) : null),
-    [containerSize, frame],
+  // Layout belongs to the decoded front frame. A denser capture adds detail,
+  // not a larger 100% layout; scale never writes to the shared browser state.
+  const canvasLayout = useMemo(
+    () =>
+      frame
+        ? getBrowserCanvasLayout(
+            containerSize,
+            frame,
+            frontLayer?.candidate.viewport ?? state?.viewport ?? frame,
+            scaleMode,
+          )
+        : null,
+    [containerSize, frame, frontLayer, state?.viewport, scaleMode],
   );
+  const displayRect = canvasLayout?.frameRect ?? null;
 
   const controlContext = useCallback(() => {
     const viewer = activeViewerTokenRef.current;
@@ -1283,8 +1283,7 @@ export function SharedBrowserPanel({
     !deviceMutation.isPending &&
     !releaseMutation.isPending &&
     !acquireMutation.isPending &&
-    !devicePickerOpen &&
-    !keysSheetOpen;
+    toolbarMenu === null;
   // Forward physical mouse events and genuine touch on every remote preset.
   const canvasInput = useBrowserCanvasInput({
     authority: () => {
@@ -1313,6 +1312,7 @@ export function SharedBrowserPanel({
       displayRect?.height,
       containerSize.width,
       containerSize.height,
+      scaleMode,
       liveInputEnabled,
     ]),
     decodedFrameId: currentFrame?.frameId ?? null,
@@ -1343,6 +1343,7 @@ export function SharedBrowserPanel({
   const requestNativeKeyboard = (kind: "keyboard" | "compose") => {
     if (!canSendInput) return;
     nextNativeRequest.current += 1;
+    closeToolbarMenu(false);
     setNativeRequest({ id: nextNativeRequest.current, kind, ownershipKey: nativeOwnershipKey });
   };
   const nativeRequestHandled = useCallback((id: number) => {
@@ -1431,27 +1432,23 @@ export function SharedBrowserPanel({
     [deviceMutation, requireControlContext],
   );
 
-  const scroll = useCallback(
-    (deltaX: number, deltaY: number) => {
-      const viewport = stateRef.current?.viewport;
-      if (!displayRect || !viewport) return;
-      const previous = lastPointRef.current;
-      const x = previous && previous.x <= displayRect.width ? previous.x : displayRect.width / 2;
-      const y = previous && previous.y <= displayRect.height ? previous.y : displayRect.height / 2;
-      sendEvent({
-        kind: "scroll",
-        point: { x, y, width: displayRect.width, height: displayRect.height },
-        deltaX,
-        deltaY,
-      });
+  const applyEmulationSelection = useCallback(
+    (selection: EmulationSelection) => {
+      const context = requireControlContext();
+      if (!context || anyMutationPending) return;
+      inputLifecycle.bump();
+      deviceMutation.mutate({ ...context, ...selection });
     },
-    [displayRect, sendEvent],
+    [requireControlContext, anyMutationPending, inputLifecycle, deviceMutation],
   );
-
-  const sendText = useCallback(() => {
-    if (!typeDraft || inputMutation.isPending) return;
-    sendEvent({ kind: "type", text: typeDraft });
-  }, [inputMutation.isPending, sendEvent, typeDraft]);
+  const emulation = useBrowserEmulationMode({
+    identity: JSON.stringify([host.id, workspaceId]),
+    platform: layout.platform,
+    state,
+    canControl,
+    pending: anyMutationPending,
+    apply: applyEmulationSelection,
+  });
 
   const reconnect = useCallback(() => {
     if (attachQuery.isFetching) return;
@@ -1510,7 +1507,10 @@ export function SharedBrowserPanel({
   const activeDevicePreset = state?.devicePresetId
     ? DEVICE_PRESETS.find(({ id }) => id === state.devicePresetId)
     : null;
-  const deviceLabel = activeDevicePreset?.label ?? "Custom display";
+  const selectedResolutionPresetId = matchingResolutionPresetId(state);
+  const deviceLabel = selectedResolutionPresetId
+    ? (activeDevicePreset?.label ?? "Custom display")
+    : `${emulation.mode === "mobile" ? "Mobile" : "Desktop"} · custom display`;
   const transportLabel = currentFrame?.transport === "cdp-screencast" ? "CDP" : "fallback";
   const frameSummary = currentFrame
     ? layout.compact
@@ -1571,7 +1571,17 @@ export function SharedBrowserPanel({
     : styles.interactionLayer;
 
   return (
-    <View style={styles.screen}>
+    <View
+      ref={paneRef}
+      collapsable={false}
+      style={styles.screen}
+      onLayout={(event) => {
+        const { width, height } = event.nativeEvent.layout;
+        setPaneSize((previous) =>
+          previous.width === width && previous.height === height ? previous : { width, height },
+        );
+      }}
+    >
       <View style={styles.chrome}>
         <View style={styles.addressRow}>
           <ChromeIconButton
@@ -1605,6 +1615,8 @@ export function SharedBrowserPanel({
             accessibilityLabel="Browser address"
             placeholder="Enter a URL"
             editable={canControl && !navigateMutation.isPending}
+            dimWhenReadOnly={false}
+            keyboardType="url"
             maxLength={MAX_URL_LENGTH}
             returnKeyType="go"
             style={[styles.addressInput, styles.chromeAddressInput]}
@@ -1613,15 +1625,37 @@ export function SharedBrowserPanel({
             onBlur={() => setAddressFocused(false)}
             onSubmit={() => navigate("goto", addressDraft)}
           />
+          <View ref={displayAnchorRef} collapsable={false}>
+            <ChromeIconButton
+              styles={styles}
+              theme={theme}
+              label="Display options"
+              icon="Monitor"
+              selected={toolbarMenu === "display"}
+              expanded={toolbarMenu === "display"}
+              onPress={() => toggleToolbarMenu("display")}
+            />
+          </View>
           <ChromeIconButton
             styles={styles}
             theme={theme}
-            label={`Device: ${deviceLabel}`}
-            icon={activeDevicePreset?.isMobile ? "Smartphone" : "Monitor"}
-            selected={Boolean(activeDevicePreset)}
-            disabled={!canControl || deviceMutation.isPending}
-            onPress={() => setDevicePickerOpen(true)}
+            label={`${emulation.mode === "mobile" ? "Disable" : "Enable"} mobile emulation`}
+            icon="Smartphone"
+            selected={emulation.mode === "mobile"}
+            disabled={!canControl || anyMutationPending}
+            onPress={emulation.toggle}
           />
+          <View ref={actionsAnchorRef} collapsable={false}>
+            <ChromeIconButton
+              styles={styles}
+              theme={theme}
+              label="Browser menu"
+              icon="EllipsisVertical"
+              selected={toolbarMenu === "actions"}
+              expanded={toolbarMenu === "actions"}
+              onPress={() => toggleToolbarMenu("actions")}
+            />
+          </View>
         </View>
       </View>
 
@@ -1653,10 +1687,21 @@ export function SharedBrowserPanel({
       ) : null}
 
       <View style={styles.canvasShell}>
-        <View style={styles.canvas} onLayout={handleCanvasLayout}>
+        <BrowserCanvasViewport
+          mode={scaleMode}
+          style={styles.canvas}
+          contentSize={canvasLayout?.contentSize ?? containerSize}
+          localPanEnabled={layout.platform === "web" || !canControl}
+          onLayout={handleCanvasLayout}
+        >
           {buffer.layers.map((layer, slot) => {
             if (!layer) return null;
-            const rect = containedRect(containerSize, layer.candidate.frame);
+            const rect = getBrowserCanvasLayout(
+              containerSize,
+              layer.candidate.frame,
+              layer.candidate.viewport ?? state?.viewport ?? layer.candidate.frame,
+              scaleMode,
+            )?.frameRect;
             if (!rect) return null;
             const visible = slot === buffer.front;
             return (
@@ -1672,7 +1717,7 @@ export function SharedBrowserPanel({
                 y={rect.y}
                 width={rect.width}
                 height={rect.height}
-                cornerRadius={0}
+                cornerRadius={layout.compact ? DIMENSION.screenRadius - SPACE.xs : 0}
               />
             );
           })}
@@ -1718,7 +1763,7 @@ export function SharedBrowserPanel({
               loading={attachQuery.isPending || reconnecting || captureQuery.isFetching}
             />
           )}
-        </View>
+        </BrowserCanvasViewport>
         <View style={styles.canvasFooter}>
           <Text numberOfLines={1} style={styles.canvasFooterText}>
             {state?.title || state?.url || "Shared browser"}
@@ -1729,191 +1774,6 @@ export function SharedBrowserPanel({
         </View>
       </View>
 
-      <View style={styles.controls}>
-        {layout.compact ? (
-          <>
-            <View style={styles.mobileRow}>
-              <Field
-                styles={styles}
-                theme={theme}
-                value={typeDraft}
-                accessibilityLabel="Text to type in the shared browser"
-                placeholder={canSendInput ? "Type into the page" : "Take control to type"}
-                editable={canSendInput}
-                maxLength={MAX_TEXT_LENGTH}
-                returnKeyType="send"
-                style={[styles.typeInput, styles.buttonLarge]}
-                onChangeText={setTypeDraft}
-                onSubmit={sendText}
-              />
-              <ControlButton
-                styles={styles}
-                theme={theme}
-                label="Send"
-                icon="Send"
-                primary
-                large
-                disabled={!canSendInput || !typeDraft || inputMutation.isPending}
-                onPress={sendText}
-              />
-            </View>
-            <View style={styles.mobileRow}>
-              <ControlButton
-                styles={styles}
-                theme={theme}
-                label="Keyboard"
-                icon="Keyboard"
-                large
-                fill
-                disabled={!canSendInput}
-                onPress={() => requestNativeKeyboard("keyboard")}
-              />
-              <ControlButton
-                styles={styles}
-                theme={theme}
-                label="Compose"
-                icon="Pencil"
-                large
-                fill
-                disabled={!canSendInput}
-                onPress={() => requestNativeKeyboard("compose")}
-              />
-              <ControlButton
-                styles={styles}
-                theme={theme}
-                label="Keys"
-                icon="Keyboard"
-                large
-                fill
-                disabled={!canSendInput}
-                onPress={() => setKeysSheetOpen(true)}
-              />
-            </View>
-          </>
-        ) : (
-          <>
-            <ScrollView
-              horizontal
-              keyboardShouldPersistTaps="handled"
-              showsHorizontalScrollIndicator={false}
-              contentContainerStyle={styles.toolbarContent}
-            >
-              <View style={styles.controlStrip}>
-                <Text style={styles.stripLabel}>Scroll</Text>
-                <ControlButton
-                  styles={styles}
-                  theme={theme}
-                  label="←"
-                  accessibilityLabel="Scroll left"
-                  disabled={!canSendInput}
-                  onPress={() => scroll(-SCROLL_STEP, 0)}
-                />
-                <ControlButton
-                  styles={styles}
-                  theme={theme}
-                  label="↑"
-                  accessibilityLabel="Scroll up"
-                  disabled={!canSendInput}
-                  onPress={() => scroll(0, -SCROLL_STEP)}
-                />
-                <ControlButton
-                  styles={styles}
-                  theme={theme}
-                  label="↓"
-                  accessibilityLabel="Scroll down"
-                  disabled={!canSendInput}
-                  onPress={() => scroll(0, SCROLL_STEP)}
-                />
-                <ControlButton
-                  styles={styles}
-                  theme={theme}
-                  label="→"
-                  accessibilityLabel="Scroll right"
-                  disabled={!canSendInput}
-                  onPress={() => scroll(SCROLL_STEP, 0)}
-                />
-              </View>
-            </ScrollView>
-
-            <View style={styles.typeRow}>
-              <Field
-                styles={styles}
-                theme={theme}
-                value={typeDraft}
-                accessibilityLabel="Text to type in the shared browser"
-                placeholder={
-                  canSendInput
-                    ? "Type into the focused page element"
-                    : "Take control and focus a page field"
-                }
-                editable={canSendInput}
-                maxLength={MAX_TEXT_LENGTH}
-                returnKeyType="send"
-                style={styles.typeInput}
-                onChangeText={setTypeDraft}
-                onSubmit={sendText}
-              />
-              <ControlButton
-                styles={styles}
-                theme={theme}
-                label="Send"
-                icon="Send"
-                primary
-                disabled={!canSendInput || !typeDraft || inputMutation.isPending}
-                onPress={sendText}
-              />
-            </View>
-            <ScrollView
-              horizontal
-              keyboardShouldPersistTaps="handled"
-              showsHorizontalScrollIndicator={false}
-              contentContainerStyle={styles.keysContent}
-            >
-              <Text style={styles.stripLabel}>Keys</Text>
-              {SPECIAL_KEYS.map(({ key, label }) => (
-                <ControlButton
-                  key={key}
-                  styles={styles}
-                  theme={theme}
-                  label={label}
-                  accessibilityLabel={`Send ${key} key`}
-                  disabled={!canSendInput}
-                  onPress={() => sendEvent({ kind: "key", key })}
-                />
-              ))}
-            </ScrollView>
-          </>
-        )}
-      </View>
-
-      <Modal
-        title="Keyboard keys"
-        icon={<Icon name="Keyboard" size={18} color={theme.colors.foreground} />}
-        open={keysSheetOpen}
-        onOpenChange={setKeysSheetOpen}
-      >
-        <Modal.Content>
-          <View style={styles.sheetContent}>
-            <View style={styles.sheetGrid}>
-              {SPECIAL_KEYS.map(({ key, label }) => (
-                <ControlButton
-                  key={key}
-                  styles={styles}
-                  theme={theme}
-                  label={label}
-                  accessibilityLabel={`Send ${key} key`}
-                  large
-                  disabled={!canSendInput}
-                  onPress={() => sendEvent({ kind: "key", key })}
-                />
-              ))}
-            </View>
-            <Text style={styles.devicePresetDetail}>
-              Keys go to the page element that currently has focus in the shared browser.
-            </Text>
-          </View>
-        </Modal.Content>
-      </Modal>
       {layout.platform !== "web" ? (
         <NativeKeyboardControls
           styles={styles}
@@ -1927,43 +1787,46 @@ export function SharedBrowserPanel({
       ) : null}
 
       <Modal
-        title="Device emulation"
+        title="Resolution and quality"
         icon={<Icon name="Smartphone" size={18} color={theme.colors.foreground} />}
         open={devicePickerOpen}
         onOpenChange={setDevicePickerOpen}
       >
         <Modal.Content>
           <View style={styles.deviceModalContent}>
-            {DEVICE_PRESETS.map((preset) => {
-              const selected = state?.devicePresetId === preset.id;
-              return (
-                <Pressable
-                  key={preset.id}
-                  accessibilityRole="button"
-                  accessibilityLabel={`Emulate ${preset.label}`}
-                  accessibilityState={{ selected }}
-                  disabled={!canControl || deviceMutation.isPending}
-                  onPress={() => selectDevicePreset(preset.id)}
-                  style={({ pressed }) => [
-                    styles.devicePresetRow,
-                    selected ? styles.devicePresetRowSelected : null,
-                    pressed ? styles.buttonPressed : null,
-                    !canControl ? styles.buttonDisabled : null,
-                  ]}
-                >
-                  <Icon
-                    name={preset.isMobile ? "Smartphone" : "Monitor"}
-                    size={18}
-                    color={selected ? theme.colors.accent : theme.colors.foregroundMuted}
-                  />
-                  <Text style={styles.devicePresetText}>{preset.label}</Text>
-                  <Text style={styles.devicePresetDetail}>
-                    {preset.viewport.width} × {preset.viewport.height}
-                  </Text>
-                </Pressable>
-              );
-            })}
+            <BrowserResolutionPicker
+              theme={theme}
+              groups={groupResolutionPresets()}
+              selectedPresetId={selectedResolutionPresetId}
+              favoritePresetIds={preferences.favoritePresetIds}
+              selectDisabled={!canControl || anyMutationPending}
+              favoriteDisabled={preferences.disabled}
+              captureQuality={preferences.captureQuality}
+              onSelect={selectDevicePreset}
+              onToggleFavorite={(id) => {
+                void preferences.toggleFavorite(id);
+              }}
+              onQualityChange={(quality) => {
+                void preferences.changeQuality(quality);
+              }}
+            />
+            {preferences.error ? (
+              <View style={styles.controlStrip}>
+                <Text accessibilityRole="alert" style={styles.mutedText}>
+                  {preferences.error}
+                </Text>
+                <ControlButton
+                  styles={styles}
+                  theme={theme}
+                  label="Reload preferences"
+                  onPress={preferences.reload}
+                />
+              </View>
+            ) : null}
             <Text style={styles.stripLabel}>Custom viewport</Text>
+            {visibleError ? (
+              <ErrorNotice styles={styles} theme={theme} message={visibleError} />
+            ) : null}
             <View style={styles.customViewportRow}>
               <Field
                 styles={styles}
@@ -2008,6 +1871,171 @@ export function SharedBrowserPanel({
           </View>
         </Modal.Content>
       </Modal>
+      {toolbarMenu ? (
+        <BrowserToolbarMenu
+          key={toolbarMenu}
+          theme={theme}
+          compact={layout.compact}
+          title={toolbarMenu === "display" ? "Display options" : "Browser menu"}
+          paneRef={paneRef}
+          paneSize={paneSize}
+          anchorRef={toolbarMenu === "display" ? displayAnchorRef : actionsAnchorRef}
+          preferredHeight={
+            toolbarMenu === "display"
+              ? 300 + preferences.favoritePresetIds.length * (layout.compact ? 44 : 36)
+              : layout.platform === "web"
+                ? 88
+                : 176
+          }
+          onClose={() => closeToolbarMenu()}
+          shouldRestoreFocus={() => menuRestoreFocus.current}
+          onSubmenuOpen={() => {
+            if (canSendInput) setKeysSubmenuOpen(true);
+          }}
+          submenu={
+            toolbarMenu === "actions" && keysSubmenuOpen
+              ? {
+                  title: "Send keys",
+                  anchorRef: keysAnchorRef,
+                  preferredHeight: 40 + SPECIAL_KEYS.length * (layout.compact ? 44 : 36),
+                  onBack: () => setKeysSubmenuOpen(false),
+                  children: SPECIAL_KEYS.map(({ key, label }) => (
+                    <BrowserMenuItem
+                      key={key}
+                      theme={theme}
+                      compact={layout.compact}
+                      label={label}
+                      disabled={!canSendInput}
+                      onPress={() => {
+                        canvasInput.nativeKeyboard.reset();
+                        sendEvent({ kind: "key", key });
+                      }}
+                    />
+                  )),
+                }
+              : undefined
+          }
+        >
+          {toolbarMenu === "display" ? (
+            <>
+              <BrowserMenuHeading theme={theme}>View size</BrowserMenuHeading>
+              <BrowserMenuItem
+                theme={theme}
+                compact={layout.compact}
+                label="Fit to panel"
+                icon="Minimize"
+                selected={scaleMode === "fit"}
+                onPress={() => {
+                  closeToolbarMenu();
+                  setScaleMode("fit");
+                }}
+              />
+              <BrowserMenuItem
+                theme={theme}
+                compact={layout.compact}
+                label="Actual size (100%)"
+                icon="Maximize"
+                selected={scaleMode === "actual"}
+                onPress={() => {
+                  closeToolbarMenu();
+                  setScaleMode("actual");
+                }}
+              />
+              {layout.platform !== "web" && scaleMode === "actual" ? (
+                <Text
+                  style={[styles.devicePresetDetail, { paddingHorizontal: 12, paddingVertical: 4 }]}
+                >
+                  Release control to pan this view. While controlling, swipes go to the page.
+                </Text>
+              ) : null}
+              <BrowserMenuSeparator theme={theme} />
+              <BrowserMenuHeading theme={theme}>Favorite resolutions</BrowserMenuHeading>
+              {preferences.favoritePresetIds.length === 0 ? (
+                <Text
+                  style={[styles.devicePresetDetail, { paddingHorizontal: 12, paddingVertical: 4 }]}
+                >
+                  Star resolutions in the full list to add them here.
+                </Text>
+              ) : (
+                preferences.favoritePresetIds.map((id) => {
+                  const preset = DEVICE_PRESETS.find((item) => item.id === id);
+                  return preset ? (
+                    <BrowserMenuItem
+                      key={id}
+                      theme={theme}
+                      compact={layout.compact}
+                      label={preset.label}
+                      icon={preset.isMobile ? "Smartphone" : "Monitor"}
+                      selected={selectedResolutionPresetId === id}
+                      disabled={!canControl || anyMutationPending}
+                      onPress={() => {
+                        closeToolbarMenu();
+                        selectDevicePreset(id);
+                      }}
+                    />
+                  ) : null;
+                })
+              )}
+              <BrowserMenuSeparator theme={theme} />
+              <BrowserMenuItem
+                theme={theme}
+                compact={layout.compact}
+                label="All resolutions and quality"
+                icon="Settings2"
+                onPress={() => {
+                  closeToolbarMenu(false);
+                  setDevicePickerOpen(true);
+                }}
+              />
+            </>
+          ) : (
+            <>
+              {layout.platform !== "web" ? (
+                <>
+                  <BrowserMenuItem
+                    theme={theme}
+                    compact={layout.compact}
+                    label="Keyboard"
+                    icon="Keyboard"
+                    disabled={!canSendInput}
+                    onPress={() => requestNativeKeyboard("keyboard")}
+                  />
+                  <BrowserMenuItem
+                    theme={theme}
+                    compact={layout.compact}
+                    label="Compose text"
+                    icon="Pencil"
+                    disabled={!canSendInput}
+                    onPress={() => requestNativeKeyboard("compose")}
+                  />
+                </>
+              ) : null}
+              <View ref={keysAnchorRef}>
+                <BrowserMenuItem
+                  theme={theme}
+                  compact={layout.compact}
+                  label="Send keys"
+                  icon="Keyboard"
+                  expanded={keysSubmenuOpen}
+                  disabled={!canSendInput}
+                  onPress={() => setKeysSubmenuOpen(true)}
+                />
+              </View>
+              <BrowserMenuItem
+                theme={theme}
+                compact={layout.compact}
+                label="Reconnect viewer"
+                icon="RotateCw"
+                disabled={attachQuery.isFetching}
+                onPress={() => {
+                  closeToolbarMenu();
+                  reconnect();
+                }}
+              />
+            </>
+          )}
+        </BrowserToolbarMenu>
+      ) : null}
     </View>
   );
 }

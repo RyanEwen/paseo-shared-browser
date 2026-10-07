@@ -23,6 +23,12 @@ import {
   type updateBrowserGestureRpc,
   type Viewport,
 } from "../shared/browser";
+import {
+  captureDimensions,
+  DEFAULT_CAPTURE_QUALITY,
+  DEFAULT_JPEG_QUALITY,
+  JPEG_QUALITY,
+} from "../shared/capture-settings";
 import { BrowserGesture } from "./browser-gesture";
 import { sameRuntimeInputAttachment } from "./input-generation";
 import type { JsonValue } from "./runtime-protocol";
@@ -49,8 +55,6 @@ const MAX_VIEWERS_PER_SESSION = 16;
 const MAX_SESSIONS = 8;
 const SCREENCAST_WAIT_MS = 500;
 const RUNTIME_FRAME_MAX_BYTES = 750_000;
-const SCREENCAST_QUALITY = 65;
-const JPEG_QUALITY = { low: 40, medium: 65, high: 85 } as const;
 
 export interface BrowserRuntimeClient {
   connect(): Promise<{ epoch: number }>;
@@ -91,6 +95,7 @@ interface BrowserSession {
   runtimeCreatedAt: number;
   bridgeEpoch: number;
   viewport: Viewport;
+  captureScale: number;
   navigationGeneration: number;
   viewportGeneration: number;
   devicePresetId: DevicePresetId | null;
@@ -225,7 +230,7 @@ export class SessionManager {
       const viewerToken = this.issueUniqueToken();
       session.viewers.set(viewerToken, { label, expiresAt: this.now() + this.viewerTtlMs });
       this.viewerSessions.set(viewerToken, session);
-      await this.request(session, "screencast.start", { quality: SCREENCAST_QUALITY }).catch(
+      await this.request(session, "screencast.start", { quality: DEFAULT_JPEG_QUALITY }).catch(
         () => undefined,
       );
       try {
@@ -293,7 +298,7 @@ export class SessionManager {
 
   async capture(
     viewerToken: string,
-    quality: CaptureQuality = "medium",
+    quality: CaptureQuality = DEFAULT_CAPTURE_QUALITY,
     knownFrameId: string | null = null,
   ): Promise<{ state: BrowserState; frame: BrowserFrame | null }> {
     const session = this.requireViewer(viewerToken);
@@ -393,6 +398,7 @@ export class SessionManager {
         });
         session.viewport = { ...input.viewport };
         session.devicePresetId = null;
+        session.captureScale = 1;
         session.userAgent = session.defaultUserAgent;
         session.viewportGeneration += 1;
         this.invalidateFrames(session);
@@ -409,22 +415,28 @@ export class SessionManager {
       await this.cancelGesture(session);
       const preset = DEVICE_PRESETS.find(({ id }) => id === input.presetId);
       if (!preset) throw new Error("Unknown device preset");
+      // Resolve the display under the session lock. A mode toggle must neither
+      // replay remembered dimensions nor change the capture's pixel resolution.
+      const viewport = input.preserveDisplay ? session.viewport : preset.viewport;
+      const captureScale = input.preserveDisplay ? session.captureScale : preset.captureScale;
       await this.request(session, "emulate", {
-        width: preset.viewport.width,
-        height: preset.viewport.height,
+        width: viewport.width,
+        height: viewport.height,
         deviceScaleFactor: preset.deviceScaleFactor,
+        captureScale,
         mobile: preset.isMobile,
         touch: preset.hasTouch,
         userAgent: preset.userAgent,
         platform: preset.platform,
       });
-      session.viewport = { ...preset.viewport };
+      session.viewport = { ...viewport };
       session.devicePresetId = preset.id;
+      session.captureScale = captureScale;
       session.userAgent = preset.userAgent;
       session.viewportGeneration += 1;
-      session.navigationGeneration += 1;
+      // Emulation invalidates input geometry even when display dimensions stay
+      // fixed. UA-sniffing sites can use Reload; never discard a draft automatically.
       this.invalidateFrames(session);
-      await this.request(session, "reload", null);
       this.renewController(session, input.viewerToken);
       return { state: await this.snapshotState(session, input.viewerToken) };
     });
@@ -825,6 +837,7 @@ export class SessionManager {
         runtimeCreatedAt: descriptor.createdAt,
         bridgeEpoch: this.bridgeEpoch,
         viewport: { ...DEFAULT_VIEWPORT },
+        captureScale: 1,
         navigationGeneration: 0,
         viewportGeneration: 0,
         devicePresetId: null,
@@ -1044,7 +1057,7 @@ export class SessionManager {
       Buffer.byteLength(dataBase64, "base64") !== byteLength
     )
       throw new Error("Browser returned an invalid frame");
-    const expectedPixels = session.viewport;
+    const expectedPixels = captureDimensions(session.viewport, session.captureScale);
     if (Number(raw.width) !== expectedPixels.width || Number(raw.height) !== expectedPixels.height)
       throw new Error("Browser returned a frame for a stale viewport");
 
@@ -1190,6 +1203,7 @@ export class SessionManager {
       canGoBack: session.canGoBack,
       canGoForward: session.canGoForward,
       viewport: { ...session.viewport },
+      captureScale: session.captureScale,
       navigationGeneration: session.navigationGeneration,
       viewportGeneration: session.viewportGeneration,
       devicePresetId: session.devicePresetId,
