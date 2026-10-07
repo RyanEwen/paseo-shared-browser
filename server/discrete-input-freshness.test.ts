@@ -1,17 +1,20 @@
 /** Exercises real capture/input policy with delayed native replies, without starting a daemon. */
 import { expect, it } from "vitest";
-import type { BrowserInputEvent } from "../shared/browser";
+import type { BrowserInputEvent, BrowserState } from "../shared/browser";
+import type { BrowserFrameAuthority } from "../shared/browser-video";
 import { SessionManager } from "./browser-policy";
 
 /** One owned document and injected elapsed clock make publication boundaries observable. */
 async function fixture() {
   let clock = 1_000;
+  let monotonicClock = 1_000;
   let ids = 0;
   let document = "1:1";
   let intercept: (operation: string) => void = () => {};
   const calls: string[] = [];
   const manager = new SessionManager({
     now: () => clock,
+    monotonicNow: () => monotonicClock,
     validateWorkspace: async () => true,
     issueToken: () => String(++ids).padStart(32, "0"),
     client: {
@@ -46,6 +49,28 @@ async function fixture() {
             capturedAt: new Date(clock).toISOString(),
           };
         }
+        if (operation === "video.read") {
+          return {
+            status: "ready",
+            streamId: "v".repeat(32),
+            inputGeneration: document,
+            packets: [
+              {
+                streamId: "v".repeat(32),
+                captureGeneration: 1,
+                sequence: 1,
+                timestampUs: 1000,
+                type: "key",
+                codec: "vp8",
+                width: 1280,
+                height: 800,
+                capturedAt: new Date(clock).toISOString(),
+                capturedAtMonotonicMs: monotonicClock,
+                dataBase64: "AA==",
+              },
+            ],
+          };
+        }
         return null;
       },
     },
@@ -59,6 +84,13 @@ async function fixture() {
     calls,
     advance: (milliseconds: number) => {
       clock += milliseconds;
+      monotonicClock += milliseconds;
+    },
+    advanceWall: (milliseconds: number) => {
+      clock += milliseconds;
+    },
+    advanceMonotonic: (milliseconds: number) => {
+      monotonicClock += milliseconds;
     },
     replaceDocument: () => {
       document = "1:2";
@@ -67,7 +99,21 @@ async function fixture() {
       intercept = callback;
     },
     capture: () => manager.capture(viewerToken),
-    send: (capture: Awaited<ReturnType<typeof manager.capture>>, event: BrowserInputEvent) => {
+    videoCapture: async () => {
+      const reply = await manager.readVideo({
+        viewerToken,
+        quality: "high",
+        streamId: null,
+        afterSequence: 0,
+        waitMs: 0,
+        requestKeyFrame: true,
+      });
+      return { state: reply.state, frame: reply.packets[0]!.frame };
+    },
+    send: (
+      capture: { state: BrowserState; frame: BrowserFrameAuthority | null },
+      event: BrowserInputEvent,
+    ) => {
       const state = capture.state;
       return manager.sendInput({
         viewerToken,
@@ -133,7 +179,9 @@ it("does not extend capture age by the time spent validating metadata", async ()
     const capture = await f.capture();
     f.intercept(() => {});
     f.advance(1_001);
-    await expect(f.send(capture, click)).rejects.toThrow("frame is stale");
+    await expect(f.send(capture, click)).rejects.toThrow(
+      "Browser frame is stale (stage=admission; reason=expired; ageMs=5001)",
+    );
     expect(f.calls).not.toContain("mouse.down");
   } finally {
     f.manager.disconnect();
@@ -162,9 +210,12 @@ it("still refuses an expired frame before publishing input", async () => {
   try {
     const capture = await f.capture();
     f.advance(5_000);
-    await expect(f.send(capture, click)).rejects.toThrow("frame is stale");
-    expect(f.calls).not.toContain("mouse.move");
-    expect(f.calls).not.toContain("mouse.down");
+    await expect(f.send(capture, click)).rejects.toThrow(
+      "Browser frame is stale (stage=admission; reason=expired; ageMs=5000)",
+    );
+    expect(
+      f.calls.filter((operation) => /^(?:mouse\.|key\.|text\.|input\.)/.test(operation)),
+    ).toEqual([]);
   } finally {
     f.manager.disconnect();
   }
@@ -180,9 +231,12 @@ it("refuses a document replacement after down while releasing the original press
         f.replaceDocument();
       }
     });
-    await expect(f.send(capture, click)).rejects.toThrow("stale");
+    await expect(f.send(capture, click)).rejects.toThrow(
+      "Browser frame is stale (stage=admitted-input; reason=context-changed)",
+    );
     expect(f.calls.filter((operation) => operation === "mouse.down")).toHaveLength(1);
     expect(f.calls.filter((operation) => operation === "mouse.up")).toHaveLength(1);
+    expect(f.calls.filter((operation) => operation === "input.end")).toHaveLength(1);
   } finally {
     f.manager.disconnect();
   }
@@ -225,8 +279,85 @@ it("revokes the admitted observation when a published press loses its acknowledg
     });
     await expect(f.send(capture, click)).rejects.toThrow("outcome is unknown");
     f.intercept(() => {});
-    await expect(f.send(capture, click)).rejects.toThrow("frame is stale");
+    const operationsBeforeReplay = f.calls.length;
+    await expect(f.send(capture, click)).rejects.toThrow(
+      "Browser frame is stale (stage=admission; reason=missing-or-revoked)",
+    );
+    expect(f.calls.slice(operationsBeforeReplay)).toEqual([]);
     expect(f.calls.filter((operation) => operation === "mouse.down")).toHaveLength(1);
+  } finally {
+    f.manager.disconnect();
+  }
+});
+
+/** Admission diagnostics must describe the same clock and receipt the policy refuses. */
+for (const skew of [-8_000, 8_000]) {
+  it(`expires video authority at five monotonic seconds despite wall skew ${skew}`, async () => {
+    const f = await fixture();
+    try {
+      const capture = await f.videoCapture();
+      f.advanceWall(skew);
+      f.advanceMonotonic(5_000);
+      await expect(f.send(capture, click)).rejects.toThrow(
+        "Browser frame is stale (stage=admission; reason=expired; ageMs=5000)",
+      );
+      expect(
+        f.calls.filter((operation) => /^(?:mouse\.|key\.|text\.|input\.)/.test(operation)),
+      ).toEqual([]);
+    } finally {
+      f.manager.disconnect();
+    }
+  });
+}
+
+it("admits video authority before monotonic expiry despite a forward wall-clock jump", async () => {
+  const f = await fixture();
+  try {
+    const capture = await f.videoCapture();
+    f.advanceWall(8_000);
+    f.advanceMonotonic(4_999);
+    await expect(f.send(capture, click)).resolves.toHaveProperty("state");
+    expect(f.calls.filter((operation) => operation === "mouse.down")).toHaveLength(1);
+    expect(f.calls.filter((operation) => operation === "mouse.up")).toHaveLength(1);
+  } finally {
+    f.manager.disconnect();
+  }
+});
+
+it("reports a known generation mismatch with age without publishing native input", async () => {
+  const f = await fixture();
+  try {
+    const capture = await f.capture();
+    f.advance(25);
+    const changed = {
+      ...capture,
+      frame: { ...capture.frame!, navigationGeneration: capture.frame!.navigationGeneration + 1 },
+    };
+    await expect(f.send(changed, click)).rejects.toThrow(
+      "Browser frame is stale (stage=admission; reason=context-changed; ageMs=25)",
+    );
+    expect(
+      f.calls.filter((operation) => /^(?:mouse\.|key\.|text\.|input\.)/.test(operation)),
+    ).toEqual([]);
+  } finally {
+    f.manager.disconnect();
+  }
+});
+
+it("preserves expiry evidence before pruning and reports the retired receipt without age", async () => {
+  const f = await fixture();
+  try {
+    const capture = await f.capture();
+    f.advance(5_000);
+    await expect(f.send(capture, click)).rejects.toThrow(
+      "Browser frame is stale (stage=admission; reason=expired; ageMs=5000)",
+    );
+    await expect(f.send(capture, click)).rejects.toThrow(
+      "Browser frame is stale (stage=admission; reason=missing-or-revoked)",
+    );
+    expect(
+      f.calls.filter((operation) => /^(?:mouse\.|key\.|text\.|input\.)/.test(operation)),
+    ).toEqual([]);
   } finally {
     f.manager.disconnect();
   }

@@ -45,6 +45,7 @@ import {
   JPEG_QUALITY,
 } from "../shared/capture-settings";
 import { frameMatchesBrowserContext } from "./browser-frame-context";
+import { createBrowserFrameRejection } from "./browser-frame-rejection";
 import { BrowserGesture } from "./browser-gesture";
 import { runWithInputCleanup } from "./input-cleanup";
 import { sameRuntimeInputAttachment } from "./input-generation";
@@ -1531,7 +1532,17 @@ export class SessionManager {
     session: BrowserSession,
     target: { frameId: string; navigationGeneration: number; viewportGeneration: number },
   ): void {
-    if (!this.isRecentFrame(session, target)) throw new Error("Browser frame is stale");
+    // Retain diagnostic evidence before validation prunes expired receipts.
+    // An absent receipt cannot distinguish expiry from an earlier revocation.
+    const frame = session.recentFrames.get(target.frameId);
+    if (this.isRecentFrame(session, target)) return;
+    if (!frame) throw createBrowserFrameRejection("admission", "missing-or-revoked");
+
+    const expiresAt = frame.expiresAtMonotonicMs ?? frame.expiresAt;
+    const now = frame.expiresAtMonotonicMs === undefined ? this.now() : this.monotonicNow();
+    const ageMs = now - (expiresAt - FRAME_TOKEN_TTL_MS);
+    const reason = expiresAt <= now ? "expired" : "context-changed";
+    throw createBrowserFrameRejection("admission", reason, ageMs);
   }
 
   /** Check issued frame authority without admitting or cancelling a live channel. */
@@ -1744,7 +1755,7 @@ export class SessionManager {
         context.expected.navigationGeneration !== session.navigationGeneration ||
         context.expected.viewportGeneration !== session.viewportGeneration
       ) {
-        throw new Error("Browser frame is stale");
+        throw createBrowserFrameRejection("admitted-input", "context-changed");
       }
       this.requireMutationAccess(session, context);
     };

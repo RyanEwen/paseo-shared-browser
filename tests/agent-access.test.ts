@@ -1,7 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { CdpUnknownOutcomeError } from "../server/cdp";
 import {
   type AgentBrowserOperation,
@@ -446,6 +446,79 @@ describe("agent shared-browser authorization", () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  for (const rejection of ["expired", "context-changed"] as const) {
+    it(`redacts ${rejection} diagnostics through the actual agent socket and retains native cleanup`, async () => {
+      const root = await mkdtemp(join(tmpdir(), "shared-browser-frame-rejection-"));
+      const paths = resolveSupervisorPaths(root);
+      let clock = 1_000;
+      const clockSpy = vi.spyOn(Date, "now").mockImplementation(() => clock);
+      const owner = new AgentRuntimeOwner();
+      const calls: string[] = [];
+      let generation = "0:0";
+      const original = owner.request.bind(owner);
+      owner.request = async (runtime, operation, input) => {
+        calls.push(operation);
+        const result = await original(runtime, operation, input);
+        if (operation === "key.down" && rejection === "context-changed") generation = "0:1";
+        if (operation === "state")
+          return { ...(result as Record<string, JsonValue>), inputGeneration: generation };
+        return result;
+      };
+      const server = await startSupervisorServer(owner, paths);
+      const admin = new SupervisorClient({ bridgeId: "private-plugin-bridge", paths });
+      const agentTicket = ticket("private-agent-ticket");
+      const agent = new AgentSupervisorClient({ ticket: agentTicket, paths });
+      try {
+        await admin.connect();
+        await admin.issueAgentTicket(agentTicket);
+        await admin.bindAgentTicket(agentTicket, "private-agent", "private-workspace");
+        await agent.open();
+        await agent.request("acquire-control", {});
+        const captured = await agent.request("capture", {});
+        if (rejection === "expired") clock += 5_000;
+        let failure: unknown;
+        try {
+          await agent.request("input", { event: { kind: "key", key: "End" } });
+        } catch (error) {
+          failure = error;
+        }
+        const message =
+          rejection === "expired"
+            ? "Browser frame is stale (stage=admission; reason=expired; ageMs=5000)"
+            : "Browser frame is stale (stage=admitted-input; reason=context-changed)";
+        expect(failure).toMatchObject({ code: "RUNTIME_FAILURE", message });
+        const serialized = JSON.stringify(failure);
+        expect(serialized).not.toMatch(
+          /private-|https:|runtime_|viewerToken|controlToken|frameId|sessionId/,
+        );
+        expect(serialized).not.toContain(agentTicket);
+        const authority = captured as unknown as {
+          state: BrowserState;
+          frame: { frameId: string };
+        };
+        for (const value of [
+          authority.state.sessionId,
+          authority.state.runtimeId,
+          authority.frame.frameId,
+        ]) {
+          expect(serialized).not.toContain(value);
+        }
+        const publications = calls.filter((operation) =>
+          /^(?:mouse\.|key\.|text\.|input\.)/.test(operation),
+        );
+        expect(publications).toEqual(
+          rejection === "expired" ? [] : ["input.begin", "key.down", "key.up", "input.end"],
+        );
+      } finally {
+        agent.disconnect();
+        admin.disconnect();
+        await server.close();
+        clockSpy.mockRestore();
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+  }
 
   it("reclaims the cached plugin bridge after its socket closes", async () => {
     const root = await mkdtemp(join(tmpdir(), "shared-browser-reconnect-"));

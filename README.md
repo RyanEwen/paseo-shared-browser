@@ -265,6 +265,11 @@ User-supplied `AGENT_BROWSER_*` variables are deliberately ignored.
 - Clicking a link or submitting a form may navigate before its input reply arrives. A completed
   input returns the new viewing state without a false failure or repeating the action.
   Replaced controls, targets and uncertain sends remain rejected.
+- Agent stale-frame errors identify initial admission or a context change during admitted
+  input. Known receipt age is bounded to 60 seconds and uses its original clock; missing
+  receipts report missing-or-revoked without inventing an age. These diagnostics contain
+  no page content or authority identifiers and do not authorize replay. Initial frame
+  admission still expires after five seconds.
 - Human control: **Take control**, **Release**, and **Take over** for explicit handoff. Agent MCP
   calls have no forced-takeover operation.
 - With control, mouse movement forwards real hover effects and standard browser cursor changes.
