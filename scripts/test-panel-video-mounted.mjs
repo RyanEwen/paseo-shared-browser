@@ -13,6 +13,7 @@ const { values } = parseArgs({
   options: {
     "tooling-root": { type: "string" },
     fixture: { type: "string", default: "handoff" },
+    compact: { type: "boolean", default: false },
   },
 });
 if (
@@ -25,6 +26,7 @@ if (
     "control-gate",
     "control-gate-takeover",
     "control-gate-stale",
+    "tab-focus",
   ].includes(values.fixture)
 )
   throw new Error("Unsupported panel fixture");
@@ -83,6 +85,9 @@ const f = {
   deferNavigation: false,
   deferBegin: false,
   staleBeginOnce: false,
+  deferTabs: false,
+  tabReplies: [],
+  createdTabId: null,
 };
 globalThis.panelFixture = f;
 const rpcCache = new Map();
@@ -90,20 +95,44 @@ f.rpc = (contract) => {
   if (!rpcCache.has(contract.name))
     rpcCache.set(contract.name, async (input) => {
       f.calls.push({ name: contract.name, input });
-      if (contract.name === "shared-browser.attach")
+      if (contract.name === "shared-browser.attach") {
+        if (values.fixture === "tab-focus" && input.tabId) {
+          f.state = { ...f.state, tabId: input.tabId, sessionId: input.tabId };
+        }
         return { viewerToken: f.token, state: { ...f.state } };
-      if (contract.name === "shared-browser.tabs.list")
-        return {
+      }
+      if (contract.name === "shared-browser.tabs.create") {
+        f.createdTabId = "n".repeat(32);
+        return { tabId: f.createdTabId };
+      }
+      if (contract.name === "shared-browser.tabs.list") {
+        const result = {
           tabs: [
             {
-              id: f.state.tabId,
+              id: state.tabId,
               title: "Fixture",
               url: f.state.url,
               viewerCount: 1,
               controllerLabel: f.state.controllerLabel ?? null,
             },
+            ...(f.createdTabId
+              ? [
+                  {
+                    id: f.createdTabId,
+                    title: "",
+                    url: "about:blank",
+                    viewerCount: 1,
+                    controllerLabel: null,
+                  },
+                ]
+              : []),
           ],
         };
+        if (f.deferTabs) {
+          return new Promise((resolve) => f.tabReplies.push({ result, resolve }));
+        }
+        return result;
+      }
       if (contract.name === "shared-browser.video.read")
         return new Promise((resolve, reject) => f.reads.push({ input, resolve, reject }));
       if (contract.name === "shared-browser.capture")
@@ -220,7 +249,7 @@ try {
         React.createElement(SharedBrowserPanel, {
           theme: { colors: new Proxy({}, { get: () => "#777" }) },
           host: { id: "fixture", label: "Fixture" },
-          layout: { compact: false, platform: "web" },
+          layout: { compact: values.compact, platform: "web" },
           workspaceId: "workspace",
         }),
       ),
@@ -254,7 +283,32 @@ try {
   await flush(20);
   assert(document.body.textContent.includes("Video"), "video displayed");
   console.log("PASS full panel painted Video");
-  if (values.fixture.startsWith("control-gate")) {
+  if (values.fixture === "tab-focus") {
+    f.deferTabs = true;
+    await React.act(async () => {
+      void query.refetchQueries({ queryKey: ["shared-browser", "tabs", "fixture", "workspace"] });
+    });
+    assert.equal(f.tabReplies.length, 1, "pre-creation list is still in flight");
+    const create = document.querySelector('button[aria-label="New browser tab"]');
+    assert(create && !create.disabled, "new tab action is available");
+    await React.act(async () => create.click());
+    await flush(30);
+    const selected = () => document.querySelector('button[role="tab"][aria-selected="true"]');
+    assert(selected()?.textContent.includes("about:blank"), "created tab immediately gains focus");
+    const attachments = () => f.calls.filter((call) => call.name === "shared-browser.attach");
+    assert.equal(attachments().at(-1).input.tabId, f.createdTabId);
+    await React.act(async () => f.tabReplies[0].resolve(f.tabReplies[0].result));
+    await flush(30);
+    assert(selected()?.textContent.includes("about:blank"), "late old list cannot undo focus");
+    const latest = f.tabReplies.at(-1);
+    await React.act(async () => latest.resolve(latest.result));
+    await flush(30);
+    assert.equal(f.calls.filter((call) => call.name === "shared-browser.tabs.create").length, 1);
+    assert.equal(attachments().length, 2, "selection attaches to the new page exactly once");
+    assert.equal(attachments().at(-1).input.tabId, f.createdTabId);
+    assert.equal(selected()?.getAttribute("aria-selected"), "true");
+    console.log("PASS new tab retains focus across cached and delayed pre-creation tab lists");
+  } else if (values.fixture.startsWith("control-gate")) {
     const reload = document.querySelector('button[aria-label="Reload"]');
     assert(reload && !reload.disabled, "observer can select Reload");
     await React.act(async () => reload.click());

@@ -6,7 +6,7 @@
  */
 import { type PluginWorkspacePanelProps, useRpc } from "@getpaseo/plugin/client";
 import { Icon, Modal } from "@getpaseo/plugin/client/react-native";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   type ReactNode,
   useCallback,
@@ -193,6 +193,7 @@ export function SharedBrowserPanel({
   workspaceId,
   active = true,
 }: PluginWorkspacePanelProps) {
+  const queryClient = useQueryClient();
   const styles = useMemo(() => createStyles(theme, layout.compact), [theme, layout.compact]);
   const viewerLabel = useState(() =>
     `Paseo ${layout.platform} · ${host.label} · ${Date.now().toString(36)}${Math.random()
@@ -386,8 +387,9 @@ export function SharedBrowserPanel({
     reconnecting || closedView || !attachedTabMatches
       ? null
       : (attachQuery.data?.viewerToken ?? null);
+  const tabsQueryKey = ["shared-browser", "tabs", host.id, workspaceId];
   const tabsQuery = useQuery({
-    queryKey: ["shared-browser", "tabs", host.id, workspaceId],
+    queryKey: tabsQueryKey,
     queryFn: () => listTabs({ viewerToken: viewerToken! }),
     enabled: Boolean(viewerToken) && active,
     refetchInterval: 2_000,
@@ -1200,6 +1202,31 @@ export function SharedBrowserPanel({
     setOperationError(null);
     try {
       const created = await createTab({ viewerToken });
+      // A pre-creation list can otherwise undo selection through the missing-tab
+      // fallback. Cancel its receipt and include the confirmed blank page first.
+      await queryClient.cancelQueries({ queryKey: tabsQueryKey, exact: true });
+      if (
+        !mountedRef.current ||
+        panelScopeRef.current !== panelScope ||
+        activeViewerTokenRef.current !== viewerToken
+      ) {
+        return;
+      }
+      queryClient.setQueryData<Awaited<ReturnType<typeof listTabs>>>(tabsQueryKey, (previous) => {
+        if (previous?.tabs.some((tab) => tab.id === created.tabId)) return previous;
+        return {
+          tabs: [
+            ...(previous?.tabs ?? []),
+            {
+              id: created.tabId,
+              title: "",
+              url: "about:blank",
+              viewerCount: 0,
+              controllerLabel: null,
+            },
+          ],
+        };
+      });
       setSelectedTabId(created.tabId);
       void tabsQuery.refetch();
     } catch (error) {
