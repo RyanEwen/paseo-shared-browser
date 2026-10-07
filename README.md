@@ -268,8 +268,6 @@ User-supplied `AGENT_BROWSER_*` variables are deliberately ignored.
 - Human control: **Take control**, **Release**, and **Take over** for explicit handoff. Agent MCP
   calls have no forced-takeover operation.
 - With control, mouse movement forwards real hover effects and standard browser cursor changes.
-  Automatic cursors resolve selectable text to an I-beam while respecting explicit
-  cursor styles and non-selectable areas.
   Wheel scrolling stays inside the browser canvas; held drags update before release. Leaving the
   canvas clears remote hover, while dragging beyond its edges still releases the held button.
 - Hidden Linux browsers use an authenticated private virtual display when `/usr/bin/Xvfb`
@@ -411,8 +409,10 @@ Release Please maintains the version, changelog, component tag, and GitHub relea
 Conventional Commits in the monorepo.
 
 Both the Paseo daemon and app must satisfy the version range in `paseo-plugin.json`.
-Paseo 0.11 is required; the tested `0.11.0-beta.3` prerelease is also allowed.
-Earlier releases are not advertised because the plugin uses the 0.11 SDK contract. The client surface uses React Native primitives
+The upstream 0.9, 0.10 and 0.11 ranges remain supported by the manifest;
+the tested `0.11.0-beta.3` prerelease is also allowed. Older daemon/client
+combinations still need runtime qualification. Encoded video requires the
+optional host decoding capability and retains JPEG fallback when unavailable. The client surface uses React Native primitives
 and works in desktop, web, iOS, and Android Paseo clients.
 
 For an initial, not-yet-admitted channel, a wheel capture can finish decoding
@@ -430,3 +430,7 @@ bounds, input admission and recovery. [Remote-control research](REMOTE_BROWSER_R
 records primary-source comparisons and the trade-offs behind continuous human
 input. These describe the implementation's guarantees, not a promise of a
 particular frame rate or remote-network latency.
+
+On Linux, set `PASEO_SHARED_BROWSER_XVFB=0` in the daemon environment to
+retain headless launch behavior for new workspace runtimes. The plugin does
+not install Xvfb or change host display settings.

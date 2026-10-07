@@ -1,4 +1,4 @@
-import { beforeEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { createRuntimeOwner } from "./runtime-owner";
 
 const fake = vi.hoisted(() => ({
@@ -24,7 +24,10 @@ vi.mock("./agent-browser-runtime", () => ({
     }
   },
 }));
+afterEach(() => vi.unstubAllEnvs());
+
 beforeEach(() => {
+  vi.stubEnv("PASEO_SHARED_BROWSER_XVFB", undefined);
   vi.clearAllMocks();
   fake.launch.mockResolvedValue(undefined);
   fake.identity.mockResolvedValue({ targetId: "owned-page" });
@@ -91,4 +94,18 @@ it("refuses runtime requests after private display loss", async () => {
   await expect(owner.request(runtime, "state", null)).rejects.toThrow("ended");
   await owner.stop(runtime);
   expect(fake.stop).toHaveBeenCalledTimes(1);
+});
+
+it("keeps headless mode and never starts Xvfb when the host opts out", async () => {
+  vi.stubEnv("PASEO_SHARED_BROWSER_XVFB", "0");
+  await (await createRuntimeOwner()).create("environment-opt-out");
+  expect(fake.display).not.toHaveBeenCalled();
+  expect(fake.runtime.mock.calls[0]![0]).toMatchObject({ headed: false });
+  expect(fake.runtime.mock.calls[0]![0]).not.toHaveProperty("launchEnvironment");
+});
+
+it("keeps headless mode when the runtime owner explicitly disables virtual displays", async () => {
+  await (await createRuntimeOwner({ virtualDisplay: false })).create("instance-opt-out");
+  expect(fake.display).not.toHaveBeenCalled();
+  expect(fake.runtime.mock.calls[0]![0]).toMatchObject({ headed: false });
 });

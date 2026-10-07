@@ -843,6 +843,122 @@ it("control incarnation replacement still cancels an admitted continuation befor
   expect(f.ended.at(-1)?.cancel).toBe(true);
 });
 
+/** Simulate native idle expiry while the client runs no scheduled cleanup callbacks. */
+function idleFixture() {
+  let clock = 0;
+  const clockSpy = vi.spyOn(performance, "now").mockImplementation(() => clock);
+  const f = fixture(undefined, true);
+  const beginnings: BrowserGestureAuthority[] = [];
+  f.transport.begin = async (input) => {
+    beginnings.push(input);
+    return { state, gestureId: `opaque-${beginnings.length}`, nextSequence: 1 };
+  };
+  const publish = f.transport.update;
+  f.transport.update = async (input) => {
+    if (clock >= 5_000 && input.gestureId === "opaque-1") {
+      throw new Error(
+        "Workspace runtime input.check failed: Live browser input attachment changed",
+      );
+    }
+    return publish(input);
+  };
+  const end = f.transport.end;
+  f.transport.end = async (input) => {
+    if (clock >= 5_000 && input.gestureId === "opaque-1" && !input.cancel) {
+      throw new Error("Browser gesture is unavailable");
+    }
+    return end(input);
+  };
+  return {
+    ...f,
+    beginnings,
+    advanceClock: (elapsedMs: number) => {
+      clock += elapsedMs;
+    },
+    async cleanup() {
+      f.queue.cancel();
+      await flush();
+      clockSpy.mockRestore();
+    },
+  };
+}
+
+it("reopens an empty channel before sending input after suspended idle cleanup", async () => {
+  const f = idleFixture();
+  try {
+    f.queue.enqueue({ kind: "down", button: "left", point: point(1), clickCount: 1 });
+    f.queue.enqueue({ kind: "up", button: "left", point: point(1), clickCount: 1 });
+    await flush();
+    f.changeAuthority(null);
+    // Simulate a paused client: no timer or finish callback ran before native expiry.
+    f.advanceClock(6_000);
+    f.queue.enqueue({ kind: "down", button: "left", point: point(2), clickCount: 1 });
+    await flush();
+    expect(f.errors).toEqual([]);
+    expect(f.beginnings).toHaveLength(2);
+    expect(f.beginnings[1]?.target).toEqual(authority.target);
+    expect(f.sent.map((input) => input.gestureId)).toEqual(["opaque-1", "opaque-1", "opaque-2"]);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+it("retires a late idle finish without addressing the expired channel", async () => {
+  const f = idleFixture();
+  try {
+    f.queue.enqueue(move(1));
+    await flush();
+    f.advanceClock(6_000);
+    f.queue.finish();
+    await flush();
+    expect(f.errors).toEqual([]);
+    expect(f.ended).toEqual([]);
+    expect(f.finishes()).toBe(1);
+    f.changeAuthority(null);
+    expect(f.queue.enqueue(move(2))).toBe(true);
+    await flush();
+    expect(f.beginnings).toHaveLength(2);
+    expect(f.sent.at(-1)?.gestureId).toBe("opaque-2");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+it("never reopens a held channel or replays its rejected release after idle expiry", async () => {
+  const f = idleFixture();
+  try {
+    f.queue.enqueue({ kind: "down", button: "left", point: point(1), clickCount: 1 });
+    await flush();
+    f.advanceClock(6_000);
+    f.queue.enqueue({ kind: "up", button: "left", point: point(1), clickCount: 1 });
+    await flush();
+    expect(f.beginnings).toHaveLength(1);
+    expect(f.sent).toHaveLength(1);
+    expect(f.errors).toHaveLength(1);
+    expect(f.ended).toMatchObject([{ gestureId: "opaque-1", cancel: true }]);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+it("discards suspended idle admission when native control identity changes", async () => {
+  const f = idleFixture();
+  try {
+    f.queue.enqueue(move(1));
+    await flush();
+    f.advanceClock(6_000);
+    f.changeAuthority(null);
+    f.changeControl({ ...authority, controlToken: "replacement-control" });
+    expect(f.queue.enqueue(move(2))).toBe(false);
+    await flush();
+    expect(f.beginnings).toHaveLength(1);
+    expect(f.sent).toHaveLength(1);
+    expect(f.ended).toMatchObject([{ gestureId: "opaque-1", cancel: true }]);
+  } finally {
+    await f.cleanup();
+  }
+});
+
 it("reopens only ACKed same-context geometry after idle closure with no new frame", async () => {
   const f = fixture(undefined, true);
   const beginnings: BrowserGestureAuthority[] = [];
