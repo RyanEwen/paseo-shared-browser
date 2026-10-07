@@ -56,7 +56,7 @@ emulation. Physical-phone software-keyboard behavior and wide/compact visual
 acceptance remain separate checks for these split candidates.
 
 Headless Linux Chromium can lack pointer/hover media even when mouse events work.
-Private Xvfb support is a separate follow-up.
+Private Xvfb support and its opt-out are documented separately in README.
 
 ## Primary references
 

@@ -114,6 +114,8 @@ export interface AgentBrowserRuntimeOptions {
   session: string;
   initialUrl?: string;
   headed?: boolean;
+  /** Trusted private DISPLAY and XAUTHORITY overrides; never mutates host environment. */
+  launchEnvironment?: Readonly<Record<string, string>>;
   timeoutMs?: number;
 }
 
@@ -144,7 +146,10 @@ function requireAbsolute(path: string, label: string): string {
   return resolve(path);
 }
 
-function runtimeEnvironment(ipcDirectory: string): NodeJS.ProcessEnv {
+function runtimeEnvironment(
+  ipcDirectory: string,
+  launchEnvironment?: Readonly<Record<string, string>>,
+): NodeJS.ProcessEnv {
   const environment: NodeJS.ProcessEnv = {};
   for (const key of [
     "PATH",
@@ -172,6 +177,26 @@ function runtimeEnvironment(ipcDirectory: string): NodeJS.ProcessEnv {
   ]) {
     const value = process.env[key];
     if (value !== undefined) environment[key] = value;
+  }
+  if (launchEnvironment !== undefined) {
+    const keys = Object.keys(launchEnvironment);
+    const display = launchEnvironment.DISPLAY;
+    const authority = launchEnvironment.XAUTHORITY;
+    if (
+      keys.length !== 2 ||
+      keys.some((key) => key !== "DISPLAY" && key !== "XAUTHORITY") ||
+      typeof display !== "string" ||
+      !/^:[0-9]{1,5}(?:\.[0-9]{1,2})?$/.test(display) ||
+      typeof authority !== "string" ||
+      !isAbsolute(authority)
+    ) {
+      // Do not include display/authentication values in errors or child arguments.
+      throw new AgentBrowserIncompatibleError("Private browser display environment is invalid");
+    }
+    environment.DISPLAY = display;
+    environment.XAUTHORITY = authority;
+    // A private X11 display must not inherit an unrelated host Wayland session.
+    delete environment.WAYLAND_DISPLAY;
   }
   environment.AGENT_BROWSER_SOCKET_DIR = ipcDirectory;
   environment.AGENT_BROWSER_IDLE_TIMEOUT_MS = "0";
@@ -251,7 +276,7 @@ export class AgentBrowserRuntime {
     this.session = options.session;
     this.headed = options.headed ?? false;
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-    this.environment = runtimeEnvironment(this.ipcDirectory);
+    this.environment = runtimeEnvironment(this.ipcDirectory, options.launchEnvironment);
     this.initialUrl = options.initialUrl ?? "about:blank";
   }
 

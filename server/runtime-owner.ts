@@ -6,16 +6,20 @@ import { AgentBrowserRuntime, type BrowserViewport } from "./agent-browser-runti
 import { resolveBrowserRuntimeRoot } from "./runtime-path";
 import type { JsonValue } from "./runtime-protocol";
 import type { RuntimeOwner } from "./supervisor";
+import { createPrivateVirtualDisplay, type PrivateVirtualDisplay } from "./virtual-display";
 
 const DEFAULT_BROWSER_URL = "https://example.com/";
 
 interface OwnedRuntime {
   runtimeId: string;
   runtime: AgentBrowserRuntime;
+  display: PrivateVirtualDisplay | null;
 }
 interface RuntimeOwnerOptions {
   initialUrl?: string;
   headed?: boolean;
+  /** Explicit false keeps upstream headless launch behavior, including on Linux with Xvfb installed. */
+  virtualDisplay?: boolean;
 }
 
 function paseoHome(): string {
@@ -49,19 +53,50 @@ export async function createRuntimeOwner(
   return {
     async create(workspaceId) {
       const hash = createHash("sha256").update(workspaceId).digest("hex");
-      const runtime = new AgentBrowserRuntime({
-        binaryPath,
-        executablePath,
-        profilePath: join(root, "profiles", hash),
-        ipcDirectory,
-        session: `ws-${hash.slice(0, 16)}`,
-        initialUrl: options.initialUrl ?? DEFAULT_BROWSER_URL,
-        headed: options.headed ?? false,
-      });
-      await runtime.launch();
-      return { runtimeId: randomUUID(), runtime };
+      // Explicit headed mode uses the caller's real display. Hidden Linux mode
+      // gets a private virtual mouse so native pointer media survive emulation.
+      let display: PrivateVirtualDisplay | null = null;
+      if (
+        !options.headed &&
+        options.virtualDisplay !== false &&
+        process.env.PASEO_SHARED_BROWSER_XVFB !== "0"
+      ) {
+        try {
+          display = await createPrivateVirtualDisplay();
+        } catch {
+          // The helper has finished cleanup and no Chromium was constructed yet.
+          // Optional display support must not break existing headless installs.
+          console.warn(
+            "[shared-browser] Private display unavailable; using existing headless mode.",
+          );
+        }
+      }
+      let runtime: AgentBrowserRuntime | null = null;
+      try {
+        runtime = new AgentBrowserRuntime({
+          binaryPath,
+          executablePath,
+          profilePath: join(root, "profiles", hash),
+          ipcDirectory,
+          session: `ws-${hash.slice(0, 16)}`,
+          initialUrl: options.initialUrl ?? DEFAULT_BROWSER_URL,
+          headed: display ? true : (options.headed ?? false),
+          ...(display ? { launchEnvironment: display.launchEnvironment } : {}),
+        });
+        await runtime.launch();
+        display?.assertAvailable();
+        return { runtimeId: randomUUID(), runtime, display };
+      } catch (error) {
+        try {
+          await runtime?.shutdown();
+        } finally {
+          await display?.stop();
+        }
+        throw error;
+      }
     },
     async request(owned, operation, input) {
+      owned.display?.assertAvailable();
       const data =
         input && typeof input === "object" && !Array.isArray(input)
           ? (input as Record<string, JsonValue>)
@@ -212,7 +247,11 @@ export async function createRuntimeOwner(
       }
     },
     async stop(owned) {
-      await owned.runtime.shutdown();
+      try {
+        await owned.runtime.shutdown();
+      } finally {
+        await owned.display?.stop();
+      }
     },
   };
 }

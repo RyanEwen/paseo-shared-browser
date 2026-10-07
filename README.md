@@ -275,3 +275,16 @@ returns a known non-admission receipt before creating a new channel; the canvas 
 for another decoded frame before admitting that still-unsent gesture. Recovery allows
 up to three admission attempts within one four-second decoded-frame wait budget.
 Published input, unknown outcomes, expired leases, and replaced contexts are never retried.
+
+
+## Optional Linux desktop hover
+
+When Xvfb is already installed, hidden Linux browsers use an owned private
+display to expose desktop pointer and hover behavior. No visible window opens
+and no TCP or pathname listener is created. The display is stopped with its
+browser, and unavailable Xvfb retains headless behavior.
+
+Set `PASEO_SHARED_BROWSER_XVFB=0` in the daemon environment to opt out and keep
+the original headless launch behavior. The setting applies when a browser runtime
+is created; it does not replace existing workspace runtimes. The plugin never
+installs Xvfb or changes host display settings.
