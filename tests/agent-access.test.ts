@@ -900,6 +900,66 @@ describe("agent shared-browser authorization", () => {
     ).rejects.toThrow("lease is invalid or expired");
   });
 
+  it("opens exactly one new tab after an idle agent viewer expires", async () => {
+    let now = 1_000;
+    const { owner, supervisor, bridge } = createHarness(() => now);
+    const original = owner.request.bind(owner);
+    let creations = 0;
+    owner.request = async (runtime, operation, input) => {
+      const data = input as Record<string, JsonValue> | null;
+      if (operation === "identity") {
+        return { targetId: data?.targetId ?? "page-one", userAgent: "Fake Chromium" };
+      }
+      if (operation === "tabs.create") {
+        creations++;
+        return { targetId: "page-two" };
+      }
+      return original(runtime, operation, input);
+    };
+    const agentTicket = ticket("idle-tab-open");
+    await issueTicket(supervisor, bridge, agentTicket);
+    await bindTicket(supervisor, bridge, agentTicket, "agent-one", "workspace-one");
+    await agentRequest(supervisor, agentTicket, "status");
+    now = 30_000;
+    supervisor.heartbeat(bridge.bridgeId, bridge.epoch);
+    now = 46_001;
+    // Human attachment prunes the expired agent viewer before the open request.
+    await browserRequest(supervisor, bridge, "attach", {
+      workspaceId: "workspace-one",
+      viewerLabel: "Human",
+    });
+    await expect(agentRequest(supervisor, agentTicket, "tabs.create")).resolves.toMatchObject({
+      tabId: "page-two",
+      state: { tabId: "page-two" },
+    });
+    expect(creations).toBe(1);
+  });
+
+  it("reselects the same tab and reacquires control after its viewer expires", async () => {
+    let now = 1_000;
+    const { owner, supervisor, bridge } = createHarness(() => now);
+    const original = owner.request.bind(owner);
+    owner.request = async (runtime, operation, input) => {
+      if (operation === "identity") {
+        return { targetId: "page-one", userAgent: "Fake Chromium" };
+      }
+      return original(runtime, operation, input);
+    };
+    const agentTicket = ticket("idle-tab-select");
+    await issueTicket(supervisor, bridge, agentTicket);
+    await bindTicket(supervisor, bridge, agentTicket, "agent-one", "workspace-one");
+    await agentRequest(supervisor, agentTicket, "acquire-control");
+    now = 30_000;
+    supervisor.heartbeat(bridge.bridgeId, bridge.epoch);
+    now = 46_001;
+    await expect(
+      agentRequest(supervisor, agentTicket, "tabs.select", { tabId: "page-one" }),
+    ).resolves.toMatchObject({ state: { tabId: "page-one", controller: "none" } });
+    await expect(agentRequest(supervisor, agentTicket, "acquire-control")).resolves.toMatchObject({
+      state: { tabId: "page-one", controller: "self" },
+    });
+  });
+
   it("archives the runtime and permanently fences every ticket bound to its workspace", async () => {
     const { owner, supervisor, bridge } = createHarness();
     const agentTicket = ticket("archive");

@@ -354,6 +354,11 @@ bun run check
 bun run test:unit
 ```
 
+The `test:tabs` native check requires explicit
+`PASEO_SHARED_BROWSER_AGENT_BROWSER_BINARY` and
+`PASEO_SHARED_BROWSER_CHROMIUM_EXECUTABLE` paths. It creates and cleans up its own
+temporary Paseo home and browser profile.
+
 `node scripts/test-image-capture-mounted.mjs --tooling-root /path/to/test-workspace`
 opt-in checks the real React/React Query image scheduling and viewing recovery hooks
 in JSDOM. The tooling workspace must already provide compatible React, react-dom,
