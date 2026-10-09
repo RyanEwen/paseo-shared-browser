@@ -9,6 +9,7 @@ import {
   type BrowserViewport,
   type RuntimeTarget,
 } from "./agent-browser-runtime";
+import { readBrowserGraphicsMode } from "./browser-graphics";
 import { resolveBrowserRuntimeRoot } from "./runtime-path";
 import type { JsonValue } from "./runtime-protocol";
 import type { RuntimeOwner } from "./supervisor";
@@ -135,6 +136,7 @@ export async function createRuntimeOwner(
       let runtime: AgentBrowserRuntime | null = null;
       try {
         const runtimeOptions: AgentBrowserRuntimeOptions = {
+          graphicsMode: readBrowserGraphicsMode(home),
           binaryPath,
           executablePath,
           profilePath: join(root, "profiles", hash),

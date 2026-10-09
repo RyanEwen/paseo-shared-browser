@@ -148,8 +148,24 @@ The plugin recognizes only these deployment overrides:
 | `PASEO_SHARED_BROWSER_AGENT_BROWSER_BINARY` | Absolute path to the pinned `agent-browser` executable. Defaults to the active runtime's `node_modules/.bin/agent-browser` (`agent-browser.exe` on Windows). |
 | `PASEO_SHARED_BROWSER_CHROMIUM_EXECUTABLE`  | Absolute path to Chromium. Defaults to the active runtime's `chromium/chrome` (`chrome.exe` on Windows). On Linux ARM64, installation automatically links `/usr/bin/chromium`; use this override for another compatible, non-Snap location. |
 | `PASEO_SHARED_BROWSER_CHROMIUM_ARGS`        | Optional Chromium arguments passed through the managed runtime. Intended for host requirements such as `--no-sandbox` in an already-isolated CI runner; do not disable the browser sandbox on a general-purpose host.                                                 |
+| `PASEO_SHARED_BROWSER_GRAPHICS` | `default` keeps Chromium's normal graphics selection. `wsl-d3d12` enables hardware WebGL through WSL's Mesa Direct3D 12 driver, including with the private display. Requires WSL GPU access, a compatible Windows GPU driver, Mesa's D3D12 driver, and the WSL libraries in `/usr/lib/wsl/lib`. Startup fails if Chromium selects software rendering. |
 
 User-supplied `AGENT_BROWSER_*` variables are deliberately ignored.
+
+Set `PASEO_SHARED_BROWSER_GRAPHICS=wsl-d3d12` in the daemon host's environment to
+opt into hardware rendering on WSL. It supplies the driver and library settings
+only to the managed browser processes. It does not install drivers or change host
+display settings. The setting takes effect when a new supervisor/browser runtime
+starts; an already-running browser keeps its existing graphics backend. Other
+platforms should keep `default`. Hardware rendering does not imply hardware video
+encoding, which remains a separate browser capability.
+
+For a persistent selection without changing the daemon's environment, put
+`{"mode":"wsl-d3d12"}` in
+`$PASEO_HOME/plugin-data/shared-browser/graphics.json`. New browser runtimes read
+this file; already-running browsers keep their backend. Use `{"mode":"default"}`
+or remove the file to return to normal selection. An explicit
+`PASEO_SHARED_BROWSER_GRAPHICS` environment value overrides the file.
 
 ## Controls
 
@@ -354,10 +370,13 @@ bun run check
 bun run test:unit
 ```
 
-The `test:tabs` native check requires explicit
+The `test:tabs` and `test:graphics` native checks require explicit
 `PASEO_SHARED_BROWSER_AGENT_BROWSER_BINARY` and
-`PASEO_SHARED_BROWSER_CHROMIUM_EXECUTABLE` paths. It creates and cleans up its own
-temporary Paseo home and browser profile.
+`PASEO_SHARED_BROWSER_CHROMIUM_EXECUTABLE` paths. Both create and clean up their
+own temporary Paseo home and browser profile. The hardware check also requires
+`PASEO_SHARED_BROWSER_GRAPHICS=wsl-d3d12`; it verifies both WebGL versions render
+the expected pixel on a D3D12 GPU and that the page can be captured. Run native
+GPU checks sequentially to avoid competing for graphics resources.
 
 `node scripts/test-image-capture-mounted.mjs --tooling-root /path/to/test-workspace`
 opt-in checks the real React/React Query image scheduling and viewing recovery hooks

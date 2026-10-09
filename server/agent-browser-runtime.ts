@@ -30,6 +30,12 @@ import {
 import { resolveVideoEncoderSettings } from "../shared/video-settings";
 import { browserCursorExpression } from "./browser-cursor";
 import { GESTURE_IDLE_MS, GESTURE_LIFETIME_MS } from "./browser-gesture";
+import {
+  assertWslHardwareRenderer,
+  type BrowserGraphicsConfiguration,
+  type BrowserGraphicsMode,
+  resolveBrowserGraphics,
+} from "./browser-graphics";
 import { CAPTURE_MAX_AGE_MS, createCaptureTransportPolicy } from "./capture-transport-policy";
 import { formatRuntimeInputGeneration } from "./input-generation";
 import { createJpegCaptureDemand } from "./jpeg-capture-demand";
@@ -130,6 +136,8 @@ export interface DeviceEmulation extends BrowserViewport {
 export type MouseButton = "left" | "middle" | "right";
 
 export interface AgentBrowserRuntimeOptions {
+  /** Host-persisted mode; omission uses the explicit graphics environment override or default. */
+  graphicsMode?: BrowserGraphicsMode;
   binaryPath: string;
   executablePath: string;
   profilePath: string;
@@ -248,6 +256,7 @@ function findString(value: unknown, keys: readonly string[]): string | null {
 }
 
 export class AgentBrowserRuntime {
+  private readonly graphics: BrowserGraphicsConfiguration;
   readonly binaryPath: string;
   readonly executablePath: string;
   readonly profilePath: string;
@@ -309,7 +318,11 @@ export class AgentBrowserRuntime {
     this.session = options.session;
     this.headed = options.headed ?? false;
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-    this.environment = runtimeEnvironment(this.ipcDirectory, options.launchEnvironment);
+    this.graphics = resolveBrowserGraphics(options.graphicsMode);
+    this.environment = {
+      ...runtimeEnvironment(this.ipcDirectory, options.launchEnvironment),
+      ...this.graphics.environment,
+    };
     this.initialUrl = options.initialUrl ?? "about:blank";
   }
 
@@ -330,6 +343,7 @@ export class AgentBrowserRuntime {
     this.assertRuntimeOpen();
     const existingArguments = process.env.PASEO_SHARED_BROWSER_CHROMIUM_ARGS;
     const chromiumArguments = [
+      ...this.graphics.chromiumArguments,
       existingArguments,
       // agent-browser creates the launch page itself. Chromium's default
       // startup window otherwise leaves an additional chrome://newtab page.
@@ -361,6 +375,12 @@ export class AgentBrowserRuntime {
     await this.protectIpcMetadata();
     this.assertRuntimeOpen();
     await this.connectCdp(targetId);
+    if (this.graphics.mode === "wsl-d3d12") {
+      const info = await this.requireConnection().send<{
+        gpu: { auxAttributes?: { glRenderer?: string } };
+      }>("SystemInfo.getInfo");
+      assertWslHardwareRenderer(info.gpu.auxAttributes?.glRenderer);
+    }
   }
 
   /** Attach an independent page controller to an existing browser session. */
