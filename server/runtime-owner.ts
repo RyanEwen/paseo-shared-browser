@@ -7,6 +7,7 @@ import {
   AgentBrowserRuntime,
   type AgentBrowserRuntimeOptions,
   type BrowserViewport,
+  type RuntimeTarget,
 } from "./agent-browser-runtime";
 import { resolveBrowserRuntimeRoot } from "./runtime-path";
 import type { JsonValue } from "./runtime-protocol";
@@ -21,6 +22,7 @@ interface OwnedRuntime {
   rootTargetId: string;
   runtimeOptions: AgentBrowserRuntimeOptions;
   tabs: Map<string, Promise<AgentBrowserRuntime>>;
+  tabOrder: string[];
   display: PrivateVirtualDisplay | null;
 }
 interface RuntimeOwnerOptions {
@@ -37,6 +39,22 @@ function optionalMouseModifiers(data: Record<string, JsonValue>): [] | [number] 
   return data.modifiers === undefined
     ? []
     : [browserGestureKeySchema.shape.modifiers.parse(data.modifiers)];
+}
+
+/** Retain known tab positions across unordered CDP snapshots; append newly discovered pages. */
+async function orderedTargets(owned: OwnedRuntime): Promise<RuntimeTarget[]> {
+  const targets = await owned.runtime.targets();
+  const byId = new Map(targets.map((target) => [target.targetId, target]));
+  const surviving = owned.tabOrder.filter((targetId) => byId.has(targetId));
+  const known = new Set(surviving);
+  for (const target of targets) {
+    if (!known.has(target.targetId)) {
+      surviving.push(target.targetId);
+      known.add(target.targetId);
+    }
+  }
+  owned.tabOrder = surviving;
+  return surviving.map((targetId) => byId.get(targetId)!);
 }
 
 /** Give each page its own CDP attachment and media state within one Chromium profile. */
@@ -130,6 +148,7 @@ export async function createRuntimeOwner(
           rootTargetId: identity.targetId,
           runtimeOptions,
           tabs: new Map(),
+          tabOrder: [identity.targetId],
           display,
         };
       } catch (error) {
@@ -148,20 +167,22 @@ export async function createRuntimeOwner(
           ? (input as Record<string, JsonValue>)
           : {};
       if (operation === "tabs.list") {
-        return (await owned.runtime.targets()).map(({ targetId, title, url }) => ({
+        return (await orderedTargets(owned)).map(({ targetId, title, url }) => ({
           targetId,
           title,
           url,
         }));
       }
       if (operation === "tabs.create") {
-        if ((await owned.runtime.targets()).length >= MAX_BROWSER_TABS)
+        if ((await orderedTargets(owned)).length >= MAX_BROWSER_TABS)
           throw new Error("Browser tab limit reached");
-        return { targetId: await owned.runtime.createTarget() };
+        const targetId = await owned.runtime.createTarget();
+        owned.tabOrder.push(targetId);
+        return { targetId };
       }
       if (operation === "tabs.close") {
         const targetId = String(data.targetId);
-        const targets = await owned.runtime.targets();
+        const targets = await orderedTargets(owned);
         if (!targets.some((target) => target.targetId === targetId)) {
           throw new Error("Browser tab is no longer available");
         }
@@ -177,6 +198,7 @@ export async function createRuntimeOwner(
         }
         await owned.runtime.closeTarget(targetId);
         owned.tabs.delete(targetId);
+        owned.tabOrder = owned.tabOrder.filter((id) => id !== targetId);
         return null;
       }
       const targetId = typeof data.targetId === "string" ? data.targetId : null;

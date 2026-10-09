@@ -331,6 +331,9 @@ export class AgentBrowserRuntime {
     const existingArguments = process.env.PASEO_SHARED_BROWSER_CHROMIUM_ARGS;
     const chromiumArguments = [
       existingArguments,
+      // agent-browser creates the launch page itself. Chromium's default
+      // startup window otherwise leaves an additional chrome://newtab page.
+      "--no-startup-window",
       `--allowlisted-extension-id=${NATIVE_VIDEO_EXTENSION_ID}`,
     ]
       .filter(Boolean)

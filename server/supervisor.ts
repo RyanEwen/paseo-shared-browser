@@ -625,7 +625,10 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
       return { state: await this.selectAgentTab(binding, tabId) } as unknown as JsonValue;
     }
     if (operation === "tabs.create") {
-      const viewerToken = await this.ensureAgentViewer(binding);
+      // Recover an idle viewer before issuing the non-idempotent create. Never
+      // replay creation if its result or the subsequent selection is uncertain.
+      await this.requestAgentObservation(binding, "status", {});
+      const viewerToken = binding.viewerToken!;
       const created = await this.browserPolicy.createTab(viewerToken);
       return {
         tabId: created.tabId,
@@ -792,8 +795,8 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
   private async selectAgentTab(binding: AgentBinding, tabId: string): Promise<BrowserState> {
     this.assertAgentBindingCurrent(binding);
     if (binding.tabId === tabId && binding.viewerToken) {
-      const current = await this.browserPolicy.status(binding.viewerToken);
-      this.assertAgentBindingCurrent(binding);
+      // Same-tab selection needs the same expiry recovery as status/capture.
+      const current = await this.requestAgentObservation(binding, "status", {});
       if (binding.tabId !== tabId) {
         throw new RuntimeProtocolError("INVALID_REQUEST", "Agent tab changed during selection");
       }
