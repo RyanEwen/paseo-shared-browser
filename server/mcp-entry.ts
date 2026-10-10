@@ -85,12 +85,43 @@ async function main(): Promise<void> {
     ticket,
     paths: resolveSupervisorPaths(paseoHome()),
   });
-  await client.open();
+  // Keep recovery tools available even when the supervisor connection is stale.
+  await client.open().catch(() => undefined);
 
   const server = new McpServer({
     name: "paseo-shared-browser",
     version: "0.2.2",
   });
+
+  server.registerTool(
+    "shared_browser_reconnect",
+    {
+      description:
+        "Reconnect this agent to its existing workspace browser and selected tab. Preserves tabs and drafts, discards old frames and control, and never replays actions. Capture and acquire control again before input. Does not reopen a deliberately closed browser.",
+      inputSchema: z.object({}),
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+      },
+    },
+    async () => textResult(await client.reconnect()),
+  );
+
+  server.registerTool(
+    "shared_browser_open",
+    {
+      description:
+        "Explicitly start or reopen this agent's workspace browser and reconnect. Reuses an already running profile and tabs without navigation or control takeover. A previously closed browser starts a new runtime; unsaved drafts from a stopped runtime cannot be recovered.",
+      inputSchema: z.object({}),
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+      },
+    },
+    async () => textResult(await client.reconnect(true)),
+  );
 
   server.registerTool(
     "shared_browser_status",
@@ -147,7 +178,11 @@ async function main(): Promise<void> {
     {
       description: "Open and select a new tab in the shared browser profile for this agent only.",
       inputSchema: z.object({}),
-      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+      },
     },
     async () => textResult(await client.request("tabs.create", {})),
   );
@@ -158,7 +193,11 @@ async function main(): Promise<void> {
       description:
         "Select an existing tab for this agent only. Capture its current frame before sending input.",
       inputSchema: z.object({ tabId: browserTabIdSchema }),
-      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+      },
     },
     async ({ tabId }) => textResult(await client.request("tabs.select", { tabId })),
   );
@@ -169,7 +208,11 @@ async function main(): Promise<void> {
       description:
         "Close this agent's selected and controlled tab for every viewer. Other tabs remain open.",
       inputSchema: z.object({}),
-      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: false,
+      },
     },
     async () => textResult(await client.request("tabs.close", {})),
   );
@@ -275,7 +318,11 @@ async function main(): Promise<void> {
       description:
         "Apply the same device or display preset as the human picker, including sharper Pixel capture. Requires control and reloads the current page.",
       inputSchema: z.object({ presetId: z.enum(DEVICE_PRESET_IDS) }),
-      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+      },
     },
     async ({ presetId }) => textResult(await client.request("device", { presetId })),
   );

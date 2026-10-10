@@ -21,6 +21,7 @@ import {
 } from "../shared/browser";
 import { readBrowserVideoRpc } from "../shared/browser-video";
 import { DEFAULT_CAPTURE_QUALITY } from "../shared/capture-settings";
+import { AgentBindingStore } from "./agent-binding-store";
 import { SessionManager } from "./browser-policy";
 import { CdpUnknownOutcomeError } from "./cdp";
 import {
@@ -68,6 +69,7 @@ export interface RuntimeOwner<Runtime extends RuntimeInstance = RuntimeInstance>
 
 export interface RuntimeSupervisorOptions<Runtime extends RuntimeInstance> {
   owner: RuntimeOwner<Runtime>;
+  agentBindingStore?: AgentBindingStore;
   now?: () => number;
   orphanGraceMs?: number;
   heartbeatIntervalMs?: number;
@@ -113,6 +115,7 @@ interface AgentPublicationContext {
 
 export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance> {
   private readonly owner: RuntimeOwner<Runtime>;
+  private readonly agentBindingStore: AgentBindingStore | undefined;
   private readonly now: () => number;
   private readonly orphanGraceMs: number;
   private readonly heartbeatIntervalMs: number;
@@ -136,6 +139,7 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
 
   constructor(options: RuntimeSupervisorOptions<Runtime>) {
     this.owner = options.owner;
+    this.agentBindingStore = options.agentBindingStore;
     this.now = options.now ?? Date.now;
     this.orphanGraceMs = options.orphanGraceMs ?? DEFAULT_ORPHAN_GRACE_MS;
     this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? DEFAULT_BRIDGE_HEARTBEAT_MS;
@@ -284,7 +288,11 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
         entry = await creation;
       }
       if (this.archived.has(workspaceId)) this.workspaceArchived(workspaceId);
-      return { workspaceId, runtimeId: entry.runtime.runtimeId, createdAt: entry.createdAt };
+      return {
+        workspaceId,
+        runtimeId: entry.runtime.runtimeId,
+        createdAt: entry.createdAt,
+      };
     });
   }
 
@@ -361,6 +369,7 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
 
   private archiveWorkspaceLocal(workspaceId: string): Promise<{ archived: true }> {
     this.archived.add(workspaceId);
+    this.agentBindingStore?.revokeWorkspace(workspaceId);
     return this.runWorkspaceOperation(workspaceId, async () => {
       const creation = this.creations.get(workspaceId);
       if (creation) await creation.catch(() => undefined);
@@ -469,7 +478,9 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
         this.invalidateAgentObservationsForState(result);
         break;
       case "list":
-        result = { workspaceIds: await this.browserPolicy.listOpenWorkspaceIds() };
+        result = {
+          workspaceIds: await this.browserPolicy.listOpenWorkspaceIds(),
+        };
         break;
       case "tabs.list":
         result = await this.browserPolicy.listTabsForViewer(requireText(data, "viewerToken"));
@@ -550,6 +561,17 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
     if (this.archived.has(workspaceId)) this.workspaceArchived(workspaceId);
     if (binding.agentId && (binding.agentId !== agentId || binding.workspaceId !== workspaceId))
       throw new RuntimeProtocolError("AUTHENTICATION_FAILED", "Agent ticket is already bound");
+    const saved = this.agentBindingStore?.get(ticket);
+    if (saved && (saved.agentId !== agentId || saved.workspaceId !== workspaceId)) {
+      throw new RuntimeProtocolError("AUTHENTICATION_FAILED", "Agent ticket is already bound");
+    }
+    // A resumed trusted launch renews identity without forgetting its saved tab.
+    if (!binding.agentId && saved) binding.tabId = saved.tabId;
+    this.agentBindingStore?.set(ticket, {
+      agentId,
+      workspaceId,
+      tabId: binding.tabId,
+    });
     binding.agentId = agentId;
     binding.workspaceId = workspaceId;
     let tickets = this.agentTickets.get(agentId);
@@ -563,6 +585,7 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
 
   private async revokeAgent(bridgeId: string, epoch: number, agentId: string): Promise<JsonValue> {
     this.assertActiveBridge(bridgeId, epoch);
+    this.agentBindingStore?.revokeAgent(agentId);
     const tickets = this.agentTickets.get(agentId);
     if (!tickets) return { revoked: 0 };
     const viewers: string[] = [];
@@ -583,6 +606,9 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
   /** Carry exact ticket identity through awaited policy and native publication. */
   private requestAgent(ticket: string, operation: string, input: JsonValue): Promise<JsonValue> {
     this.assertPluginAvailable();
+    if (operation === "reconnect" || operation === "open") {
+      return this.reconnectAgent(ticket, operation === "open");
+    }
     const binding = this.requireAgentBinding(ticket);
     const execute = () => this.executeAgentRequest(binding, operation, input);
     // Attachment constructs shared session state; its late viewer is removed
@@ -607,6 +633,42 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
     );
   }
 
+  /** Explicit recovery never replays inputs or inherits a control lease/frame. */
+  private async reconnectAgent(ticket: string, openBrowser: boolean): Promise<JsonValue> {
+    this.assertPluginAvailable();
+    let binding = this.agentBindings.get(ticket);
+    if (!binding?.agentId || !binding.workspaceId) {
+      const saved = this.agentBindingStore?.get(ticket);
+      if (!saved) {
+        throw new RuntimeProtocolError(
+          "AUTHENTICATION_FAILED",
+          "Agent ticket is invalid or unbound and has no recovery registration. Resume through a trusted launch or create a fresh agent.",
+        );
+      }
+      const bridge = this.activeBridge!;
+      if (!binding) this.issueAgentTicket(bridge.bridgeId, bridge.epoch, ticket);
+      this.bindAgentTicket(bridge.bridgeId, bridge.epoch, ticket, saved.agentId, saved.workspaceId);
+      binding = this.requireAgentBinding(ticket);
+      binding.tabId = saved.tabId;
+      this.saveAgentSelection(binding);
+    }
+    this.assertAgentBindingCurrent(binding);
+    const viewerToken = binding.viewerToken;
+    // Fence any outstanding input before asynchronous viewer cleanup.
+    binding.selectionRevision += 1;
+    binding.viewerToken = null;
+    binding.controlToken = null;
+    binding.lastFrame = null;
+    binding.lastState = null;
+    if (viewerToken) await this.browserPolicy.detach(viewerToken);
+    this.assertAgentBindingCurrent(binding);
+    if (openBrowser) {
+      await this.browserPolicy.reopenBrowser(binding.workspaceId!);
+      this.assertAgentBindingCurrent(binding);
+    }
+    return (await this.requestAgentObservation(binding, "status", {})) as unknown as JsonValue;
+  }
+
   private async executeAgentRequest(
     binding: AgentBinding,
     operation: string,
@@ -622,7 +684,9 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
     }
     if (operation === "tabs.select") {
       const tabId = requireText(data, "tabId");
-      return { state: await this.selectAgentTab(binding, tabId) } as unknown as JsonValue;
+      return {
+        state: await this.selectAgentTab(binding, tabId),
+      } as unknown as JsonValue;
     }
     if (operation === "tabs.create") {
       // Recover an idle viewer before issuing the non-idempotent create. Never
@@ -651,7 +715,9 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
       const { tabs } = await this.browserPolicy.listTabs(binding.workspaceId!);
       const next = tabs[0];
       if (!next) throw new RuntimeProtocolError("RUNTIME_FAILURE", "Browser has no remaining tab");
-      return { state: await this.selectAgentTab(binding, next.id) } as unknown as JsonValue;
+      return {
+        state: await this.selectAgentTab(binding, next.id),
+      } as unknown as JsonValue;
     }
     try {
       if (operation === "acquire-control") {
@@ -787,6 +853,7 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
     }
     binding.lastState = result.state;
     binding.tabId = result.state.tabId ?? null;
+    this.saveAgentSelection(binding);
     if (operation === "capture") binding.lastFrame = result.frame ?? null;
     return result;
   }
@@ -824,6 +891,7 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
       this.assertAgentBindingCurrent(binding);
       binding.viewerToken = attached.viewerToken;
       binding.tabId = attached.state.tabId ?? tabId;
+      this.saveAgentSelection(binding);
       binding.controlToken = null;
       binding.lastState = attached.state;
       binding.lastFrame = null;
@@ -865,7 +933,20 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
     binding.viewerToken = attached.viewerToken;
     binding.lastState = attached.state;
     binding.tabId = attached.state.tabId ?? null;
+    this.saveAgentSelection(binding);
     return attached.viewerToken;
+  }
+
+  /** Persist selection only when it changes; runtime content and leases stay volatile. */
+  private saveAgentSelection(binding: AgentBinding): void {
+    if (!this.agentBindingStore || !binding.agentId || !binding.workspaceId) return;
+    const previous = this.agentBindingStore.get(binding.ticket);
+    if (previous?.tabId === binding.tabId) return;
+    this.agentBindingStore.set(binding.ticket, {
+      agentId: binding.agentId,
+      workspaceId: binding.workspaceId,
+      tabId: binding.tabId,
+    });
   }
 
   /** A deleted or replaced ticket cannot regain authority after an awaited step. */
@@ -915,6 +996,7 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
   }
 
   private async revokeWorkspace(workspaceId: string): Promise<void> {
+    this.agentBindingStore?.revokeWorkspace(workspaceId);
     const viewers: string[] = [];
     for (const [ticket, binding] of this.agentBindings) {
       if (binding.workspaceId !== workspaceId) continue;
@@ -1217,7 +1299,9 @@ export async function acquireStartupLock(path: string): Promise<() => Promise<vo
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
       await mkdir(path, { mode: DIRECTORY_MODE });
-      await writeFile(join(path, "pid"), String(process.pid), { mode: FILE_MODE });
+      await writeFile(join(path, "pid"), String(process.pid), {
+        mode: FILE_MODE,
+      });
       return async () => rm(path, { recursive: true, force: true });
     } catch (error) {
       if (!isNodeError(error) || error.code !== "EEXIST") throw error;
@@ -1234,9 +1318,15 @@ export async function acquireStartupLock(path: string): Promise<() => Promise<vo
 export async function startSupervisorServer<Runtime extends RuntimeInstance>(
   owner: RuntimeOwner<Runtime>,
   paths = resolveSupervisorPaths(),
-): Promise<{ close: () => Promise<void>; supervisor: RuntimeSupervisor<Runtime> }> {
+): Promise<{
+  close: () => Promise<void>;
+  supervisor: RuntimeSupervisor<Runtime>;
+}> {
   const releaseLock = await acquireStartupLock(paths.lock);
-  const supervisor = new RuntimeSupervisor({ owner });
+  const supervisor = new RuntimeSupervisor({
+    owner,
+    agentBindingStore: new AgentBindingStore(join(paths.root, "agent-bindings.json")),
+  });
   const sockets = new Set<Socket>();
   let globalInFlight = 0;
   let globalMediaInFlight = 0;
@@ -1399,7 +1489,10 @@ export async function startSupervisorServer<Runtime extends RuntimeInstance>(
     if (process.platform !== "win32") await chmod(paths.socket, SOCKET_MODE);
     await writeFile(
       paths.endpoint,
-      JSON.stringify({ version: RUNTIME_PROTOCOL_VERSION, socket: paths.socket }),
+      JSON.stringify({
+        version: RUNTIME_PROTOCOL_VERSION,
+        socket: paths.socket,
+      }),
       { mode: FILE_MODE },
     );
     await chmod(paths.endpoint, FILE_MODE);
@@ -1493,10 +1586,18 @@ async function handleLine<Runtime extends RuntimeInstance>(
   line: string,
   token: string,
   supervisor: RuntimeSupervisor<Runtime>,
-): Promise<{ response: RuntimeResponse; lease: { bridgeId: string; epoch: number } | null }> {
+): Promise<{
+  response: RuntimeResponse;
+  lease: { bridgeId: string; epoch: number } | null;
+}> {
   let id = "unknown";
   try {
     const raw: unknown = JSON.parse(line);
+    // Preserve correlation even when schema validation rejects the operation.
+    // Otherwise the caller waits forever for a response carrying its own ID.
+    if (raw && typeof raw === "object" && "id" in raw && typeof raw.id === "string") {
+      id = raw.id;
+    }
     const request = parseRuntimeRequest(raw);
     id = request.id;
     if (request.method !== "agent.request" && !tokensEqual(request.token, token))

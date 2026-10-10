@@ -318,3 +318,52 @@ describe("runtime installation compatibility", () => {
     expect(pluginPackage.files).toContain("scripts/replace-runtime.mjs");
   });
 });
+
+
+describe("agent binding renewal on session open", () => {
+  function captureSessionHook() {
+    let hook: ((input: { request: Record<string, unknown> }) => Promise<unknown>) | undefined;
+    contribute({
+      registerSettings: vi.fn(), handle: vi.fn(), on: vi.fn(),
+      before: vi.fn((name: string, handler: unknown) => {
+        if (name === "agent.session_open") hook = handler as typeof hook;
+        return () => {};
+      }),
+    } as never);
+    if (!hook) throw new Error("Session hook missing");
+    return hook;
+  }
+
+  for (const reason of ["create", "resume", "refresh", "import"]) {
+    it(`binds trusted interactive ${reason} launches and retains the renewal override`, async () => {
+      browserMocks.bindAgentTicket.mockReset();
+      const request = {
+        reason, purpose: "interactive", agentId: "agent-one", workspaceId: "workspace-one",
+        env: { PASEO_SHARED_BROWSER_TICKET: "private-credential" },
+      };
+      await expect(captureSessionHook()({ request })).resolves.toBe(request);
+      expect(browserMocks.bindAgentTicket).toHaveBeenCalledWith("private-credential", "agent-one", "workspace-one");
+    });
+  }
+
+  it("reissues an unknown ticket only through the trusted launch hook", async () => {
+    browserMocks.issueAgentTicket.mockClear();
+    browserMocks.bindAgentTicket.mockRejectedValueOnce(new Error("Unknown agent ticket"));
+    const request = {
+      reason: "resume", purpose: "interactive", agentId: "agent-one", workspaceId: "workspace-one",
+      env: { PASEO_SHARED_BROWSER_TICKET: "private-credential" },
+    };
+    await captureSessionHook()({ request });
+    expect(browserMocks.issueAgentTicket).toHaveBeenCalledWith("private-credential");
+  });
+
+  it("does not issue browser authority to history-only launches", async () => {
+    browserMocks.bindAgentTicket.mockClear();
+    const request = {
+      reason: "resume", purpose: "history", agentId: "agent-one", workspaceId: "workspace-one",
+      env: { PASEO_SHARED_BROWSER_TICKET: "private-credential" },
+    };
+    await captureSessionHook()({ request });
+    expect(browserMocks.bindAgentTicket).not.toHaveBeenCalled();
+  });
+});

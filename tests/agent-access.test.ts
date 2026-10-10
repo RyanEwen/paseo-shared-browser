@@ -2,6 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { AgentBindingStore } from "../server/agent-binding-store";
 import { CdpUnknownOutcomeError } from "../server/cdp";
 import {
   type AgentBrowserOperation,
@@ -982,4 +983,159 @@ describe("agent shared-browser authorization", () => {
       bindTicket(supervisor, bridge, lateTicket, "agent-two", "workspace-one"),
     ).rejects.toMatchObject({ code: "WORKSPACE_ARCHIVED" });
   });
+});
+
+
+describe("explicit agent connection recovery", () => {
+  it("reconnects a disconnected socket without replacing the runtime or retaining control", async () => {
+    const root = await mkdtemp(join(tmpdir(), "shared-browser-reconnect-"));
+    const paths = resolveSupervisorPaths(root);
+    const owner = new AgentRuntimeOwner();
+    const server = await startSupervisorServer(owner, paths);
+    const admin = new SupervisorClient({ bridgeId: "plugin-bridge", paths });
+    const credential = ticket("reconnect");
+    const agent = new AgentSupervisorClient({ ticket: credential, paths });
+    try {
+      await admin.connect();
+      await admin.issueAgentTicket(credential);
+      await admin.bindAgentTicket(credential, "agent-one", "workspace-one");
+      await agent.open();
+      const original = (await agent.request("status", {})) as unknown as {
+        state: BrowserState;
+      };
+      await agent.request("capture", {});
+      await agent.request("acquire-control", {});
+      await expect(agent.request("unsupported-operation" as AgentBrowserOperation, {}))
+        .rejects.toMatchObject({ code: "INVALID_REQUEST" });
+      agent.disconnect();
+      const recovered = (await agent.reconnect()) as unknown as {
+        state: BrowserState;
+      };
+      expect(recovered.state.runtimeId).toBe(original.state.runtimeId);
+      expect(recovered.state.tabId).toBe(original.state.tabId);
+      expect(recovered.state.controller).toBe("none");
+      expect(owner.stopped).toEqual([]);
+      await expect(
+        agent.request("input", { event: { kind: "type", text: "replay" } }),
+      ).rejects.toThrow("Agent does not hold browser control");
+      await agent.request("acquire-control", {});
+      await expect(
+        agent.request("input", { event: { kind: "type", text: "replay" } }),
+      ).rejects.toThrow("Capture a frame before sending input");
+    } finally {
+      agent.disconnect();
+      admin.disconnect();
+      await server.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("restores only a bridge-registered identity and makes revocation durable", async () => {
+    const root = await mkdtemp(join(tmpdir(), "shared-browser-binding-"));
+    const store = new AgentBindingStore(join(root, "bindings.json"));
+    const owner = new AgentRuntimeOwner();
+    const supervisor = new RuntimeSupervisor({
+      owner,
+      agentBindingStore: store,
+    });
+    supervisors.push(supervisor);
+    const bridge = supervisor.claimBridge("plugin-bridge");
+    const credential = ticket("durable");
+    try {
+      await issueTicket(supervisor, bridge, credential);
+      await bindTicket(supervisor, bridge, credential, "agent-one", "workspace-one");
+      const observed = await agentRequest<{ state: BrowserState }>(
+        supervisor,
+        credential,
+        "status",
+      );
+      // Simulate loss of volatile registrations while Chromium still owns drafts.
+      const internal = supervisor as unknown as {
+        agentBindings: Map<string, unknown>;
+      };
+      internal.agentBindings.delete(credential);
+      await expect(agentRequest(supervisor, credential, "status")).rejects.toThrow(
+        "invalid or unbound",
+      );
+      const recovered = await agentRequest<{ state: BrowserState }>(
+        supervisor,
+        credential,
+        "reconnect",
+        {
+          agentId: "agent-other",
+          workspaceId: "workspace-other",
+        },
+      );
+      expect(recovered.state.runtimeId).toBe(observed.state.runtimeId);
+      expect(recovered.state.workspaceId).toBe("workspace-one");
+      expect(owner.stopped).toEqual([]);
+      await expect(agentRequest(supervisor, ticket("forged"), "reconnect")).rejects.toThrow(
+        "invalid or unbound",
+      );
+      await revokeAgent(supervisor, bridge, "agent-one");
+      expect(new AgentBindingStore(join(root, "bindings.json")).get(credential)).toBeUndefined();
+      await expect(agentRequest(supervisor, credential, "reconnect")).rejects.toThrow(
+        "invalid or unbound",
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not reopen a human-closed browser unless explicitly asked to open", async () => {
+    const { supervisor, bridge, owner } = createHarness();
+    const credential = ticket("explicit-open");
+    await issueTicket(supervisor, bridge, credential);
+    await bindTicket(supervisor, bridge, credential, "agent-one", "workspace-one");
+    const human = await browserRequest<{
+      viewerToken: string;
+      state: BrowserState;
+    }>(supervisor, bridge, "attach", {
+      workspaceId: "workspace-one",
+      viewerLabel: "Human",
+    });
+    const control = await browserRequest<{ controlToken: string }>(
+      supervisor,
+      bridge,
+      "acquire-control",
+      { viewerToken: human.viewerToken, takeover: false },
+    );
+    await browserRequest(supervisor, bridge, "close", {
+      viewerToken: human.viewerToken,
+      controlToken: control.controlToken,
+      sessionId: human.state.sessionId,
+      runtimeId: human.state.runtimeId!,
+    });
+    await expect(agentRequest(supervisor, credential, "reconnect")).rejects.toThrow(
+      "Browser is closed",
+    );
+    expect(owner.states.size).toBe(0);
+    const opened = await agentRequest<{ state: BrowserState }>(supervisor, credential, "open");
+    expect(opened.state.status).toBe("ready");
+    expect(opened.state.workspaceId).toBe("workspace-one");
+  });
+});
+
+
+it("retains the durable tab when a trusted launch rebinds after supervisor replacement", async () => {
+  const root = await mkdtemp(join(tmpdir(), "shared-browser-rebind-"));
+  const store = new AgentBindingStore(join(root, "bindings.json"));
+  const owner = new AgentRuntimeOwner();
+  const supervisor = new RuntimeSupervisor({ owner, agentBindingStore: store });
+  supervisors.push(supervisor);
+  const bridge = supervisor.claimBridge("plugin-bridge");
+  const credential = ticket("trusted-rebind");
+  try {
+    store.set(credential, { agentId: "agent-one", workspaceId: "workspace-one", tabId: "saved-tab" });
+    await issueTicket(supervisor, bridge, credential);
+    await expect(bindTicket(supervisor, bridge, credential, "other-agent", "other-workspace"))
+      .rejects.toThrow("Agent ticket is already bound");
+    await bindTicket(supervisor, bridge, credential, "agent-one", "workspace-one");
+    expect(store.get(credential)?.tabId).toBe("saved-tab");
+    const internal = supervisor as unknown as { agentBindings: Map<string, { tabId: string }> };
+    expect(internal.agentBindings.get(credential)?.tabId).toBe("saved-tab");
+    expect(owner.states.size).toBe(0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });

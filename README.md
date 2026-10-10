@@ -115,13 +115,15 @@ jumps to the chosen workspace's browser panel.
 ## Agent MCP access
 
 The plugin automatically injects its stdio MCP adapter only when a new, non-internal agent is
-created with a provider that accepts external MCP servers. Agents that already exist, resumed
-sessions, imported sessions, and Paseo's internal agents are not modified. Paseo's built-in OMP
+created with a provider that accepts external MCP servers. Agents without an existing adapter and
+Paseo's internal agents are not modified. Interactive resume/refresh/import launches that retain
+an injected ticket renew its binding through the trusted launch hook. Paseo's built-in OMP
 provider accepts session MCP servers from Paseo 0.11, so new OMP agents receive the adapter there.
 Pi agents also receive the adapter, but require Pi's optional MCP support to
 launch it.
 
-The injected MCP server exposes `shared_browser_status`, `shared_browser_capture`,
+The injected MCP server exposes `shared_browser_open`, `shared_browser_reconnect`,
+`shared_browser_status`, `shared_browser_capture`,
 `shared_browser_device`, `shared_browser_acquire_control`, `shared_browser_release_control`,
 `shared_browser_navigate`, `shared_browser_input`, `shared_browser_viewport`,
 `shared_browser_tabs`, `shared_browser_tab_open`, `shared_browser_tab_select`, and
@@ -137,6 +139,28 @@ release control or the lease must expire before agent input can proceed on that 
 The provider launches the stdio adapter on the Paseo daemon host, beside the daemon-owned browser
 runtime. Web, desktop, and mobile clients never own or host the adapter or Chromium, and a client
 disconnect does not close or reset either process.
+
+### Recovering agent access
+
+Call `shared_browser_reconnect` after a disconnected supervisor socket or a lost ticket binding.
+It reconnects this agent to its registered workspace and selected tab, without navigation, tab
+creation, action replay, or human control takeover. It releases this agent's previous control
+lease and discards its old frame. Capture again and acquire control before sending input.
+A deliberately closed browser stays closed. Use `shared_browser_open` to explicitly start or
+reopen it; an already running browser retains its tabs. Drafts from a stopped Chromium process
+cannot be recovered.
+
+The supervisor saves hashed ticket registrations and selected tab IDs in a private
+`agent-bindings.json` beside its IPC metadata. It never persists frames, page contents, or
+control leases. Agent and workspace archival remove these recovery registrations. Arbitrary
+credentials and caller-supplied workspace identities cannot establish a binding.
+
+These actions require the updated MCP adapter and supervisor. Reloading the plugin alone does
+not replace an already running supervisor executable. Schedule the supervisor upgrade after
+saving or discarding all browser drafts; do not stop it automatically to recover access.
+Tickets issued before durable registrations were added need a trusted session launch that
+retains the ticket override, or a fresh agent. Recovery tools remain advertised when their
+initial socket connection fails, but require the plugin's active supervisor bridge.
 
 ## Runtime environment overrides
 

@@ -140,12 +140,18 @@ export default function contribute(server: PluginServerContext) {
   });
 
   server.before("agent.session_open", async ({ request }) => {
-    if (request.reason !== "create") return request;
     const ticket = request.env[TICKET_ENV];
     if (!ticket || request.purpose !== "interactive" || !request.workspaceId) return request;
-    await bindAgentTicket(ticket, request.agentId, request.workspaceId);
-    const { [TICKET_ENV]: _ticket, ...environment } = request.env;
-    return { ...request, env: environment };
+    // Trusted interactive launches re-register after supervisor replacement.
+    // Retain the override so resume/refresh hooks can renew the same binding.
+    try {
+      await bindAgentTicket(ticket, request.agentId, request.workspaceId);
+    } catch (error) {
+      if (!(error instanceof Error) || error.message !== "Unknown agent ticket") throw error;
+      await issueAgentTicket(ticket);
+      await bindAgentTicket(ticket, request.agentId, request.workspaceId);
+    }
+    return request;
   });
 
   server.on("agent.archived", ({ agent }) => revokeAgentBrowserAccess(agent.id));

@@ -265,7 +265,11 @@ export class SupervisorClient {
       if (this.heartbeatInFlight) return;
       const socket = this.socket;
       const epoch = this.epoch;
-      const operation = this.send({ method: "bridge.heartbeat", bridgeId: this.bridgeId, epoch })
+      const operation = this.send({
+        method: "bridge.heartbeat",
+        bridgeId: this.bridgeId,
+        epoch,
+      })
         .then((result) => {
           if (this.socket !== socket || this.epoch !== epoch) return;
           const lease = result as BridgeLease;
@@ -322,6 +326,7 @@ export class AgentSupervisorClient {
   private socket: Socket | null = null;
   private receiveBuffer = "";
   private closed = false;
+  private reconnecting: Promise<JsonValue> | null = null;
 
   constructor(options: AgentSupervisorClientOptions) {
     this.ticket = options.ticket;
@@ -331,6 +336,7 @@ export class AgentSupervisorClient {
   async open(): Promise<void> {
     if (this.socket) throw new Error("Agent supervisor client is already connected");
     this.closed = false;
+    this.receiveBuffer = "";
     const endpointText = await readPrivateFile(this.paths.endpoint);
     const parsed: unknown = JSON.parse(endpointText);
     if (
@@ -348,11 +354,35 @@ export class AgentSupervisorClient {
       socket.once("connect", () => resolve(socket));
       socket.once("error", reject);
     });
-    this.socket.setEncoding("utf8");
-    this.socket.on("data", (chunk: string) => this.consume(chunk));
-    this.socket.once("close", () => this.handleClose(new Error("Supervisor connection closed")));
-    this.socket.on("error", (error) => this.handleClose(error));
+    const connected = this.socket;
+    connected.setEncoding("utf8");
+    connected.on("data", (chunk: string) => {
+      if (this.socket === connected) this.consume(chunk);
+    });
+    connected.once("close", () => {
+      if (this.socket === connected) this.handleClose(new Error("Supervisor connection closed"));
+    });
+    connected.on("error", (error) => {
+      if (this.socket === connected) this.handleClose(error);
+    });
   }
+
+  /** Reconnect only on explicit request. Outstanding actions are never replayed. */
+  async reconnect(openBrowser = false): Promise<JsonValue> {
+    if (this.reconnecting) throw new Error("Browser reconnection is already in progress");
+    const recover = async () => {
+      this.disconnect();
+      await this.open();
+      return await this.request(openBrowser ? "open" : "reconnect", {});
+    };
+    this.reconnecting = recover();
+    try {
+      return await this.reconnecting;
+    } finally {
+      this.reconnecting = null;
+    }
+  }
+
   async request(operation: AgentBrowserOperation, input: JsonValue): Promise<JsonValue> {
     const socket = this.socket;
     if (!socket || socket.destroyed) throw new Error("Agent supervisor client is not connected");
@@ -373,9 +403,11 @@ export class AgentSupervisorClient {
   }
 
   disconnect(): void {
+    this.handleClose(
+      new Error("Agent supervisor client disconnected; outstanding actions were not replayed"),
+    );
     this.closed = true;
-    this.socket?.destroy();
-    this.socket = null;
+    this.receiveBuffer = "";
   }
 
   private consume(chunk: string): void {
