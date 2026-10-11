@@ -951,6 +951,31 @@ describe("agent shared-browser authorization", () => {
     ).rejects.toThrow("lease is invalid or expired");
   });
 
+  it("reselects the same tab and reacquires control after its viewer expires", async () => {
+    let now = 1_000;
+    const { owner, supervisor, bridge } = createHarness(() => now);
+    const original = owner.request.bind(owner);
+    owner.request = async (runtime, operation, input) => {
+      if (operation === "identity") {
+        return { targetId: "page-one", userAgent: "Fake Chromium" };
+      }
+      return original(runtime, operation, input);
+    };
+    const agentTicket = ticket("idle-tab-select");
+    await issueTicket(supervisor, bridge, agentTicket);
+    await bindTicket(supervisor, bridge, agentTicket, "agent-one", "workspace-one");
+    await agentRequest(supervisor, agentTicket, "acquire-control");
+    now = 30_000;
+    supervisor.heartbeat(bridge.bridgeId, bridge.epoch);
+    now = 46_001;
+    await expect(
+      agentRequest(supervisor, agentTicket, "tabs.select", { tabId: "page-one" }),
+    ).resolves.toMatchObject({ state: { tabId: "page-one", controller: "none" } });
+    await expect(agentRequest(supervisor, agentTicket, "acquire-control")).resolves.toMatchObject({
+      state: { tabId: "page-one", controller: "self" },
+    });
+  });
+
   it("archives the runtime and permanently fences every ticket bound to its workspace", async () => {
     const { owner, supervisor, bridge } = createHarness();
     const agentTicket = ticket("archive");

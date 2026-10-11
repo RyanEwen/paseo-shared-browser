@@ -828,8 +828,8 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
   private async selectAgentTab(binding: AgentBinding, tabId: string): Promise<BrowserState> {
     this.assertAgentBindingCurrent(binding);
     if (binding.tabId === tabId && binding.viewerToken) {
-      const current = await this.browserPolicy.status(binding.viewerToken);
-      this.assertAgentBindingCurrent(binding);
+      // Same-tab selection needs the same expiry recovery as status/capture.
+      const current = await this.requestAgentObservation(binding, "status", {});
       if (binding.tabId !== tabId) {
         throw new RuntimeProtocolError("INVALID_REQUEST", "Agent tab changed during selection");
       }

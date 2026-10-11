@@ -7,7 +7,9 @@ import {
   AgentBrowserRuntime,
   type AgentBrowserRuntimeOptions,
   type BrowserViewport,
+  type RuntimeTarget,
 } from "./agent-browser-runtime";
+import { CdpUnknownOutcomeError } from "./cdp";
 import { resolveBrowserRuntimeRoot } from "./runtime-path";
 import type { JsonValue } from "./runtime-protocol";
 import type { RuntimeOwner } from "./supervisor";
@@ -25,6 +27,7 @@ interface OwnedRuntime {
   rootTargetId: string;
   runtimeOptions: AgentBrowserRuntimeOptions;
   tabs: Map<string, Promise<AgentBrowserRuntime>>;
+  tabOrder: string[];
   display: PrivateVirtualDisplay | null;
   /** Bounded, secret-free reason an opted-in private display is not in use. */
   displayNotice: string | null;
@@ -51,6 +54,22 @@ function optionalMouseModifiers(data: Record<string, JsonValue>): [] | [number] 
   return data.modifiers === undefined
     ? []
     : [browserGestureKeySchema.shape.modifiers.parse(data.modifiers)];
+}
+
+/** Retain known tab positions across unordered CDP snapshots; append newly discovered pages. */
+async function orderedTargets(owned: OwnedRuntime): Promise<RuntimeTarget[]> {
+  const targets = await owned.runtime.targets();
+  const byId = new Map(targets.map((target) => [target.targetId, target]));
+  const surviving = owned.tabOrder.filter((targetId) => byId.has(targetId));
+  const known = new Set(surviving);
+  for (const target of targets) {
+    if (!known.has(target.targetId)) {
+      surviving.push(target.targetId);
+      known.add(target.targetId);
+    }
+  }
+  owned.tabOrder = surviving;
+  return surviving.map((targetId) => byId.get(targetId)!);
 }
 
 /** Give each page its own CDP attachment and media state within one Chromium profile. */
@@ -151,6 +170,7 @@ export async function createRuntimeOwner(
           rootTargetId: identity.targetId,
           runtimeOptions,
           tabs: new Map(),
+          tabOrder: [identity.targetId],
           display,
           displayNotice,
         };
@@ -179,20 +199,22 @@ export async function createRuntimeOwner(
           ? (input as Record<string, JsonValue>)
           : {};
       if (operation === "tabs.list") {
-        return (await owned.runtime.targets()).map(({ targetId, title, url }) => ({
+        return (await orderedTargets(owned)).map(({ targetId, title, url }) => ({
           targetId,
           title,
           url,
         }));
       }
       if (operation === "tabs.create") {
-        if ((await owned.runtime.targets()).length >= MAX_BROWSER_TABS)
+        if ((await orderedTargets(owned)).length >= MAX_BROWSER_TABS)
           throw new Error("Browser tab limit reached");
-        return { targetId: await owned.runtime.createTarget() };
+        const targetId = await owned.runtime.createTarget();
+        owned.tabOrder.push(targetId);
+        return { targetId };
       }
       if (operation === "tabs.close") {
         const targetId = String(data.targetId);
-        const targets = await owned.runtime.targets();
+        const targets = await orderedTargets(owned);
         if (!targets.some((target) => target.targetId === targetId)) {
           throw new Error("Browser tab is no longer available");
         }
@@ -207,7 +229,20 @@ export async function createRuntimeOwner(
           owned.rootTargetId = successor.targetId;
         }
         await owned.runtime.closeTarget(targetId);
+        // Target.closeTarget can acknowledge before Chromium drops the page from
+        // its target list. Success requires observing its absence; the close is
+        // never replayed, and exhaustion is reported rather than assumed.
+        let gone = false;
+        for (let attempt = 0; attempt < 20 && !gone; attempt++) {
+          gone = !(await owned.runtime.targets()).some((target) => target.targetId === targetId);
+          if (gone) break;
+          const { promise, resolve } = Promise.withResolvers<void>();
+          setTimeout(resolve, 50);
+          await promise;
+        }
         owned.tabs.delete(targetId);
+        if (!gone) throw new CdpUnknownOutcomeError("Browser tab close could not be confirmed");
+        owned.tabOrder = owned.tabOrder.filter((id) => id !== targetId);
         return null;
       }
       const targetId = typeof data.targetId === "string" ? data.targetId : null;
