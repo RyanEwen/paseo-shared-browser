@@ -110,7 +110,7 @@ Before upgrading the plugin on Windows, close active Shared Browser sessions and
 daemon; Windows does not allow the installer to replace runtime executables that are still running.
 
 Open a workspace, search the Command Center for **Open Shared Browser**, or tap the **Shared
-Browser** composer pill while a workspace session is open. On Paseo 0.11 or newer, a **Shared
+Browser** composer pill while a workspace session is open. A **Shared
 Browser (n)** row in the sidebar footer appears while browser sessions are open; it lists them and
 jumps to the chosen workspace's browser panel.
 
@@ -119,7 +119,7 @@ jumps to the chosen workspace's browser panel.
 The plugin automatically injects its stdio MCP adapter only when a new, non-internal agent is
 created with a provider that accepts external MCP servers. Agents that already exist, resumed
 sessions, imported sessions, and Paseo's internal agents are not modified. Paseo's built-in OMP
-provider accepts session MCP servers from Paseo 0.11, so new OMP agents receive the adapter there.
+provider accepts session MCP servers, so new OMP agents receive the adapter.
 Pi agents also receive the adapter, but require Pi's optional MCP support to
 launch it.
 
@@ -417,10 +417,7 @@ runs the actual Paseo compiler on both plugin entries.
 Release Please maintains the version, changelog, component tag, and GitHub release from
 Conventional Commits in the monorepo.
 
-Both the Paseo daemon and app must satisfy the version range in `paseo-plugin.json`.
-The upstream 0.9, 0.10 and 0.11 ranges remain supported by the manifest;
-the tested `0.11.0-beta.3` prerelease is also allowed. Older daemon/client
-combinations still need runtime qualification. Encoded video is opt-in on the daemon and
+Both the Paseo daemon and app must satisfy `^0.11.0`. Encoded video is opt-in on the daemon and
 requires WebCodecs in a web client; JPEG is always available. The client surface uses React
 Native primitives and works in desktop, web, iOS, and Android Paseo clients.
 
