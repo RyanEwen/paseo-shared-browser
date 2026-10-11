@@ -52,6 +52,9 @@ export type NativeVideoPacket = z.infer<typeof nativeVideoPacketSchema>;
 
 export const browserVideoPacketSchema = nativeVideoPacketSchema.extend({
   frame: browserFrameAuthoritySchema,
+  /** False when the host refused this capture as an input receipt (it predates
+   * acknowledged input). It may still be painted. Absent from older hosts. */
+  actionable: z.boolean().optional(),
 });
 export type BrowserVideoPacket = z.infer<typeof browserVideoPacketSchema>;
 

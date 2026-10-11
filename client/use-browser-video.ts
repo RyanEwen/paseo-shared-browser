@@ -71,6 +71,13 @@ export function useBrowserVideo(options: BrowserVideoOptions) {
     fallbackRef.current = ++fallbackCounter.current;
     setFallbackRevision(fallbackRef.current);
   };
+  /** Source/document/geometry validity: enough to decode and paint a packet. */
+  const sourceCurrent = (packet: BrowserVideoPacket, epoch: number) =>
+    latest.current.isCurrent(packet, epoch);
+  /** Input eligibility: source validity plus a host receipt. A display-only packet
+   * (actionable === false) may be decoded and painted but never admits a press. */
+  const inputCurrent = (packet: BrowserVideoPacket, epoch: number) =>
+    packet.actionable !== false && sourceCurrent(packet, epoch);
   const displayCurrent = (packet: BrowserVideoPacket) =>
     latest.current.isDisplayCurrent
       ? latest.current.isDisplayCurrent(packet)
@@ -78,7 +85,7 @@ export function useBrowserVideo(options: BrowserVideoOptions) {
   const front = presentation?.packet ?? null;
   const setFront = (value: BrowserVideoPacket | null, epoch = 0) => {
     displayedPacket.current = value;
-    if (!value || latest.current.isCurrent(value, epoch)) {
+    if (!value || inputCurrent(value, epoch)) {
       fallbackRef.current = 0;
       setFallbackRevision(0);
     }
@@ -121,7 +128,7 @@ export function useBrowserVideo(options: BrowserVideoOptions) {
       if (
         !fallbackRef.current &&
         presentation.authorityRevision === authorityRevision.current &&
-        latest.current.isCurrent(presentation.packet, presentation.epoch)
+        inputCurrent(presentation.packet, presentation.epoch)
       ) {
         frontRef.current = presentation.packet;
         latest.current.onPresented(presentation.packet, presentation.epoch);
@@ -167,9 +174,9 @@ export function useBrowserVideo(options: BrowserVideoOptions) {
         isCurrent: (packet, epoch) => !stopped && latest.current.isCurrent(packet, epoch),
         // Same source/document packets preserve the codec's dependency chain,
         // including a reply that began before a local press. They carry that old
-        // read epoch through paint and cannot authorize another press.
-        isSourceCurrent: (packet) =>
-          !stopped && latest.current.isCurrent(packet, latest.current.epoch()),
+        // read epoch through paint and cannot authorize another press. A display-only
+        // (non-actionable) packet is still source-valid and must keep decoding.
+        isSourceCurrent: (packet) => !stopped && sourceCurrent(packet, latest.current.epoch()),
         onPresented(packet, epoch) {
           if (stopped) return;
           lastPaintedAt = Date.now();
@@ -177,7 +184,7 @@ export function useBrowserVideo(options: BrowserVideoOptions) {
           setError(null);
           // Once this canvas is visible, its pixels change before React commits.
           // Publish authority synchronously with that draw, never the old front.
-          if (visible.current && latest.current.isCurrent(packet, epoch)) {
+          if (visible.current && inputCurrent(packet, epoch)) {
             frontRef.current = packet;
             latest.current.onPresented(packet, epoch);
           } else {

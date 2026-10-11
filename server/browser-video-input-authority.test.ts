@@ -153,6 +153,8 @@ it.each([-1, 0, 40])(
       const late = await pendingRead;
       pendingRead = null;
       expect(late.packets[0]!.frame.frameId).toBe(frame.frameId);
+      // Late pixels are painted but flagged: the viewer must not try to press on them.
+      expect(late.packets[0]!.actionable).toBe(false);
       // Late pixels still paint, but cannot re-authorize discrete agent input.
       await expect(strictInput()).rejects.toThrow("frame is stale");
       expect(calls).not.toContain("mouse.down");
@@ -185,6 +187,7 @@ it.each([-1, 0, 40])(
       packet.capturedAt = new Date(now).toISOString();
       const fresh = await manager.readVideo(videoInput);
       const freshFrame = fresh.packets[0]!.frame;
+      expect(fresh.packets[0]!.actionable).toBe(true);
       const accepted = await manager.beginGesture({
         viewerToken,
         controlToken,

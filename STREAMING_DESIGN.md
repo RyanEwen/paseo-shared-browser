@@ -69,7 +69,12 @@ admit clicks indefinitely. Motion, releases and keys of a held gesture use the o
 channel without waiting for new pixels. Agent commands retain strict fresh-frame
 targeting.
 
-A visible frame is not automatically an actionable receipt. Delayed reads may
+A visible frame is not automatically an actionable receipt. The host flags each
+video packet `actionable` or not (a capture older than the last acknowledged input
+is painted but never a receipt), and the viewer starts a new epoch when the host
+acknowledges a receipt-revoking input, so reads answered before that revocation
+cannot authorize the next press. After an acknowledged press the viewer has no
+actionable video receipt until a newer packet paints; a following press waits for it. Delayed reads may
 continue painting within the same source and geometry while retaining their
 original input revision. Initial-admission waiters wake only for actionable
 pixels. A document or viewport transition, controller loss, cancellation,

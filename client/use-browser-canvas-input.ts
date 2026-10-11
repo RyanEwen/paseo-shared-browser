@@ -45,6 +45,8 @@ interface CanvasOptions {
   onPoint(point: BrowserGesturePoint): void;
   onActivity(active: boolean): void;
   onInputBoundary(): void;
+  /** The host acknowledged an input that revoked every earlier frame receipt. */
+  onInputAcknowledged?(): void;
 }
 
 /** Native touch coordinates are relative to the controlled overlay, with stable ID mapping. */
@@ -119,6 +121,9 @@ export function useBrowserCanvasInput(options: CanvasOptions) {
         setBrowserCanvasCursor(nodeRef.current, null);
         clearIdle();
         if (alive.current) current.current.onError(error);
+      },
+      onAcknowledged: () => {
+        if (alive.current) current.current.onInputAcknowledged?.();
       },
       onNavigationComplete: () => {
         // Server already closed the acknowledged channel. Quarantine local
