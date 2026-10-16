@@ -42,8 +42,7 @@ export function resolveDependencyRoot(packageName, from = import.meta.url) {
 }
 
 export function prepareDependencies(root = projectRoot, execute = execFileSync) {
-  const catalog = loadRootCatalog(root);
-  if (!catalog) return false;
+  const catalog = loadRootCatalog(root) ?? {};
   stageManifest(root, catalog, () => {
     execute(
       process.platform === "win32" ? "npm.cmd" : "npm",

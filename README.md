@@ -1,5 +1,8 @@
 # Shared Browser
 
+Standalone fork maintained at [RyanEwen/paseo-shared-browser](https://github.com/RyanEwen/paseo-shared-browser).
+Derived from [omercnet/paseo-plugins](https://github.com/omercnet/paseo-plugins); original license and attribution are retained.
+
 A Paseo plugin that runs one real Chromium browser per workspace on the daemon host and shares its
 pages with connected Paseo clients and workspace agents. Version 1.0 replaces the previous browser
 runtime in place with a plugin-owned, pinned `agent-browser` runtime; existing installations keep
@@ -22,11 +25,11 @@ organization names.
 
 ### Wide desktop
 
-![Shared Browser showing the same live Paseo page to two viewers on desktop](https://raw.githubusercontent.com/omercnet/paseo-plugins/main/paseo-shared-browser/docs/images/shared-browser-wide.png)
+![Shared Browser showing the same live Paseo page to two viewers on desktop](docs/images/shared-browser-wide.png)
 
 ### Compact client
 
-![Shared Browser controls and the same canonical browser viewport on a compact client](https://raw.githubusercontent.com/omercnet/paseo-plugins/main/paseo-shared-browser/docs/images/shared-browser-compact.png)
+![Shared Browser controls and the same canonical browser viewport on a compact client](docs/images/shared-browser-compact.png)
 
 ## Runtime model
 
@@ -86,14 +89,14 @@ wanted.
 
 ## Install
 
-Enable trusted plugins on the target Paseo daemon, then install from npm:
+Enable trusted plugins on the target Paseo daemon, then install this standalone fork from Git:
 
 ```bash
-paseo plugin install npm:@omercnet/paseo-shared-browser
+paseo plugin install github:RyanEwen/paseo-shared-browser --ref main
 paseo plugin ls
 ```
 
-When Paseo acquires the npm package, it runs the `npm run prepare:runtime` build hook automatically. The
+Paseo runs the dependency preparation and `npm run prepare:runtime` build hooks automatically. The
 hook installs the pinned browser runtime, builds both `supervisor.cjs` and `shared-browser-mcp.cjs`
 under a versioned directory in `$PASEO_HOME/plugin-data/shared-browser`, then atomically updates the
 `runtime-current` pointer. Existing processes keep using their immutable runtime during an update.
@@ -399,13 +402,14 @@ or remove the file to return to normal selection. An explicit
 
 Follow the repository's `AGENTS.md`. Runtime verification must use an isolated
 Paseo home, never the default daemon, active plugin installation, or signed-in
-profile. Run dependency installation from the monorepo root, then the following
-checks from `paseo-shared-browser`:
+profile. Install dependencies and run the following checks from this repository root:
 
 ```bash
 bun install --frozen-lockfile
+bun run build
 bun run typecheck
 bun run check
+bun run test:scripts
 bun run test:unit
 ```
 
@@ -478,8 +482,9 @@ capture. macOS and Windows run the image/browser smoke; their native video
 hardware and remote-network performance require separate qualification. CI also
 runs the actual Paseo compiler on both plugin entries.
 
-Release Please maintains the version, changelog, component tag, and GitHub release from
-Conventional Commits in the monorepo.
+This repository preserves the upstream package version and changelog. CI validates this fork;
+it does not publish npm packages or create releases. See [migration notes](docs/standalone-migration.md)
+for source history and upstream contribution instructions.
 
 Both the Paseo daemon and app must satisfy `^0.11.0` or the retained explicit
 `0.11.0-beta.3`, `0.11.0-beta.4`, or `0.11.0-beta.5` allowances. Encoded video is opt-in

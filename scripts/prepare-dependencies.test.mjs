@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -55,4 +55,24 @@ test("resolves a dependency hoisted above the installed plugin", (t) => {
     resolveDependencyRoot("example-runtime", pathToFileURL(pluginScript).href),
     realpathSync(packageRoot),
   );
+});
+
+test("installs a standalone Git checkout without a parent catalog", (t) => {
+  const root = temporaryRoot(t);
+  const manifest = { dependencies: { zod: "4.4.3" }, devDependencies: { vitest: "5.0.1" } };
+  const source = `${JSON.stringify(manifest)}\n`;
+  writeFileSync(join(root, "package.json"), source);
+  let calls = 0;
+  assert.equal(
+    prepareDependencies(root, (_command, args) => {
+      calls += 1;
+      assert.deepEqual(args, ["ci", "--omit=dev", "--ignore-scripts", "--workspaces=false"]);
+      assert.deepEqual(JSON.parse(readFileSync(join(root, "package.json"), "utf8")), {
+        dependencies: manifest.dependencies,
+      });
+    }),
+    true,
+  );
+  assert.equal(calls, 1);
+  assert.equal(readFileSync(join(root, "package.json"), "utf8"), source);
 });

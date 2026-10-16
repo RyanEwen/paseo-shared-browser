@@ -65,15 +65,16 @@ it("coalesces rapid panel changes into one resize using the latest action", () =
   expect(apply).not.toHaveBeenCalled();
 });
 
-it("cancels queued work when control is released, a mutation starts, or following stops", () => {
-  for (const override of [{ canResize: false }, { enabled: false }, { target: null }]) {
+it.each([{ canResize: false }, { enabled: false }, { target: null }])(
+  "cancels queued work when control is released, a mutation starts, or following stops (%j)",
+  (override) => {
     useBrowserFillViewport(defaults);
     vi.advanceTimersByTime(100);
     useBrowserFillViewport({ ...defaults, ...override });
     vi.advanceTimersByTime(300);
     expect(apply).not.toHaveBeenCalled();
-  }
-});
+  },
+);
 
 it("resumes after control returns without repeatedly resizing an acknowledged resolution", () => {
   useBrowserFillViewport({ ...defaults, canResize: false });

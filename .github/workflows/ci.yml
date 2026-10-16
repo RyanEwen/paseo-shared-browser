@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shared-browser:
+    name: Shared Browser (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            chromium_args: --no-sandbox
+          - os: macos-latest
+            chromium_args: ""
+          - os: windows-latest
+            chromium_args: ""
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.2
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Compile Paseo client and server entries
+        run: npm run build
+      - name: Check formatting, lint and production lockfile
+        run: npm run check
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Test preparation scripts
+        run: npm run test:scripts
+      - name: Unit tests
+        run: npm run test:unit
+      - name: Prepare isolated browser runtime
+        env:
+          PASEO_HOME: ${{ runner.temp }}/shared-browser-ci-home
+        run: npm run prepare:runtime
+      - name: Browser smoke tests
+        env:
+          PASEO_HOME: ${{ runner.temp }}/shared-browser-ci-home
+          PASEO_SHARED_BROWSER_CHROMIUM_ARGS: ${{ matrix.chromium_args }}
+        run: npm run test:smoke
+      - name: Require virtual display for native video
+        if: ${{ runner.os == 'Linux' }}
+        run: command -v Xvfb
+      - name: Native video capture and decode smoke
+        if: ${{ runner.os == 'Linux' }}
+        env:
+          PASEO_HOME: ${{ runner.temp }}/shared-browser-ci-home
+          PASEO_SHARED_BROWSER_CHROMIUM_ARGS: ${{ matrix.chromium_args }}
+        run: npm run test:video

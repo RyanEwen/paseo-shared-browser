@@ -61,15 +61,16 @@ it("debounces adjustments and does not repeat acknowledged density changes", () 
   expect(apply).toHaveBeenCalledOnce();
 });
 
-it("cancels queued work for observers, hidden panels, pending mutations and manual choices", () => {
-  for (const override of [{ canChange: false }, { enabled: false }, { target: null }]) {
+it.each([{ canChange: false }, { enabled: false }, { target: null }])(
+  "cancels queued work for observers, hidden panels, pending mutations and manual choices (%j)",
+  (override) => {
     useBrowserAutoCaptureDensity(defaults);
     vi.advanceTimersByTime(100);
     useBrowserAutoCaptureDensity({ ...defaults, ...override });
     vi.advanceTimersByTime(500);
     expect(apply).not.toHaveBeenCalled();
-  }
-});
+  },
+);
 
 it("waits while Fill viewport owns a combined size and density transition", () => {
   useBrowserAutoCaptureDensity({ ...defaults, canChange: false });

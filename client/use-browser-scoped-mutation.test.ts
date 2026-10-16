@@ -30,7 +30,7 @@ import { useBrowserScopedMutation } from "./use-browser-scoped-mutation";
 const send = vi.fn(async (input: string) => ({ value: input }));
 const success = vi.fn();
 const failure = vi.fn();
-function render(identity = "host/workspace/viewer/control", currentIdentity?: () => string) {
+function useHarness(identity = "host/workspace/viewer/control", currentIdentity?: () => string) {
   fixture.index = 0;
   const hook = useBrowserScopedMutation({
     identity,
@@ -55,7 +55,7 @@ beforeEach(() => {
   vi.clearAllMocks();
 });
 it("captures submitted identity, keeps current settlement and never retries", async () => {
-  const { hook, options } = render();
+  const { hook, options } = useHarness();
   hook.mutate("chosen");
   const request = fixture.submissions[0] as { input: string; identity: string };
   const result = await options.mutationFn(request);
@@ -71,11 +71,11 @@ for (const replacement of [
   "host/workspace/viewer/new-control",
 ]) {
   it(`discards published success and failure after ${replacement}`, async () => {
-    const previous = render();
+    const previous = useHarness();
     previous.hook.mutate("published");
     const request = fixture.submissions[0] as { input: string; identity: string };
     await previous.options.mutationFn(request);
-    const latest = render(replacement);
+    const latest = useHarness(replacement);
     expect(() => latest.options.mutationFn(request)).toThrow("context changed");
     latest.options.onSuccess({ value: "old" }, request);
     latest.options.onError(new Error("old"), request);
@@ -87,7 +87,7 @@ for (const replacement of [
   });
 }
 it("refuses stale queued publication and ignores callbacks after unmount", async () => {
-  const { hook, options } = render();
+  const { hook, options } = useHarness();
   hook.mutate("unsent");
   const request = fixture.submissions[0] as { input: string; identity: string };
   fixture.cleanup?.();
@@ -103,7 +103,7 @@ it("refuses stale queued publication and ignores callbacks after unmount", async
 
 it("synchronous authority observations revoke settlement before another render", async () => {
   let observed = "host/workspace/viewer/control";
-  const { hook, options } = render(observed, () => observed);
+  const { hook, options } = useHarness(observed, () => observed);
   hook.mutate("published");
   const request = fixture.submissions[0] as { input: string; identity: string };
   await options.mutationFn(request);
