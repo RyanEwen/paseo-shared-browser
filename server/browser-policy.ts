@@ -47,14 +47,23 @@ import {
 import { frameMatchesBrowserContext } from "./browser-frame-context";
 import { createBrowserFrameRejection } from "./browser-frame-rejection";
 import { BrowserGesture } from "./browser-gesture";
+import {
+  AGENT_VIEWER_POLICY,
+  type BrowserViewerPolicy,
+  HUMAN_VIEWER_POLICY,
+} from "./browser-viewer-policy";
 import { runWithInputCleanup } from "./input-cleanup";
 import { sameRuntimeInputAttachment } from "./input-generation";
 import { runtimeVideoPacketSchema } from "./native-video-packet";
 import { NAVIGATION_METADATA_TIMEOUT_MS } from "./navigation-budget";
-import type { JsonValue } from "./runtime-protocol";
+import { type JsonValue, RuntimeProtocolError } from "./runtime-protocol";
 import { createViewerCaptureLifetime, type ViewerCaptureLifetime } from "./viewer-capture-lifetime";
 export type WorkspaceValidator = (workspaceId: string) => Promise<void | boolean>;
-type CaptureReply = Omit<RpcOutput<typeof captureBrowserRpc>, "state"> & { state: BrowserState };
+type CaptureReply = Omit<RpcOutput<typeof captureBrowserRpc>, "state"> & {
+  state: BrowserState;
+  /** Trusted agents receive the actual observation deadline, not a TTL guessed from source pixels. */
+  frameExpiresAt?: string;
+};
 type DensityInput = RpcInput<typeof setCaptureDensityRpc>;
 type CloseInput = RpcInput<typeof closeBrowserRpc>;
 type NavigateInput = RpcInput<typeof navigateBrowserRpc>;
@@ -68,10 +77,7 @@ type UpdateGestureReply = Omit<RpcOutput<typeof updateBrowserGestureRpc>, "state
 };
 type EndGestureInput = RpcInput<typeof endBrowserGestureRpc>;
 
-const VIEWER_TTL_MS = 45_000;
-const CONTROL_LEASE_MS = 30_000;
 const FRAME_CACHE_MS = 100;
-const FRAME_TOKEN_TTL_MS = 5_000;
 const MAX_RECENT_FRAMES = 512;
 const MAX_VIEWERS_PER_SESSION = 16;
 const MAX_SESSIONS = 64;
@@ -79,7 +85,11 @@ const SCREENCAST_WAIT_MS = 500;
 
 export interface BrowserRuntimeClient {
   connect(): Promise<{ epoch: number }>;
-  ensureWorkspace(workspaceId: string): Promise<{
+  /** `replaceLost` is internal authority; without it a lost runtime is reported, never replaced. */
+  ensureWorkspace(
+    workspaceId: string,
+    options?: { replaceLost?: boolean },
+  ): Promise<{
     workspaceId: string;
     runtimeId: string;
     createdAt: number;
@@ -105,6 +115,7 @@ export interface SessionManagerOptions {
 
 interface Viewer {
   label: string;
+  policy: BrowserViewerPolicy;
   expiresAt: number;
 }
 interface Controller {
@@ -112,11 +123,14 @@ interface Controller {
   controlToken: string;
   expiresAt: number;
 }
-/** One decoded geometry basis for the current human controller, separate from agent receipts. */
-type HumanInputAdmission = Pick<
-  BrowserGesture,
-  "viewerToken" | "controlToken" | "expected" | "runtimeInputGeneration"
-> & { frameId: string };
+interface FrameObservation {
+  navigationGeneration: number;
+  viewportGeneration: number;
+  expiresAt: number;
+  expiresAtMonotonicMs?: number;
+  observedAt: number;
+  observedAtMonotonicMs?: number;
+}
 interface BrowserSession {
   key: string;
   workspaceId: string;
@@ -144,23 +158,17 @@ interface BrowserSession {
       rawFrame: Record<string, JsonValue>;
     }
   >;
-  recentFrames: Map<
-    string,
-    {
-      navigationGeneration: number;
-      viewportGeneration: number;
-      expiresAt: number;
-      expiresAtMonotonicMs?: number;
-    }
-  >;
+  recentFrames: Map<string, FrameObservation>;
   lastUrl: string;
   lastTitle: string;
   canGoBack: boolean;
   canGoForward: boolean;
   error: string | null;
+  notice: string | null;
+  /** Set when the runtime reported it can never serve again; the next explicit attach replaces it. */
+  runtimeLost: boolean;
   archived: boolean;
   gesture: BrowserGesture | null;
-  humanInputAdmission: HumanInputAdmission | null;
   inputGeneration: string | null;
   frameRevision: number;
   /** Playback and input fences use the native capture's Node elapsed clock. */
@@ -222,8 +230,7 @@ export class SessionManager {
   private readonly now: () => number;
   private readonly monotonicNow: () => number;
   private readonly issueToken: () => string;
-  private readonly viewerTtlMs: number;
-  private readonly controlLeaseMs: number;
+  private readonly humanViewerPolicy: BrowserViewerPolicy;
   private readonly frameCacheMs: number;
   private readonly maxSessions: number;
   private readonly sessions = new Map<string, BrowserSession>();
@@ -244,8 +251,11 @@ export class SessionManager {
     this.now = options.now ?? Date.now;
     this.monotonicNow = options.monotonicNow ?? (() => performance.now());
     this.issueToken = options.issueToken ?? defaultToken;
-    this.viewerTtlMs = options.viewerTtlMs ?? VIEWER_TTL_MS;
-    this.controlLeaseMs = options.controlLeaseMs ?? CONTROL_LEASE_MS;
+    this.humanViewerPolicy = {
+      ...HUMAN_VIEWER_POLICY,
+      viewerTtlMs: options.viewerTtlMs ?? HUMAN_VIEWER_POLICY.viewerTtlMs,
+      controlLeaseMs: options.controlLeaseMs ?? HUMAN_VIEWER_POLICY.controlLeaseMs,
+    };
     this.frameCacheMs = options.frameCacheMs ?? FRAME_CACHE_MS;
     this.maxSessions = options.maxSessions ?? MAX_SESSIONS;
     if (!Number.isInteger(this.maxSessions) || this.maxSessions < 1)
@@ -261,7 +271,6 @@ export class SessionManager {
     this.bridgeEpoch = epoch;
     for (const session of this.sessions.values()) {
       if (session.bridgeEpoch !== epoch) {
-        session.humanInputAdmission = null;
         void this.cancelGesture(session);
         // A new bridge cannot admit a token issued by the previous attachment.
         this.invalidateFrames(session);
@@ -270,10 +279,32 @@ export class SessionManager {
     }
   }
 
-  async attach(
+  /**
+   * `replaceLost` is internal authority held only by the supervisor's explicit human attach
+   * path. It lets this call replace a workspace runtime that reported it was lost (before or
+   * while attaching) exactly once; every other caller observes the lost session without
+   * restarting it.
+   */
+  attach(
     workspaceId: string,
     viewerLabel: string,
     tabId?: string,
+    options: { replaceLost?: boolean } = {},
+  ): Promise<{ viewerToken: string; state: BrowserState }> {
+    return this.attachWithPolicy(workspaceId, viewerLabel, tabId, options, this.humanViewerPolicy);
+  }
+
+  /** Internal agent route; viewer labels and public attach payloads never select this policy. */
+  attachAgent(workspaceId: string, viewerLabel: string, tabId?: string) {
+    return this.attachWithPolicy(workspaceId, viewerLabel, tabId, {}, AGENT_VIEWER_POLICY);
+  }
+
+  private async attachWithPolicy(
+    workspaceId: string,
+    viewerLabel: string,
+    tabId: string | undefined,
+    options: { replaceLost?: boolean },
+    policy: BrowserViewerPolicy,
   ): Promise<{ viewerToken: string; state: BrowserState }> {
     this.assertOpen();
     const label = viewerLabel.trim();
@@ -281,14 +312,57 @@ export class SessionManager {
     const validation = await this.validateWorkspace(workspaceId);
     if (validation === false) throw new Error("Workspace not found");
     this.assertOpen();
-    const session = await this.getOrCreateSession(workspaceId, tabId);
+    const replaceLost = options.replaceLost === true;
+    let session = await this.getOrCreateSession(workspaceId, tabId, replaceLost);
+    let replaced = false;
+    if (session.runtimeLost && replaceLost) {
+      session = await this.replaceLostRuntime(session);
+      replaced = true;
+    }
+    const attached = await this.attachViewer(session, label, policy);
+    if (session.runtimeLost && replaceLost && !replaced) {
+      // The loss was first observed by this very attach. One fenced replacement, no input replay.
+      session = await this.replaceLostRuntime(session);
+      return this.attachViewer(session, label, policy);
+    }
+    return attached;
+  }
+
+  /**
+   * Discards every page session of the dead workspace runtime behind fresh session and
+   * runtime ids; nothing is replayed. Page ids belong to the old browser, so the
+   * replacement attaches to the new browser's launch page.
+   */
+  private async replaceLostRuntime(lost: BrowserSession): Promise<BrowserSession> {
+    for (const candidate of [...this.sessions.values()]) {
+      if (candidate.workspaceId !== lost.workspaceId) continue;
+      candidate.archived = true;
+      candidate.videoLifetime?.cancel();
+      await this.cancelGesture(candidate);
+      for (const token of candidate.viewers.keys()) this.viewerSessions.delete(token);
+      candidate.viewers.clear();
+      candidate.controller = null;
+      this.sessions.delete(candidate.key);
+    }
+    return this.getOrCreateSession(lost.workspaceId, undefined, true);
+  }
+
+  private attachViewer(
+    session: BrowserSession,
+    label: string,
+    policy: BrowserViewerPolicy,
+  ): Promise<{ viewerToken: string; state: BrowserState }> {
     return this.serialize(session, async () => {
       if (session.archived) throw new Error("Browser session is closed");
       this.pruneExpired(session);
       if (session.viewers.size >= MAX_VIEWERS_PER_SESSION)
         throw new Error(`Shared browser viewer limit (${MAX_VIEWERS_PER_SESSION}) reached`);
       const viewerToken = this.issueUniqueToken();
-      session.viewers.set(viewerToken, { label, expiresAt: this.now() + this.viewerTtlMs });
+      session.viewers.set(viewerToken, {
+        label,
+        policy,
+        expiresAt: this.now() + policy.viewerTtlMs,
+      });
       this.viewerSessions.set(viewerToken, session);
       // Actual image reads lazily own JPEG capture. Attaching a desktop video
       // viewer or an agent doing status-only work does not start a second stream.
@@ -310,7 +384,6 @@ export class SessionManager {
       const detached = session.viewers.delete(viewerToken);
       this.viewerSessions.delete(viewerToken);
       if (session.controller?.viewerToken === viewerToken) {
-        session.humanInputAdmission = null;
         await this.cancelGesture(session);
         session.controller = null;
       }
@@ -360,7 +433,16 @@ export class SessionManager {
   /** Expose tab metadata to a client only through its active viewer lease. */
   async listTabsForViewer(viewerToken: string): Promise<{ tabs: BrowserTab[] }> {
     const session = this.requireViewer(viewerToken);
-    return this.listTabs(session.workspaceId);
+    const listed = await this.listTabs(session.workspaceId);
+    // The lease may have lapsed while the runtime answered; never return metadata then.
+    let current = false;
+    try {
+      current = this.requireViewer(viewerToken) === session && !session.archived;
+    } catch {
+      current = false;
+    }
+    if (!current) throw new Error("Browser viewer attachment changed while listing tabs");
+    return listed;
   }
 
   /** A new page shares the workspace profile but does not change any viewer's selection. */
@@ -369,9 +451,15 @@ export class SessionManager {
     const value = asRecord(
       await this.client.requestWorkspace(session.workspaceId, "tabs.create", null),
     );
-    if (this.requireViewer(viewerToken) !== session || session.archived) {
-      throw new Error("Browser viewer attachment changed during tab creation");
+    // The page now exists. A viewer lease that ended meanwhile must not read as a
+    // pre-dispatch refusal, or a caller recovering from an expired viewer would create twice.
+    let current = false;
+    try {
+      current = this.requireViewer(viewerToken) === session && !session.archived;
+    } catch {
+      current = false;
     }
+    if (!current) throw new Error("Browser viewer attachment changed during tab creation");
     const tabId = browserTabSchema.shape.id.parse(value.targetId);
     return { tabId };
   }
@@ -393,9 +481,9 @@ export class SessionManager {
       for (const [token, expiresAt] of this.closedViewerTabs) {
         if (expiresAt <= this.now()) this.closedViewerTabs.delete(token);
       }
-      for (const token of session.viewers.keys()) {
+      for (const [token, viewer] of session.viewers) {
         this.viewerSessions.delete(token);
-        this.closedViewerTabs.set(token, this.now() + this.viewerTtlMs);
+        this.closedViewerTabs.set(token, this.now() + viewer.policy.viewerTtlMs);
       }
       session.viewers.clear();
       session.controller = null;
@@ -506,6 +594,14 @@ export class SessionManager {
     });
   }
 
+  /** A lost runtime keeps its typed code so observers can tell it from a transient failure. */
+  private metadataFailure(session: BrowserSession, error: string): Error {
+    const message = `Browser capture metadata failed: ${error}`;
+    return session.runtimeLost
+      ? new RuntimeProtocolError("RUNTIME_LOST", message)
+      : new Error(message);
+  }
+
   async capture(
     viewerToken: string,
     quality: CaptureQuality = DEFAULT_CAPTURE_QUALITY,
@@ -518,13 +614,13 @@ export class SessionManager {
       // Reconcile native document identity before capturing and again before
       // issuing authority. A same-URL reload can invalidate the captured pixels.
       const before = await this.snapshotState(session, viewerToken);
-      if (before.error) throw new Error(`Browser capture metadata failed: ${before.error}`);
+      if (before.error) throw this.metadataFailure(session, before.error);
       const inputGeneration = session.inputGeneration;
       const revision = session.frameRevision;
       const frame = await this.frameForQuality(session, quality);
       const observedAt = this.now();
       const state = await this.snapshotState(session, viewerToken);
-      if (state.error) throw new Error(`Browser capture metadata failed: ${state.error}`);
+      if (state.error) throw this.metadataFailure(session, state.error);
       if (
         inputGeneration !== session.inputGeneration ||
         revision !== session.frameRevision ||
@@ -533,11 +629,18 @@ export class SessionManager {
       ) {
         throw new Error("Browser changed during capture; request another frame");
       }
-      if (observedAt + FRAME_TOKEN_TTL_MS <= this.now()) {
+      if (observedAt + this.policyForViewer(session, viewerToken).frameTtlMs <= this.now()) {
         throw new Error("Browser capture expired during validation; request another frame");
       }
-      this.rememberFrame(session, frame, undefined, observedAt);
-      return { state, frame: knownFrameId === frame.frameId ? null : frame };
+      this.rememberFrame(session, viewerToken, frame, undefined, observedAt);
+      const policy = this.policyForViewer(session, viewerToken);
+      return {
+        state,
+        frame: knownFrameId === frame.frameId ? null : frame,
+        ...(policy.kind === "agent"
+          ? { frameExpiresAt: new Date(observedAt + policy.frameTtlMs).toISOString() }
+          : {}),
+      };
     });
   }
 
@@ -549,7 +652,6 @@ export class SessionManager {
       if (!canUseCaptureDensity(session.viewport, input.density))
         throw new RangeError("Capture density exceeds the supported image bounds");
       if (session.captureScale !== input.density) {
-        session.humanInputAdmission = null;
         await this.cancelGesture(session);
         const preset = DEVICE_PRESETS.find(({ id }) => id === session.devicePresetId);
         await this.request(session, "capture.density", {
@@ -683,8 +785,15 @@ export class SessionManager {
               };
               session.videoReceipts.set(receipt, { frame, capturedAtMonotonicMs });
             }
-            this.rememberFrame(session, frame, capturedAtMonotonicMs);
-            packets.push({ ...packet, frame });
+            // False when input revoked this capture's time: it may still be painted,
+            // but it can never authorize a press, and the viewer must not try.
+            const actionable = this.rememberFrame(
+              session,
+              input.viewerToken,
+              frame,
+              capturedAtMonotonicMs,
+            );
+            packets.push({ ...packet, frame, actionable });
           }
         }
         while (session.videoReceipts.size > MAX_RECENT_FRAMES) {
@@ -698,7 +807,9 @@ export class SessionManager {
           streamId: raw.streamId,
           packets,
           ...(typeof raw.reason === "string" ? { reason: raw.reason } : {}),
-          ...(raw.reasonCode === "encoder-capacity" ? { reasonCode: raw.reasonCode } : {}),
+          ...(raw.reasonCode === "encoder-capacity" || raw.reasonCode === "video-disabled"
+            ? { reasonCode: raw.reasonCode }
+            : {}),
         });
       });
     } finally {
@@ -717,14 +828,13 @@ export class SessionManager {
       if (current && current.viewerToken !== viewerToken && !takeover)
         throw new Error("Browser control is held by another viewer");
       if (current?.viewerToken !== viewerToken) {
-        session.humanInputAdmission = null;
         await this.cancelGesture(session);
       }
       const controller =
         current?.viewerToken === viewerToken
           ? current
           : { viewerToken, controlToken: this.issueUniqueToken(), expiresAt: 0 };
-      controller.expiresAt = this.now() + this.controlLeaseMs;
+      controller.expiresAt = this.now() + this.policyForViewer(session, viewerToken).controlLeaseMs;
       session.controller = controller;
       return {
         controlToken: controller.controlToken,
@@ -740,7 +850,6 @@ export class SessionManager {
     const session = this.requireViewer(viewerToken);
     return this.serialize(session, async () => {
       this.requireController(session, viewerToken, controlToken);
-      session.humanInputAdmission = null;
       await this.cancelGesture(session);
       session.controller = null;
       this.heartbeatViewer(session, viewerToken);
@@ -752,7 +861,6 @@ export class SessionManager {
     const session = this.requireViewer(input.viewerToken);
     return this.serialize(session, async () => {
       this.requireMutationAccess(session, input);
-      session.humanInputAdmission = null;
       await this.cancelGesture(session);
       const navigationGeneration = session.navigationGeneration;
       if (input.action.kind === "goto")
@@ -799,7 +907,6 @@ export class SessionManager {
         session.captureScale !== captureScale ||
         (!preserveEmulation && session.devicePresetId !== null)
       ) {
-        session.humanInputAdmission = null;
         const preset = preserveEmulation
           ? DEVICE_PRESETS.find(({ id }) => id === session.devicePresetId)
           : undefined;
@@ -833,7 +940,6 @@ export class SessionManager {
       await this.cancelGesture(session);
       const preset = DEVICE_PRESETS.find(({ id }) => id === input.presetId);
       if (!preset) throw new Error("Unknown device preset");
-      session.humanInputAdmission = null;
       // Resolve the display under the session lock. A mode toggle must neither
       // replay remembered dimensions nor change the capture's pixel resolution.
       const viewport = input.preserveDisplay ? session.viewport : preset.viewport;
@@ -865,10 +971,10 @@ export class SessionManager {
     const session = this.requireViewer(input.viewerToken);
     return this.serialize(session, async () => {
       this.requireMutationAccess(session, input);
-      this.requireRecentFrame(session, input.target);
+      this.requireRecentFrame(session, input.viewerToken, input.target);
       const assertTargetCurrent = this.discreteInputGuard(session, input);
-      await this.cancelGesture(session);
       try {
+        await this.cancelGesture(session);
         await this.dispatchDiscreteInput(session, input.event, assertTargetCurrent);
       } finally {
         const hadVideo = session.videoReceipts.size > 0 || session.videoReads.size > 0;
@@ -883,21 +989,19 @@ export class SessionManager {
   }
 
   /**
-   * Admit decoded geometry once, then reopen its same human control context
-   * after idle cleanup without requiring new pixels. Native begin/check must
-   * still pin the original attachment/document; this never admits agent input.
+   * Admit one human channel from a decoded frame receipt that is still fresh.
+   * A receipt is bounded by its TTL and cleared by acknowledged input; an idle
+   * reopen therefore needs new pixels, never a retained earlier admission. Native
+   * begin pins the attachment/document. This never admits agent input.
    */
   async beginGesture(input: BeginGestureInput) {
     const session = this.requireViewer(input.viewerToken);
     return this.serialize(session, async () => {
       this.requireMutationAccess(session, input);
-      const retainedAdmission = this.matchesHumanInputAdmission(session, input);
-      if (!retainedAdmission) {
-        await this.refreshPageMetadata(session);
-        session.error = null;
-        this.requireMutationAccess(session, input);
-      }
-      if (!retainedAdmission && !this.isRecentFrame(session, input.target)) {
+      await this.refreshPageMetadata(session);
+      session.error = null;
+      this.requireMutationAccess(session, input);
+      if (!this.isRecentFrame(session, input.viewerToken, input.target)) {
         // A pre-input capture can decode after scroll revoked its token. Report
         // known non-publication, not an uncertain runtime failure. The client
         // may obtain another decoded frame before admitting its still-unsent input.
@@ -929,24 +1033,10 @@ export class SessionManager {
         await this.assertGestureCurrent(session, gesture);
         this.renewController(session, input.viewerToken);
         this.scheduleGestureTimeout(session, gesture);
-        // Initial admission reconciles metadata. Retained geometry instead uses
-        // atomic native begin(expectedInputGeneration) plus checks, so idle reopen
-        // cannot adopt a replacement document or block on page metadata catchup.
         const state = this.projectState(session, input.viewerToken);
         await this.assertGestureCurrent(session, gesture);
-        // Unknown legacy native identity cannot establish a reusable basis.
-        if (gesture.runtimeInputGeneration !== null) {
-          session.humanInputAdmission = {
-            frameId: input.target.frameId,
-            viewerToken: gesture.viewerToken,
-            controlToken: gesture.controlToken,
-            expected: { ...gesture.expected },
-            runtimeInputGeneration: gesture.runtimeInputGeneration,
-          };
-        }
         return { state, gestureId: gesture.id, nextSequence: gesture.nextSequence };
       } catch (error) {
-        session.humanInputAdmission = null;
         await this.cancelGesture(session, gesture);
         throw error;
       }
@@ -955,8 +1045,10 @@ export class SessionManager {
 
   /**
    * Continue an admitted human channel independently of decoded-frame catchup.
-   * Exact control/document/geometry/native checks still fence every ordered
-   * packet. An uncertain publication revokes observations and is never replayed.
+   * Exact control/document/geometry/native checks fence every ordered packet, and
+   * every new press (mouse down or first touch contact) needs its own fresh decoded
+   * receipt. Held motion and releases reuse the channel. Uncertain publication
+   * revokes observations and is never replayed.
    */
   async updateGesture(input: UpdateGestureInput): Promise<UpdateGestureReply> {
     const session = this.requireViewer(input.viewerToken);
@@ -971,8 +1063,14 @@ export class SessionManager {
         await this.assertGestureCurrent(session, gesture);
         gesture.validate(event);
         const hover = gesture.isHover(event);
-        // Admission belongs to this exact human channel, not each painted
-        // receipt. Revoke agent observations before an outcome can become unknown.
+        if (
+          event.kind === "down" ||
+          (event.kind === "touch" && event.type === "start" && gesture.touches.size === 0)
+        ) {
+          if (!input.target) throw new Error("A current frame is required for a new press");
+          this.requireRecentFrame(session, input.viewerToken, input.target);
+        }
+        // Revoke agent observations before an outcome can become unknown.
         this.invalidateGestureObservations(session, hover);
         if (event.kind === "key") {
           await this.request(session, "input.key", {
@@ -1034,7 +1132,6 @@ export class SessionManager {
         await this.assertGestureCurrent(session, gesture);
         return { state, gestureId: gesture.id, nextSequence: gesture.nextSequence, cursor };
       } catch (error) {
-        session.humanInputAdmission = null;
         if (publishedEvent) {
           const completion = await this.completeNavigatingInput(
             session,
@@ -1109,49 +1206,20 @@ export class SessionManager {
       const gesture = session.gesture;
       if (!gesture && input.cancel) {
         this.requireController(session, input.viewerToken, input.controlToken);
-        session.humanInputAdmission = null;
         return { state: this.projectState(session, input.viewerToken), cursor: null };
       }
       const owned = this.requireGesture(session, input);
-      if (input.cancel) session.humanInputAdmission = null;
       try {
         if (!input.cancel) {
           this.assertGesturePacketContext(owned, input.expected);
           owned.assertSequence(input.sequence, this.now());
           await this.assertGestureCurrent(session, owned);
         }
-      } catch (error) {
-        session.humanInputAdmission = null;
-        throw error;
       } finally {
         await this.cancelGesture(session, owned);
       }
       return { state: this.projectState(session, input.viewerToken), cursor: null };
     });
-  }
-
-  /** A caller can only select its original admitted receipt under the exact current native context. */
-  private matchesHumanInputAdmission(session: BrowserSession, input: BeginGestureInput): boolean {
-    const admission = session.humanInputAdmission;
-    if (!admission) return false;
-    const contextMatches =
-      admission.viewerToken === input.viewerToken &&
-      admission.controlToken === input.controlToken &&
-      admission.runtimeInputGeneration !== null &&
-      admission.runtimeInputGeneration === session.inputGeneration &&
-      input.target.navigationGeneration === admission.expected.navigationGeneration &&
-      input.target.viewportGeneration === admission.expected.viewportGeneration &&
-      (
-        [
-          "sessionId",
-          "runtimeId",
-          "bridgeEpoch",
-          "navigationGeneration",
-          "viewportGeneration",
-        ] as const
-      ).every((key) => admission.expected[key] === input.expected[key]);
-    if (!contextMatches) session.humanInputAdmission = null;
-    return contextMatches && admission.frameId === input.target.frameId;
   }
 
   private requireGesture(
@@ -1279,7 +1347,11 @@ export class SessionManager {
     this.reset();
   }
 
-  private async getOrCreateSession(workspaceId: string, tabId?: string): Promise<BrowserSession> {
+  private async getOrCreateSession(
+    workspaceId: string,
+    tabId?: string,
+    replaceLost = false,
+  ): Promise<BrowserSession> {
     if (this.archived.has(workspaceId)) throw new Error("Workspace was archived");
     const closing = this.sessionClosures.get(workspaceId);
     if (closing) await closing.catch(() => undefined);
@@ -1297,13 +1369,13 @@ export class SessionManager {
     )?.[1];
     if (workspaceCreation) {
       await workspaceCreation.catch(() => undefined);
-      return this.getOrCreateSession(workspaceId, tabId);
+      return this.getOrCreateSession(workspaceId, tabId, replaceLost);
     }
     const key = tabId ? `${workspaceId}/${tabId}` : workspaceId;
     if (this.sessions.size + this.sessionCreations.size >= this.maxSessions)
       throw new Error(`Shared browser session limit (${this.maxSessions}) reached`);
     const lifecycleGeneration = this.lifecycleGeneration;
-    const creation = this.createSession(workspaceId, key, tabId);
+    const creation = this.createSession(workspaceId, key, tabId, replaceLost);
     this.sessionCreations.set(key, creation);
     try {
       const session = await creation;
@@ -1327,10 +1399,11 @@ export class SessionManager {
     workspaceId: string,
     key: string,
     requestedTabId?: string,
+    replaceLost = false,
   ): Promise<BrowserSession> {
     let runtimeId: string | null = null;
     try {
-      const descriptor = await this.client.ensureWorkspace(workspaceId);
+      const descriptor = await this.client.ensureWorkspace(workspaceId, { replaceLost });
       runtimeId = descriptor.runtimeId;
       const initialTarget = requestedTabId ? { targetId: requestedTabId } : null;
       const identity = asRecord(
@@ -1386,9 +1459,13 @@ export class SessionManager {
         canGoBack: Boolean(state.canGoBack),
         canGoForward: Boolean(state.canGoForward),
         error: null,
+        notice:
+          typeof identity.displayNotice === "string"
+            ? boundedText(identity.displayNotice, 256)
+            : null,
+        runtimeLost: false,
         archived: false,
         gesture: null,
-        humanInputAdmission: null,
         inputGeneration: typeof state.inputGeneration === "string" ? state.inputGeneration : null,
       };
     } catch (error) {
@@ -1415,12 +1492,22 @@ export class SessionManager {
     input: JsonValue,
   ): Promise<JsonValue> {
     if (session.archived) throw new Error("Workspace was archived");
-    if (!session.tabId) return this.client.requestWorkspace(session.workspaceId, operation, input);
     const data = input && typeof input === "object" && !Array.isArray(input) ? input : {};
-    return this.client.requestWorkspace(session.workspaceId, operation, {
-      ...data,
-      targetId: session.tabId,
-    });
+    return this.client
+      .requestWorkspace(
+        session.workspaceId,
+        operation,
+        session.tabId ? { ...data, targetId: session.tabId } : input,
+      )
+      .catch((error) => {
+        if (error instanceof RuntimeProtocolError && error.code === "RUNTIME_LOST") {
+          // The workspace's single browser is gone, so every page session of it is gone.
+          session.runtimeLost = true;
+          for (const candidate of this.sessions.values())
+            if (candidate.workspaceId === session.workspaceId) candidate.runtimeLost = true;
+        }
+        throw error;
+      });
   }
 
   /** Cleanup depends on viewer ownership, never on whether capture produced pixels. */
@@ -1457,7 +1544,10 @@ export class SessionManager {
       this.closedViewerTabs.delete(token);
     }
     const session = this.viewerSessions.get(token);
-    if (!session || !session.viewers.has(token))
+    const viewer = session?.viewers.get(token);
+    // Expiry is enforced at the authentication boundary itself: an unpruned lapsed lease
+    // never authorizes an entrypoint that does not run pruneExpired first.
+    if (!session || !viewer || viewer.expiresAt <= this.now())
       throw new Error("Viewer token is invalid or expired");
     return session;
   }
@@ -1465,18 +1555,18 @@ export class SessionManager {
     this.pruneExpired(session);
     this.heartbeatViewer(session, token);
     if (session.controller?.viewerToken === token)
-      session.controller.expiresAt = this.now() + this.controlLeaseMs;
+      session.controller.expiresAt =
+        this.now() + this.policyForViewer(session, token).controlLeaseMs;
   }
   private heartbeatViewer(session: BrowserSession, token: string): void {
     const viewer = session.viewers.get(token);
     if (!viewer) throw new Error("Viewer token is invalid or expired");
-    viewer.expiresAt = this.now() + this.viewerTtlMs;
+    viewer.expiresAt = this.now() + viewer.policy.viewerTtlMs;
   }
   private pruneExpired(session: BrowserSession): void {
     const now = this.now();
     for (const [token, viewer] of session.viewers)
       if (viewer.expiresAt <= now) {
-        if (session.humanInputAdmission?.viewerToken === token) session.humanInputAdmission = null;
         session.viewers.delete(token);
         this.viewerSessions.delete(token);
       }
@@ -1484,7 +1574,6 @@ export class SessionManager {
       session.controller &&
       (session.controller.expiresAt <= now || !session.viewers.has(session.controller.viewerToken))
     ) {
-      session.humanInputAdmission = null;
       session.controller = null;
       void this.serialize(session, () => this.cancelGesture(session)).catch(() => undefined);
     }
@@ -1528,32 +1617,63 @@ export class SessionManager {
     )
       throw new Error("Browser bridge state is stale");
   }
+  /** Policy belongs to the registered route, never its caller-controlled display label. */
+  private policyForViewer(session: BrowserSession, viewerToken: string): BrowserViewerPolicy {
+    const viewer = session.viewers.get(viewerToken);
+    if (!viewer) throw new Error("Viewer token is invalid or expired");
+    return viewer.policy;
+  }
+
+  /** Shared cached pixels retain independent human/agent observations and deadlines. */
+  private frameReceiptKey(session: BrowserSession, viewerToken: string, frameId: string): string {
+    return this.policyForViewer(session, viewerToken).kind === "agent"
+      ? `agent:${frameId}`
+      : frameId;
+  }
+
+  /** Use the same elapsed clock as the issued receipt, including video observations. */
+  private frameAge(frame: FrameObservation): number {
+    return frame.observedAtMonotonicMs === undefined
+      ? this.now() - frame.observedAt
+      : this.monotonicNow() - frame.observedAtMonotonicMs;
+  }
+
   private requireRecentFrame(
     session: BrowserSession,
+    viewerToken: string,
     target: { frameId: string; navigationGeneration: number; viewportGeneration: number },
   ): void {
     // Retain diagnostic evidence before validation prunes expired receipts.
     // An absent receipt cannot distinguish expiry from an earlier revocation.
-    const frame = session.recentFrames.get(target.frameId);
-    if (this.isRecentFrame(session, target)) return;
+    const frame = session.recentFrames.get(
+      this.frameReceiptKey(session, viewerToken, target.frameId),
+    );
+    if (this.isRecentFrame(session, viewerToken, target)) return;
     if (!frame) throw createBrowserFrameRejection("admission", "missing-or-revoked");
 
-    const expiresAt = frame.expiresAtMonotonicMs ?? frame.expiresAt;
-    const now = frame.expiresAtMonotonicMs === undefined ? this.now() : this.monotonicNow();
-    const ageMs = now - (expiresAt - FRAME_TOKEN_TTL_MS);
-    const reason = expiresAt <= now ? "expired" : "context-changed";
+    const ageMs = this.frameAge(frame);
+    const expired =
+      ageMs >= this.policyForViewer(session, viewerToken).frameTtlMs ||
+      (frame.expiresAtMonotonicMs === undefined
+        ? this.now() >= frame.expiresAt
+        : this.monotonicNow() >= frame.expiresAtMonotonicMs);
+    const reason = expired ? "expired" : "context-changed";
     throw createBrowserFrameRejection("admission", reason, ageMs);
   }
 
   /** Check issued frame authority without admitting or cancelling a live channel. */
   private isRecentFrame(
     session: BrowserSession,
+    viewerToken: string,
     target: { frameId: string; navigationGeneration: number; viewportGeneration: number },
   ): boolean {
     this.pruneRecentFrames(session);
-    const frame = session.recentFrames.get(target.frameId);
+    const frame = session.recentFrames.get(
+      this.frameReceiptKey(session, viewerToken, target.frameId),
+    );
     return Boolean(
       frame &&
+        this.frameAge(frame) < this.policyForViewer(session, viewerToken).frameTtlMs &&
         target.navigationGeneration === session.navigationGeneration &&
         target.viewportGeneration === session.viewportGeneration &&
         frame.navigationGeneration === session.navigationGeneration &&
@@ -1565,7 +1685,7 @@ export class SessionManager {
     const controller = session.controller;
     if (!controller || controller.viewerToken !== token)
       throw new Error("Browser control lease is invalid or expired");
-    controller.expiresAt = this.now() + this.controlLeaseMs;
+    controller.expiresAt = this.now() + this.policyForViewer(session, token).controlLeaseMs;
   }
   private assertOpen(): void {
     if (this.closed) throw new Error("Shared browser manager is closed");
@@ -1581,8 +1701,8 @@ export class SessionManager {
           (session) =>
             session.sessionId === token ||
             session.controller?.controlToken === token ||
-            session.humanInputAdmission?.frameId === token ||
-            session.recentFrames.has(token),
+            session.recentFrames.has(token) ||
+            session.recentFrames.has(`agent:${token}`),
         )
       )
         return token;
@@ -1699,26 +1819,32 @@ export class SessionManager {
    * JPEG receipts retain the runtime's existing post-input capture-generation fence. */
   private rememberFrame(
     session: BrowserSession,
+    viewerToken: string,
     frame: BrowserFrameAuthority,
     capturedAtMonotonicMs?: number,
     observedAt = this.now(),
-  ): void {
+  ): boolean {
     if (capturedAtMonotonicMs !== undefined && session.videoInputNotBefore !== null) {
       const exclusiveFloor = session.videoInputNotBefore + VIDEO_SOURCE_CLOCK_TOLERANCE_MS;
       if (!Number.isFinite(capturedAtMonotonicMs) || capturedAtMonotonicMs <= exclusiveFloor) {
-        session.recentFrames.delete(frame.frameId);
-        return;
+        session.recentFrames.delete(this.frameReceiptKey(session, viewerToken, frame.frameId));
+        return false;
       }
     }
     this.pruneRecentFrames(session);
-    session.recentFrames.set(frame.frameId, {
+    const frameTtlMs = this.policyForViewer(session, viewerToken).frameTtlMs;
+    const observedAtMonotonicMs = this.monotonicNow();
+    const receiptKey = this.frameReceiptKey(session, viewerToken, frame.frameId);
+    session.recentFrames.set(receiptKey, {
+      observedAt,
       navigationGeneration: frame.navigationGeneration,
       viewportGeneration: frame.viewportGeneration,
-      expiresAt: observedAt + FRAME_TOKEN_TTL_MS,
+      expiresAt: observedAt + frameTtlMs,
       ...(capturedAtMonotonicMs === undefined
         ? {}
         : {
-            expiresAtMonotonicMs: this.monotonicNow() + FRAME_TOKEN_TTL_MS,
+            observedAtMonotonicMs,
+            expiresAtMonotonicMs: observedAtMonotonicMs + frameTtlMs,
           }),
     });
     while (session.recentFrames.size > MAX_RECENT_FRAMES) {
@@ -1726,6 +1852,7 @@ export class SessionManager {
       if (!oldest) break;
       session.recentFrames.delete(oldest);
     }
+    return session.recentFrames.has(receiptKey);
   }
 
   /**
@@ -1761,18 +1888,19 @@ export class SessionManager {
     };
   }
 
-  /** A strict discrete press owns one private native cleanup channel. The ID is
-   * never returned to callers and grants no agent continuation. Native end uses
-   * the original page even after navigation, revocation or a lost down ACK. */
+  /** Every discrete native primitive (text, key, press, hover, wheel) runs on one private
+   * channel pinned to the original attachment and document, which the runtime re-checks
+   * before each publication. The ID is never returned to callers and grants no agent
+   * continuation. Native end uses the original page even after navigation, revocation
+   * or a lost down ACK. */
   private async dispatchDiscreteInput(
     session: BrowserSession,
     event: BrowserInputEvent,
     assertTargetCurrent: () => Promise<void>,
   ): Promise<void> {
-    if (event.kind !== "key" && event.kind !== "click" && event.kind !== "drag") {
-      await this.dispatchInput(session, event, assertTargetCurrent);
-      return;
-    }
+    // Reconcile the captured document before anything is published, hover included, so a
+    // stalled or failed metadata read holds back every native primitive.
+    await assertTargetCurrent();
     if (session.inputGeneration === null) {
       throw new Error("Browser input identity is unavailable");
     }
@@ -1793,42 +1921,45 @@ export class SessionManager {
     session: BrowserSession,
     event: BrowserInputEvent,
     assertTargetCurrent: () => Promise<void>,
-    gestureId?: string,
+    gestureId: string,
   ): Promise<void> {
-    // Hover keeps its existing fast path. It must not wait behind page metadata
-    // while video is pending; the initial control/frame checks still apply.
+    // The document was reconciled and pinned by dispatchDiscreteInput; the runtime refuses
+    // every primitive below once its attachment or document differs from that pin.
     if (event.kind === "move") {
       const point = mapDisplayedPoint(event.point, session.viewport);
-      await this.request(session, "mouse.move", { x: point.x, y: point.y });
+      await this.request(session, "mouse.move", { x: point.x, y: point.y, gestureId });
       return;
     }
-    await assertTargetCurrent();
     if (event.kind === "type") {
-      await this.request(session, "text.insert", { text: event.text });
+      await this.request(session, "text.insert", {
+        text: event.text,
+        gestureId,
+      });
       return;
     }
     if (event.kind === "key") {
       await this.request(session, "key.down", {
         key: event.key,
-        ...(gestureId ? { gestureId } : {}),
+        gestureId,
       });
       await runWithInputCleanup(assertTargetCurrent, () =>
         this.request(session, "key.up", {
           key: event.key,
-          ...(gestureId ? { gestureId } : {}),
+          gestureId,
         }),
       );
       return;
     }
     if (event.kind === "scroll") {
       const point = mapDisplayedPoint(event.point, session.viewport);
-      await this.request(session, "mouse.move", { x: point.x, y: point.y });
+      await this.request(session, "mouse.move", { x: point.x, y: point.y, gestureId });
       await assertTargetCurrent();
       await this.request(session, "mouse.wheel", {
         x: point.x,
         y: point.y,
         deltaX: event.deltaX,
         deltaY: event.deltaY,
+        gestureId,
       });
       return;
     }
@@ -1839,7 +1970,7 @@ export class SessionManager {
     await this.request(session, "mouse.move", {
       x: start.x,
       y: start.y,
-      ...(gestureId ? { gestureId } : {}),
+      gestureId,
     });
     await assertTargetCurrent();
     const count = event.kind === "click" ? event.clickCount : 1;
@@ -1849,7 +1980,7 @@ export class SessionManager {
         y: start.y,
         button: event.button,
         clickCount,
-        ...(gestureId ? { gestureId } : {}),
+        gestureId,
       });
       await runWithInputCleanup(
         async () => {
@@ -1859,7 +1990,7 @@ export class SessionManager {
             await this.request(session, "mouse.move", {
               x: end.x,
               y: end.y,
-              ...(gestureId ? { gestureId } : {}),
+              gestureId,
             });
             await assertTargetCurrent();
           }
@@ -1872,7 +2003,7 @@ export class SessionManager {
             y: end.y,
             button: event.button,
             clickCount,
-            ...(gestureId ? { gestureId } : {}),
+            gestureId,
           });
         },
       );
@@ -1888,7 +2019,6 @@ export class SessionManager {
     const documentChanged =
       session.inputGeneration !== null && inputGeneration !== session.inputGeneration;
     if ((session.lastUrl && session.lastUrl !== url) || documentChanged) {
-      session.humanInputAdmission = null;
       await this.cancelGesture(session);
       session.navigationGeneration += 1;
       this.invalidateFrames(session);
@@ -1945,6 +2075,7 @@ export class SessionManager {
       controllerExpiresAt: controller ? new Date(controller.expiresAt).toISOString() : null,
       viewerCount: session.viewers.size,
       error: session.error,
+      ...(session.notice ? { notice: session.notice } : {}),
     };
   }
 }

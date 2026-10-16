@@ -44,8 +44,10 @@ organization names.
   It strips inherited `AGENT_BROWSER_*` variables and sets `AGENT_BROWSER_SOCKET_DIR`,
   `AGENT_BROWSER_IDLE_TIMEOUT_MS=0`, `AGENT_BROWSER_STREAM_PORT=0`, and
   `AGENT_BROWSER_NO_AUTO_DIALOG=1` itself.
-- Desktop/web clients with usable WebCodecs and Android apps with the host video renderer
-  receive encoded workspace-tab video. Other native and unsupported clients receive JPEG frames from CDP `Page.startScreencast` or bounded screenshots.
+- By default every client receives JPEG frames from CDP `Page.startScreencast` or bounded
+  screenshots, and no capture extension is loaded into Chromium. When the daemon is started with
+  `PASEO_SHARED_BROWSER_VIDEO=1`, desktop/web clients with usable WebCodecs and matching Android fork hosts receive encoded
+  workspace-tab video instead; other clients keep JPEG.
   Remote input supports mouse hover, wheel scrolling, continuous dragging, native touch pan/pinch,
   tap, double-tap, right-click, text, and special keys.
 - Device presets for Desktop Chrome, iPhone 15 Pro, Pixel 7, and iPad Pro 11 change Chromium's
@@ -108,9 +110,21 @@ Before upgrading the plugin on Windows, close active Shared Browser sessions and
 daemon; Windows does not allow the installer to replace runtime executables that are still running.
 
 Open a workspace, search the Command Center for **Open Shared Browser**, or tap the **Shared
-Browser** composer pill while a workspace session is open. On Paseo 0.11 or newer, a **Shared
+Browser** composer pill while a workspace session is open. A **Shared
 Browser (n)** row in the sidebar footer appears while browser sessions are open; it lists them and
 jumps to the chosen workspace's browser panel.
+
+## Fork input and host extensions
+
+The native **Keyboard** action retains basic live typing and Backspace. Use **Compose text**
+and Done for IME input or corrections; the shared Compose sheet keeps the host-owned draft and
+upstream stale-callback protection. Keyboard input uses the same acknowledged gesture queue as
+pointer input and is cleared when control, the selected tab, or the document changes.
+
+The agent `shared_browser_device` tool remains available with the human picker's presets.
+Agent custom viewports retain the fork's 3840 x 3840 bound, including high-resolution desktop
+workflows. This is an intentional fork difference from upstream's smaller agent-only limit.
+Device changes require control, target the selected tab, and invalidate earlier captures.
 
 ## Agent MCP access
 
@@ -118,13 +132,12 @@ The plugin automatically injects its stdio MCP adapter only when a new, non-inte
 created with a provider that accepts external MCP servers. Agents without an existing adapter and
 Paseo's internal agents are not modified. Interactive resume/refresh/import launches that retain
 an injected ticket renew its binding through the trusted launch hook. Paseo's built-in OMP
-provider accepts session MCP servers from Paseo 0.11, so new OMP agents receive the adapter there.
-Pi agents also receive the adapter, but require Pi's optional MCP support to
-launch it.
+provider accepts session MCP servers, so new OMP agents receive the adapter.
+Pi agents also receive the adapter, but require Pi's optional MCP support to launch it.
 
 The injected MCP server exposes `shared_browser_open`, `shared_browser_reconnect`,
-`shared_browser_status`, `shared_browser_capture`,
-`shared_browser_device`, `shared_browser_acquire_control`, `shared_browser_release_control`,
+`shared_browser_status`, `shared_browser_capture`, `shared_browser_device`,
+`shared_browser_acquire_control`, `shared_browser_release_control`,
 `shared_browser_navigate`, `shared_browser_input`, `shared_browser_viewport`,
 `shared_browser_tabs`, `shared_browser_tab_open`, `shared_browser_tab_select`, and
 `shared_browser_tab_close`. It does not
@@ -227,18 +240,22 @@ or remove the file to return to normal selection. An explicit
   page instead. Fitting images stay centered without empty scroll ranges; a scrollbar on
   one axis does not force one on the other. Returning to Fit resets local offsets without
   reloading the page or image.
-- Desktop and web clients with WebCodecs play genuine encoded tab video (H264 when supported,
-  otherwise VP8). The trusted bundled helper captures the exact workspace tab, not a screenshot
-  loop or title-selected window. Android uses Paseo's host-owned WebView canvas and retains native
-  touch controls. It requires an Android app rebuilt with the `EncodedVideo` plugin SDK API and
-  a System WebView supporting the stream codec. Other native apps and clients without usable
-  video decoding keep the existing JPEG fallback.
-- The monitor menu's resolution and quality list separates JPEG quality (70%, 90%, 95%,
+- With `PASEO_SHARED_BROWSER_VIDEO=1` set in the daemon environment, desktop and web clients
+  with WebCodecs play genuine encoded tab video (H264 when supported, otherwise VP8). The
+  bundled capture helper, which holds `tabCapture` and `debugger` permissions, is then
+  loaded into every workspace Chromium profile and captures the exact workspace tab, not a
+  screenshot loop or title-selected window. Without the variable the helper is never
+  materialized or loaded, and clients show a one-time disabled reply then use JPEG.
+  Android clients running the matching Paseo fork retain acknowledged host-canvas video.
+  This is an optional fork-host extension, not an export of the published SDK. Stock Android
+  clients and other native apps retain JPEG. Input authority waits for the exact host paint
+  acknowledgement and still follows the upstream source and receipt checks.
+- The monitor menu's resolution and quality list separates JPEG quality (40%, 65%, 85%,
   or 100%), video bitrate (2, 5, 12, or 24 Mbps), and video frame rate (15, 30, or 60 FPS).
-  Defaults remain JPEG95 and 12 Mbps at 30 FPS. Old saved quality choices keep their
+  Defaults are JPEG65 (Medium) and, when video is enabled, 12 Mbps at 30 FPS. Old saved quality choices keep their
   corresponding video bitrate when upgraded. These are encoder targets, not measured
   bandwidth or guaranteed frame rates. Large JPEGs may reduce quality to stay within
-  the existing 4 MiB frame bound. Preferences persist on the connected Paseo host.
+  the 800 KB frame bound. Preferences persist on the connected Paseo host.
   Capture density defaults to Auto for each viewer panel. While controlling, it selects
   1x or 2x from the displayed page size and screen pixel density, accounting for Fit's
   letterboxing and Actual size. Manual 1x/2x choices override Auto until Auto is selected
@@ -313,19 +330,18 @@ or remove the file to return to normal selection. An explicit
   input. Known receipt age is bounded to 60 seconds and uses its original clock; missing
   receipts report missing-or-revoked without inventing an age. These diagnostics contain
   no page content or authority identifiers and do not authorize replay. Initial frame
-  admission still expires after five seconds.
+  admission expires after one minute for trusted agent screenshots and after five seconds
+  for human viewer receipts. Agent viewer and idle control leases last five minutes; humans
+  can take over immediately. Status and capture responses expose the effective agent policy,
+  and captures include the actual frameExpiresAt deadline.
 - Human control: **Take control**, **Release**, and **Take over** for explicit handoff. Agent MCP
   calls have no forced-takeover operation.
 - With control, mouse movement forwards real hover effects and standard browser cursor changes.
   Wheel scrolling stays inside the browser canvas; held drags update before release. Leaving the
   canvas clears remote hover, while dragging beyond its edges still releases the held button.
-- Hidden Linux browsers use an authenticated private virtual display when `/usr/bin/Xvfb`
-  is already installed. This supplies native desktop pointer/hover capabilities after switching
-  back from phone mode. It opens no visible window or TCP listener, changes no host display
-  settings, and adds about 25 MiB of framebuffer memory per workspace plus server overhead.
-  The owned display is stopped with its browser. Other platforms, missing Xvfb, or a fully
-  cleaned display-startup failure retain the existing launch behavior; headless Linux may
-  still lack media-query-gated hover. The plugin does not install Xvfb automatically.
+- Hidden Linux browsers are headless by default. Opting in to a private virtual display
+  (see Optional Linux desktop hover) supplies native desktop pointer/hover capabilities,
+  including after switching back from phone mode.
 - Native touch forwards active fingers continuously, including pan and pinch on desktop and mobile
   presets. Physical mouse buttons and double clicks retain their natural actions; touch never
   changes into a synthetic mouse gesture.
@@ -339,11 +355,10 @@ or remove the file to return to normal selection. An explicit
 - The address-bar Browser menu contains a Send keys submenu and reconnect actions. On desktop,
   keys open beside the menu; on compact screens, Back returns to the parent menu. Extra keys
   are no longer shown below the canvas or in a separate dialog.
-- On native phones, Keyboard in that menu opens the software keyboard for basic live typing
-  and Backspace
-  without a visible text box. Autocorrection is disabled. Compose opens an explicit local
-  draft for IME text, inserted once with Done. Native hardware shortcuts are not supported
-  by this software-keyboard relay. Extra keys remain available in the Send keys submenu.
+- On native phones and compact web layouts, Compose text in that menu opens an explicit local
+  draft for keyboard or IME text, inserted once into the focused page field when you choose
+  Done. Native phones have no live software-keyboard relay; compact web also keeps canvas
+  typing. Extra keys remain available in the Send keys submenu.
 - Local plain-text paste is forwarded; remote copy/cut are not synchronized to the local clipboard.
 - The address-bar mobile toggle changes shared emulation while preserving the current display
   dimensions and capture density. Choose a resolution explicitly to change the display.
@@ -452,7 +467,8 @@ host to recover a test failure.
 control handoff, reconnect, stale-frame rejection, viewport changes, device emulation, profile
 persistence, and archive teardown.
 
-`bun run test:video` is an optional real video gate. It reads prepared Chromium/CLI assets,
+`bun run test:video` is an optional real video gate. It opts its own runtime into encoded video
+and reads prepared Chromium/CLI assets,
 then creates its own temporary Paseo home, browser profile, Unix socket and local fixture pages.
 It checks the production video decoder and canvas at 1280x800, sharp Pixel and 2560x2560,
 including all four corner markers. It never uses the live browser. This gate requires usable
@@ -465,14 +481,16 @@ runs the actual Paseo compiler on both plugin entries.
 Release Please maintains the version, changelog, component tag, and GitHub release from
 Conventional Commits in the monorepo.
 
-Both the Paseo daemon and app must satisfy the version range in `paseo-plugin.json`.
-The upstream 0.9, 0.10 and 0.11 ranges remain supported by the manifest;
-the tested `0.11.0-beta.3` prerelease is also allowed. Older daemon/client
-combinations still need runtime qualification. Encoded video requires the
-optional host decoding capability and retains JPEG fallback when unavailable. The client surface uses React Native primitives
-and works in desktop, web, iOS, and Android Paseo clients.
+Both the Paseo daemon and app must satisfy `^0.11.0` or the retained explicit
+`0.11.0-beta.3`, `0.11.0-beta.4`, or `0.11.0-beta.5` allowances. Encoded video is opt-in
+on the daemon and requires WebCodecs in a web client or the matching Android fork-host surface;
+JPEG is always available. The client surface uses React
+Native primitives and works in desktop, web, iOS, and Android Paseo clients.
 
-For an initial, not-yet-admitted channel, a wheel capture can finish decoding
+Every independent press (mouse down or first touch contact) carries the decoded frame
+receipt that was visible when it was made. Human receipts last five seconds and are spent by
+acknowledged input, so a stalled or superseded presentation cannot admit a later click;
+held drags, releases and keys continue on their channel. A wheel capture can finish decoding
 after input revoked its frame token. The server
 returns a known non-admission receipt before creating a new channel; the canvas waits
 for another decoded frame before admitting that still-unsent gesture. Recovery allows
@@ -488,6 +506,33 @@ records primary-source comparisons and the trade-offs behind continuous human
 input. These describe the implementation's guarantees, not a promise of a
 particular frame rate or remote-network latency.
 
-On Linux, set `PASEO_SHARED_BROWSER_XVFB=0` in the daemon environment to
-retain headless launch behavior for new workspace runtimes. The plugin does
-not install Xvfb or change host display settings.
+
+## Optional Linux desktop hover
+
+Hidden browsers are headless by default. To expose desktop pointer and hover
+behavior on Linux, opt in by setting `PASEO_SHARED_BROWSER_XVFB=1` (exactly `1`;
+any other value stays headless) in the environment of the Shared Browser
+supervisor process. The supervisor is a detached process that inherits the
+daemon environment when it is spawned, so changing the variable affects it only
+after that supervisor process restarts. Within a running supervisor the variable
+is read each time a workspace browser runtime is created; existing runtimes keep
+their mode. A trusted embedding can pass `virtualDisplay: true | false` to
+`createRuntimeOwner`; an explicit `false` overrides the variable.
+
+When opted in and `/usr/bin/Xvfb` exists, each hidden Linux browser uses its own
+private, authenticated display. No visible window opens and no TCP or pathname
+listener is created. The display is stopped with its browser. Headed mode and
+non-Linux platforms are unchanged. The plugin never installs Xvfb or changes host
+display settings.
+
+If the display cannot start, the browser falls back to headless and the viewer
+shows a short notice (for example "Private display unavailable: Xvfb was not
+found."). The notice never contains paths or credentials. If an opted-in display
+dies while running, requests fail and the viewer shows an error; use **Reconnect
+viewer** to replace the browser. Reconnect discards the old runtime and starts a
+new one, so the page reloads from its initial URL, and old viewer, control and
+input attachments are rejected. Nothing is replayed automatically.
+
+Known limitation: if the supervisor is killed with SIGKILL it cannot stop its
+child, so an orphaned Xvfb process and its private authority directory under the
+temporary directory can remain until removed manually.

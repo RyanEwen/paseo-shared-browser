@@ -3,8 +3,8 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, it } from "vitest";
-import { parseRuntimeRequest, RUNTIME_PROTOCOL_VERSION } from "../server/runtime-protocol";
 import { AgentBindingStore } from "../server/agent-binding-store";
+import { parseRuntimeRequest, RUNTIME_PROTOCOL_VERSION } from "../server/runtime-protocol";
 
 it("stores hashed credentials, restores exact selection, and revokes archived workspaces", async () => {
   const root = await mkdtemp(join(tmpdir(), "shared-browser-authority-"));
@@ -41,12 +41,24 @@ it("fails closed for corrupt or publicly readable authority files", async () => 
   }
 });
 
-
 it("accepts every advertised recovery and tab operation over the wire", () => {
-  for (const operation of ["reconnect", "open", "tabs.list", "tabs.create", "tabs.select", "tabs.close"]) {
-    expect(parseRuntimeRequest({
-      id: "correlated", version: RUNTIME_PROTOCOL_VERSION, method: "agent.request",
-      ticket: "opaque", operation, input: {},
-    })).toMatchObject({ id: "correlated", operation });
+  for (const operation of [
+    "reconnect",
+    "open",
+    "tabs.list",
+    "tabs.create",
+    "tabs.select",
+    "tabs.close",
+  ]) {
+    expect(
+      parseRuntimeRequest({
+        id: "correlated",
+        version: RUNTIME_PROTOCOL_VERSION,
+        method: "agent.request",
+        ticket: "opaque",
+        operation,
+        input: {},
+      }),
+    ).toMatchObject({ id: "correlated", operation });
   }
 });

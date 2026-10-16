@@ -4,7 +4,6 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { browserTabIdSchema } from "../shared/browser";
-import { DEFAULT_CAPTURE_QUALITY } from "../shared/capture-settings";
 import { DEVICE_PRESET_IDS } from "../shared/device-presets";
 import { MAX_VIEWPORT, MIN_VIEWPORT } from "../shared/viewport-limits";
 import type { JsonValue } from "./runtime-protocol";
@@ -126,7 +125,8 @@ async function main(): Promise<void> {
   server.registerTool(
     "shared_browser_status",
     {
-      description: "Read the current shared browser state for this agent's workspace.",
+      description:
+        "Read the current shared browser state and effective agent timing policy. Agent screenshots last one minute; agent viewer/control idle budgets are five minutes, with immediate human takeover.",
       inputSchema: z.object({}),
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
@@ -137,9 +137,9 @@ async function main(): Promise<void> {
     "shared_browser_capture",
     {
       description:
-        "Capture the current shared browser frame and state. Capture before sending input.",
+        "Capture the current shared browser frame, effective policy and frameExpiresAt deadline. Agent screenshots remain eligible for one minute from observation, unless input, navigation, viewport, tab, runtime, attachment or control changes revoke them sooner. Capture before each independent input; a reasoning pause beyond five seconds is allowed within that deadline.",
       inputSchema: z.object({
-        quality: z.enum(["low", "medium", "high"]).default(DEFAULT_CAPTURE_QUALITY),
+        quality: z.enum(["low", "medium", "high"]).default("medium"),
       }),
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
@@ -149,7 +149,20 @@ async function main(): Promise<void> {
       const frame = data.frame;
       const content: Array<
         { type: "text"; text: string } | { type: "image"; data: string; mimeType: string }
-      > = [{ type: "text", text: JSON.stringify(data.state, null, 2) }];
+      > = [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              ...asObject(data.state ?? null),
+              agentPolicy: data.agentPolicy ?? null,
+              frameExpiresAt: data.frameExpiresAt ?? null,
+            },
+            null,
+            2,
+          ),
+        },
+      ];
       if (frame && typeof frame === "object" && !Array.isArray(frame)) {
         const image = frame as Record<string, JsonValue>;
         if (typeof image.dataBase64 === "string" && typeof image.mimeType === "string")
@@ -221,7 +234,7 @@ async function main(): Promise<void> {
     "shared_browser_acquire_control",
     {
       description:
-        "Acquire browser control if no human or other viewer currently holds it. Forced takeover is unavailable.",
+        "Acquire browser control if no human or other viewer currently holds it. The agent idle lease lasts five minutes; humans can take over immediately. Forced takeover by an agent is unavailable.",
       inputSchema: z.object({}),
       annotations: {
         readOnlyHint: false,
@@ -278,7 +291,7 @@ async function main(): Promise<void> {
     "shared_browser_input",
     {
       description:
-        "Send one input event using the exact frame returned by the latest capture. Stale frames are rejected.",
+        "Send one input event using the exact frame returned by the latest capture, before its frameExpiresAt deadline (one minute for agents). A reasoning pause beyond five seconds alone does not expire an agent screenshot. Input, navigation, viewport, tab, runtime, native attachment or control changes still revoke it immediately. Never replay an uncertain action.",
       inputSchema: z.object({ event: inputEventSchema }),
       annotations: {
         readOnlyHint: false,
@@ -318,11 +331,7 @@ async function main(): Promise<void> {
       description:
         "Apply the same device or display preset as the human picker, including sharper Pixel capture. Requires control and reloads the current page.",
       inputSchema: z.object({ presetId: z.enum(DEVICE_PRESET_IDS) }),
-      annotations: {
-        readOnlyHint: false,
-        destructiveHint: false,
-        idempotentHint: false,
-      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
     },
     async ({ presetId }) => textResult(await client.request("device", { presetId })),
   );

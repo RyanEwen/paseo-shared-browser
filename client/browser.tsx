@@ -62,6 +62,7 @@ import {
   ErrorNotice,
   Field,
 } from "./browser-chrome";
+import { ComposeTextControls } from "./browser-compose-controls";
 import { BrowserControlDialog } from "./browser-control-dialog";
 import {
   type ControlRequest,
@@ -84,6 +85,7 @@ import {
   BrowserMenuSeparator,
   BrowserToolbarMenu,
 } from "./browser-toolbar-menu";
+import { isFrameCurrent, isVideoSourceCurrent } from "./browser-video-currency";
 import { BrowserVideoSurface } from "./browser-video-surface";
 import { isBrowserClosedError, isExpiredBrowserViewerError } from "./browser-viewer-recovery";
 import { createFrameLifecycle } from "./frame-lifecycle";
@@ -121,7 +123,8 @@ interface ControlledActions {
   changeDensity(value: CaptureDensityMode): void;
   toggleEmulation(): void;
   sendKey(key: SpecialKey): void;
-  openNativeKeyboard(kind: "keyboard" | "compose" | "commit"): void;
+  openCompose(kind: "compose" | "commit"): void;
+  openNativeKeyboard(): void;
   closeTab(): void;
   closeBrowser(): void;
   confirmCloseTab(): void;
@@ -182,25 +185,13 @@ function isFrameDisplayCurrent(frame: BrowserFrameAuthority, state: BrowserState
   );
 }
 
-function isFrameCurrent(frame: BrowserFrameAuthority, state: BrowserState): boolean {
-  return (
-    frame.sessionId === state.sessionId &&
-    (!frame.runtimeId || !state.runtimeId || frame.runtimeId === state.runtimeId) &&
-    (frame.captureEpoch === undefined ||
-      state.bridgeEpoch === undefined ||
-      frame.captureEpoch === state.bridgeEpoch) &&
-    frame.navigationGeneration === state.navigationGeneration &&
-    frame.viewportGeneration === state.viewportGeneration
-  );
-}
-
 export function SharedBrowserPanel({
   theme,
   host,
   layout,
   workspaceId,
   active = true,
-}: PluginWorkspacePanelProps) {
+}: PluginWorkspacePanelProps & { active?: boolean }) {
   const queryClient = useQueryClient();
   const styles = useMemo(() => createStyles(theme, layout.compact), [theme, layout.compact]);
   const { scale: screenPixelRatio } = useWindowDimensions();
@@ -316,12 +307,12 @@ export function SharedBrowserPanel({
     setKeysSubmenuOpen(false);
     setToolbarMenu((current) => (current === menu ? null : menu));
   };
-  const [nativeRequest, setNativeRequest] = useState<{
+  const [composeRequest, setComposeRequest] = useState<{
     id: number;
     kind: "keyboard" | "compose" | "commit";
     ownershipKey: string;
   } | null>(null);
-  const nextNativeRequest = useRef(0);
+  const nextComposeRequest = useRef(0);
   const [activeInput, setActiveInput] = useState(false);
   const activeInputRef = useRef(false);
   /** Fence automatic timers immediately, before React commits a new physical press. */
@@ -507,13 +498,17 @@ export function SharedBrowserPanel({
     epoch: () => inputLifecycle.epoch,
     viewport: () => stateRef.current?.viewport ?? null,
     isCurrent: (packet, epoch) =>
-      mountedRef.current &&
-      activeViewerTokenRef.current === viewerToken &&
-      epoch === inputLifecycle.epoch &&
-      committedViewport.current?.sessionId === packet.frame.sessionId &&
-      committedViewport.current?.generation === packet.frame.viewportGeneration &&
-      stateRef.current !== null &&
-      isFrameCurrent(packet.frame, stateRef.current),
+      isVideoSourceCurrent(
+        {
+          mounted: mountedRef.current,
+          viewerActive: activeViewerTokenRef.current === viewerToken,
+          epoch: inputLifecycle.epoch,
+          committedViewport: committedViewport.current,
+          state: stateRef.current,
+        },
+        packet,
+        epoch,
+      ),
     isDisplayCurrent: (packet) => {
       const current = stateRef.current;
       return (
@@ -964,12 +959,17 @@ export function SharedBrowserPanel({
       lastPointRef.current = { x: point.x, y: point.y };
     },
     onActivity: handleInputActivity,
+    onInputAcknowledged: () => {
+      // Pixels requested before the host acknowledged this input cannot authorize
+      // the next press, even when their request began after the local press.
+      inputLifecycle.bump();
+    },
     onInputBoundary: () => {
       inputLifecycle.bump();
     },
   });
 
-  const nativeOwnershipKey = JSON.stringify([
+  const composeOwnershipKey = JSON.stringify([
     viewerToken,
     controlToken,
     state?.sessionId,
@@ -978,7 +978,7 @@ export function SharedBrowserPanel({
     state?.navigationGeneration,
     state?.viewportGeneration,
   ]);
-  const nativeDocumentKey = JSON.stringify([
+  const composeDocumentKey = JSON.stringify([
     viewerToken,
     state?.sessionId,
     state?.runtimeId,
@@ -986,14 +986,16 @@ export function SharedBrowserPanel({
     state?.navigationGeneration,
     state?.viewportGeneration,
   ]);
-  const requestNativeKeyboard = (kind: "keyboard" | "compose" | "commit") => {
+  // Touch-first surfaces (native and compact web) get the explicit draft; desktop web types on the canvas.
+  const composeAvailable = layout.platform !== "web" || layout.compact;
+  const requestCompose = (kind: "keyboard" | "compose" | "commit") => {
     if (!canSendInput) return;
-    nextNativeRequest.current += 1;
+    nextComposeRequest.current += 1;
     closeToolbarMenu(false);
-    setNativeRequest({ id: nextNativeRequest.current, kind, ownershipKey: nativeOwnershipKey });
+    setComposeRequest({ id: nextComposeRequest.current, kind, ownershipKey: composeOwnershipKey });
   };
-  const nativeRequestHandled = useCallback((id: number) => {
-    setNativeRequest((current) => (current?.id === id ? null : current));
+  const composeRequestHandled = useCallback((id: number) => {
+    setComposeRequest((current) => (current?.id === id ? null : current));
   }, []);
 
   const handleCanvasLayout = useCallback((event: LayoutChangeEvent) => {
@@ -1415,7 +1417,8 @@ export function SharedBrowserPanel({
     },
     toggleEmulation: emulation.toggle,
     sendKey: (key) => sendEvent({ kind: "key", key }),
-    openNativeKeyboard: requestNativeKeyboard,
+    openCompose: requestCompose,
+    openNativeKeyboard: () => requestCompose("keyboard"),
     closeTab: () => setTabCloseConfirmationOpen(true),
     closeBrowser: () => setCloseConfirmationOpen(true),
     confirmCloseTab: () => void confirmCloseSelectedTab(),
@@ -1713,11 +1716,11 @@ export function SharedBrowserPanel({
         </View>
       </View>
 
-      {runtimeNotice || visibleError ? (
+      {runtimeNotice || visibleError || state?.notice ? (
         <ErrorNotice
           styles={styles}
           theme={theme}
-          message={runtimeNotice ?? visibleError ?? ""}
+          message={runtimeNotice ?? visibleError ?? state?.notice ?? ""}
           action={connectionError || reconnecting ? "Reconnect" : undefined}
           onAction={connectionError || reconnecting ? reconnect : undefined}
           actionDisabled={attachQuery.isFetching}
@@ -1833,16 +1836,41 @@ export function SharedBrowserPanel({
           styles={styles}
           theme={theme}
           relay={canvasInput.nativeKeyboard}
+          cancelInput={canvasInput.cancel}
           enabled={canSendInput}
-          ownershipKey={nativeOwnershipKey}
-          documentKey={nativeDocumentKey}
-          request={nativeRequest}
-          onRequestHandled={nativeRequestHandled}
+          ownershipKey={composeOwnershipKey}
+          documentKey={composeDocumentKey}
+          request={composeRequest}
+          onRequestHandled={composeRequestHandled}
           canRequestControl={Boolean(viewerToken) && !canControl}
           onRequestControlForCompose={() =>
             requestControlled(
               "insert the composed text",
-              () => controlledActionsRef.current?.openNativeKeyboard("commit"),
+              () => controlledActionsRef.current?.openCompose("commit"),
+              true,
+            )
+          }
+        />
+      ) : composeAvailable ? (
+        <ComposeTextControls
+          styles={styles}
+          theme={theme}
+          composeText={canvasInput.composeText}
+          cancelInput={canvasInput.cancel}
+          enabled={canSendInput}
+          ownershipKey={composeOwnershipKey}
+          documentKey={composeDocumentKey}
+          request={
+            composeRequest && composeRequest.kind !== "keyboard"
+              ? { ...composeRequest, kind: composeRequest.kind }
+              : null
+          }
+          onRequestHandled={composeRequestHandled}
+          canRequestControl={Boolean(viewerToken) && !canControl}
+          onRequestControlForCompose={() =>
+            requestControlled(
+              "insert the composed text",
+              () => controlledActionsRef.current?.openCompose("commit"),
               true,
             )
           }
@@ -2070,9 +2098,9 @@ export function SharedBrowserPanel({
           preferredHeight={
             toolbarMenu === "display"
               ? 300 + preferences.favoritePresetIds.length * (layout.compact ? 44 : 36)
-              : layout.platform === "web"
-                ? 132
-                : 220
+              : composeAvailable
+                ? 220
+                : 132
           }
           onClose={() => closeToolbarMenu()}
           shouldRestoreFocus={() => menuRestoreFocus.current}
@@ -2205,38 +2233,38 @@ export function SharedBrowserPanel({
           ) : (
             <>
               {layout.platform !== "web" ? (
-                <>
-                  <BrowserMenuItem
-                    theme={theme}
-                    compact={layout.compact}
-                    label="Keyboard"
-                    icon="Keyboard"
-                    disabled={!viewerToken || (canControl && !canSendInput)}
-                    onPress={() => {
-                      closeToolbarMenu();
-                      requestControlled(
-                        "open the browser keyboard",
-                        () => controlledActionsRef.current?.openNativeKeyboard("keyboard"),
-                        true,
-                      );
-                    }}
-                  />
-                  <BrowserMenuItem
-                    theme={theme}
-                    compact={layout.compact}
-                    label="Compose text"
-                    icon="Pencil"
-                    disabled={!viewerToken || (canControl && !canSendInput)}
-                    onPress={() => {
-                      closeToolbarMenu();
-                      requestControlled(
-                        "compose browser text",
-                        () => controlledActionsRef.current?.openNativeKeyboard("compose"),
-                        true,
-                      );
-                    }}
-                  />
-                </>
+                <BrowserMenuItem
+                  theme={theme}
+                  compact={layout.compact}
+                  label="Keyboard"
+                  icon="Keyboard"
+                  disabled={!viewerToken || (canControl && !canSendInput)}
+                  onPress={() => {
+                    closeToolbarMenu();
+                    requestControlled(
+                      "open the browser keyboard",
+                      () => controlledActionsRef.current?.openNativeKeyboard(),
+                      true,
+                    );
+                  }}
+                />
+              ) : null}
+              {composeAvailable ? (
+                <BrowserMenuItem
+                  theme={theme}
+                  compact={layout.compact}
+                  label="Compose text"
+                  icon="Pencil"
+                  disabled={!viewerToken || (canControl && !canSendInput)}
+                  onPress={() => {
+                    closeToolbarMenu();
+                    requestControlled(
+                      "compose browser text",
+                      () => controlledActionsRef.current?.openCompose("compose"),
+                      true,
+                    );
+                  }}
+                />
               ) : null}
               <View ref={keysAnchorRef}>
                 <BrowserMenuItem

@@ -23,6 +23,7 @@ import { readBrowserVideoRpc } from "../shared/browser-video";
 import { DEFAULT_CAPTURE_QUALITY } from "../shared/capture-settings";
 import { AgentBindingStore } from "./agent-binding-store";
 import { SessionManager } from "./browser-policy";
+import { AGENT_VIEWER_POLICY } from "./browser-viewer-policy";
 import { CdpUnknownOutcomeError } from "./cdp";
 import {
   type BridgeLease,
@@ -33,6 +34,7 @@ import {
   parseRuntimeRequest,
   RUNTIME_PROTOCOL_VERSION,
   type RuntimeDescriptor,
+  RuntimeLostError,
   RuntimeProtocolError,
   type RuntimeRequest,
   type RuntimeResponse,
@@ -81,6 +83,7 @@ export interface RuntimeSupervisorOptions<Runtime extends RuntimeInstance> {
 
 interface WorkspaceEntry<Runtime extends RuntimeInstance> {
   createdAt: number;
+  lost?: boolean;
   runtime: Runtime;
 }
 
@@ -153,7 +156,8 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
       validateWorkspace: async (workspaceId) => !this.archived.has(workspaceId),
       client: {
         connect: async () => ({ epoch: this.nextEpoch }),
-        ensureWorkspace: (workspaceId) => this.ensureWorkspaceLocal(workspaceId),
+        ensureWorkspace: (workspaceId, options) =>
+          this.ensureWorkspaceLocal(workspaceId, options?.replaceLost === true),
         requestWorkspace: (workspaceId, operation, input) =>
           this.requestWorkspaceLocal(workspaceId, operation, input),
         archiveWorkspace: (workspaceId) => this.archiveWorkspaceLocal(workspaceId).then(() => {}),
@@ -269,10 +273,28 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
     this.assertActiveBridge(bridgeId, epoch);
   }
 
-  private ensureWorkspaceLocal(workspaceId: string): Promise<RuntimeDescriptor> {
+  private ensureWorkspaceLocal(
+    workspaceId: string,
+    replaceLost = false,
+  ): Promise<RuntimeDescriptor> {
     return this.runWorkspaceOperation(workspaceId, async () => {
       if (this.archived.has(workspaceId)) this.workspaceArchived(workspaceId);
       let entry = this.workspaces.get(workspaceId);
+      if (entry?.lost) {
+        // Only the in-process explicit human attach carries this authority; protocol
+        // workspace.ensure and implicit agent paths observe the loss instead.
+        if (!replaceLost)
+          throw new RuntimeProtocolError(
+            "RUNTIME_LOST",
+            "Workspace runtime was lost; reconnect explicitly to replace it",
+          );
+        // Fail closed: release the dead runtime before any replacement exists.
+        // Stop first: if the daemon's exit cannot be confirmed the entry stays lost and
+        // no replacement is created behind a possibly live session.
+        await this.owner.stop(entry.runtime);
+        this.workspaces.delete(workspaceId);
+        entry = undefined;
+      }
       if (!entry) {
         let creation = this.creations.get(workspaceId);
         if (!creation) {
@@ -349,6 +371,10 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
         return result;
       } catch (error) {
         if (error instanceof RuntimeProtocolError) throw error;
+        if (error instanceof RuntimeLostError) {
+          entry.lost = true;
+          throw new RuntimeProtocolError("RUNTIME_LOST", error.message);
+        }
         if (error instanceof CdpUnknownOutcomeError)
           throw new RuntimeProtocolError(
             "UNKNOWN_OUTCOME",
@@ -412,6 +438,8 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
           requireText(data, "workspaceId"),
           requireText(data, "viewerLabel"),
           typeof data.tabId === "string" ? data.tabId : undefined,
+          // Only this bridge-authorised human attach may replace a lost runtime.
+          { replaceLost: true },
         );
         break;
       case "detach":
@@ -604,13 +632,18 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
   }
 
   /** Carry exact ticket identity through awaited policy and native publication. */
-  private requestAgent(ticket: string, operation: string, input: JsonValue): Promise<JsonValue> {
+  private async requestAgent(
+    ticket: string,
+    operation: string,
+    input: JsonValue,
+  ): Promise<JsonValue> {
     this.assertPluginAvailable();
     if (operation === "reconnect" || operation === "open") {
-      return this.reconnectAgent(ticket, operation === "open");
+      return this.agentReply(await this.reconnectAgent(ticket, operation === "open"));
     }
     const binding = this.requireAgentBinding(ticket);
-    const execute = () => this.executeAgentRequest(binding, operation, input);
+    const execute = async () =>
+      this.agentReply(await this.executeAgentRequest(binding, operation, input));
     // Attachment constructs shared session state; its late viewer is removed
     // explicitly. Only actionable requests carry a native publication fence.
     if (
@@ -631,6 +664,28 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
       },
       execute,
     );
+  }
+
+  /** Report the enforcing runtime's effective policy even to an already-running MCP process. */
+  private agentReply(result: JsonValue): JsonValue {
+    const reply = asObject(result);
+    const agentPolicy = { ...AGENT_VIEWER_POLICY, humanTakeover: "immediate" };
+    const state = reply.state;
+    return {
+      ...reply,
+      agentPolicy,
+      ...(state && typeof state === "object" && !Array.isArray(state)
+        ? {
+            state: {
+              ...state,
+              agentPolicy,
+              ...(typeof reply.frameExpiresAt === "string"
+                ? { frameExpiresAt: reply.frameExpiresAt }
+                : {}),
+            },
+          }
+        : {}),
+    };
   }
 
   /** Explicit recovery never replays inputs or inherits a control lease/frame. */
@@ -689,11 +744,19 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
       } as unknown as JsonValue;
     }
     if (operation === "tabs.create") {
-      // Recover an idle viewer before issuing the non-idempotent create. Never
-      // replay creation if its result or the subsequent selection is uncertain.
-      await this.requestAgentObservation(binding, "status", {});
-      const viewerToken = binding.viewerToken!;
-      const created = await this.browserPolicy.createTab(viewerToken);
+      const create = async () =>
+        this.browserPolicy.createTab(await this.ensureAgentViewer(binding));
+      let created: { tabId: string };
+      try {
+        created = await create();
+      } catch (error) {
+        // Only a refusal before dispatch is recoverable: the lapsed agent viewer is replaced
+        // once. A lease that ends after the page was created is a distinct, non-retried error.
+        if (!isInvalidViewer(error)) throw error;
+        binding.viewerToken = null;
+        binding.controlToken = null;
+        created = await create();
+      }
       return {
         tabId: created.tabId,
         state: await this.selectAgentTab(binding, created.tabId),
@@ -776,14 +839,16 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
           }),
         );
       } else if (operation === "viewport") {
-        result = await this.browserPolicy.resize(
-          parseAgentInput(resizeBrowserRpc.input, {
-            viewerToken,
-            controlToken,
-            expected,
-            viewport: data.viewport,
-          }),
-        );
+        const resize = parseAgentInput(resizeBrowserRpc.input, {
+          viewerToken,
+          controlToken,
+          expected,
+          viewport: data.viewport,
+        });
+        // The fork keeps the shared viewport range so its agent device and
+        // high-resolution capture workflows remain available. Schema validation
+        // still rejects out-of-range requests before native mutation.
+        result = await this.browserPolicy.resize(resize);
       } else if (operation === "device") {
         result = await this.browserPolicy.applyDevicePreset(
           parseAgentInput(applyDevicePresetRpc.input, {
@@ -833,7 +898,7 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
         ? await this.browserPolicy.status(viewerToken)
         : await this.browserPolicy.capture(
             viewerToken,
-            input.quality === "low" || input.quality === "medium"
+            input.quality === "low" || input.quality === "medium" || input.quality === "high"
               ? input.quality
               : DEFAULT_CAPTURE_QUALITY,
             null,
@@ -877,7 +942,7 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
     binding.controlToken = null;
     binding.lastState = null;
     binding.lastFrame = null;
-    const attached = await this.browserPolicy.attach(
+    const attached = await this.browserPolicy.attachAgent(
       binding.workspaceId!,
       `Agent ${binding.agentId!.slice(0, 48)}`,
       tabId,
@@ -907,7 +972,7 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
     this.assertAgentBindingCurrent(binding);
     if (binding.viewerToken) return binding.viewerToken;
     const selectionRevision = binding.selectionRevision;
-    const attached = await this.browserPolicy.attach(
+    const attached = await this.browserPolicy.attachAgent(
       binding.workspaceId!,
       `Agent ${binding.agentId!.slice(0, 48)}`,
       binding.tabId ?? undefined,

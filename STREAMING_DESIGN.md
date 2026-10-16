@@ -7,12 +7,15 @@ comparisons behind the input design.
 
 ## Transport and ownership
 
-Desktop, web and Android clients use Chromium tab capture, a realtime WebCodecs encoder,
-and bounded encoded-packet reads over authenticated Paseo RPC. The receiver
-decodes into a retained canvas. Android uses the host-owned `EncodedVideo` surface;
-its bridge acknowledges explicit canvas draws before input authority is admitted.
-Other native clients and clients without a usable decoder use JPEG. This is encoded video, not WebRTC or a push subscription; it
-shares the reliable connection and relay used by Paseo.
+Encoded video is opt-in: the daemon must set `PASEO_SHARED_BROWSER_VIDEO=1`. Without it
+the capture helper is never loaded and `video.read` returns a typed `video-disabled` reply,
+after which the client stops reading and uses JPEG. When enabled, desktop and web clients
+use Chromium tab capture, a realtime WebCodecs encoder, and bounded encoded-packet reads
+over authenticated Paseo RPC. The receiver decodes into a retained canvas. Android
+clients on the matching fork host can use its optional native encoded-video surface.
+The published SDK does not expose that surface, so stock native clients and clients
+without a usable decoder use JPEG. This encoded-video transport shares the reliable
+connection and relay used by Paseo.
 
 `server/native-video-extension.ts` materializes the immutable bundled capture
 helper in the runtime's private IPC directory. The helper has tabCapture and
@@ -58,14 +61,26 @@ retained for older clients.
 
 ## Presentation and input are separate contracts
 
-Initial human input requires decoded and painted geometry. Admission binds the
-controller, viewer, workspace, runtime, bridge, native attachment, document and
-viewport. Subsequent presses, motion, keyboard and releases use an ordered
-channel without waiting for a newly decoded image after every event. A human
-click may reach the page ahead of the remote display, as in remote desktop.
-Agent commands retain strict fresh-frame targeting.
+Human input requires decoded and painted geometry. A channel binds the controller,
+viewer, workspace, runtime, bridge, native attachment, document and viewport. Every
+independent press (mouse down, first touch contact) carries its own decoded frame
+receipt, valid for five seconds and spent by acknowledged input; the next press waits
+a bounded time for a newer decoded frame, and a stalled presentation therefore cannot
+admit clicks indefinitely. Motion, releases and keys of a held gesture use the ordered
+channel without waiting for new pixels. Trusted agent screenshot admission lasts one minute, with five-minute viewer and idle
+control leases and immediate human takeover. Public viewer labels never select this policy.
+Agent responses report the effective policy and screenshot deadline. Human and agent
+observations of identical cached pixels retain independent deadlines. Navigation, viewport,
+tab, runtime, native attachment and control changes still revoke input authority. The native
+five-second held-input idle cleanup starts only after admission and remains unchanged;
+it does not expire an agent screenshot during reasoning.
 
-A visible frame is not automatically an actionable receipt. Delayed reads may
+A visible frame is not automatically an actionable receipt. The host flags each
+video packet `actionable` or not (a capture older than the last acknowledged input
+is painted but never a receipt), and the viewer starts a new epoch when the host
+acknowledges a receipt-revoking input, so reads answered before that revocation
+cannot authorize the next press. After an acknowledged press the viewer has no
+actionable video receipt until a newer packet paints; a following press waits for it. Delayed reads may
 continue painting within the same source and geometry while retaining their
 original input revision. Initial-admission waiters wake only for actionable
 pixels. A document or viewport transition, controller loss, cancellation,
@@ -74,9 +89,9 @@ binding checks its expected generation after attachment and cleanup awaits.
 
 Press/release, key and text transitions remain ordered; only compatible motion
 can coalesce without crossing a transition. Pointer capture and teardown release
-held state. The four-second idle channel closure releases native keys/buttons;
-a reopen can reuse only the exact acknowledged human admission. No published
-or uncertain input is replayed after a timeout.
+held state. The four-second idle channel closure releases native keys/buttons; a reopen
+needs a fresh decoded receipt. No published or uncertain input is replayed after
+a timeout.
 
 Video can retain its last painted canvas across an ordinary input or document
 transition without retaining input authority. Viewer, runtime, bridge and
@@ -91,7 +106,7 @@ clears cached JPEGs and queued video before admitting replacement pixels.
 
 ## Quality and geometry
 
-The menu separates JPEG quality (70, 90, 95 or 100), video bitrate (2, 5, 12 or
+The menu separates JPEG quality (40, 65, 85 or 100), video bitrate (2, 5, 12 or
 24 Mbps), frame rate (15, 30 or 60 FPS), source density and local Fit/Actual size.
 These are encoder targets, not measured bandwidth or guaranteed frame rates.
 JPEG 100 remains lossy and its byte budget can lower actual quality. Video

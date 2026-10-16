@@ -4,11 +4,12 @@ import * as Host from "@getpaseo/plugin/client/react-native";
 import { useEffect, useRef } from "react";
 import { Platform, type StyleProp, View, type ViewStyle } from "react-native";
 import type { BrowserVideoCodec, BrowserVideoDecodeEnvironment } from "./browser-video-decoder";
+import { type EncodedVideoHandle, getEncodedVideoComponent } from "./browser-video-host";
 import * as Web from "./web";
 
 interface NativeNode {
   native: true;
-  handle: Host.EncodedVideoHandle;
+  handle: EncodedVideoHandle;
   callbacks: Parameters<BrowserVideoDecodeEnvironment["createDecoder"]>[0] | null;
   queueSize: number;
   generation: number;
@@ -18,8 +19,8 @@ export type BrowserVideoCanvasNode = Web.BrowserVideoCanvasNode | NativeNode;
 /** Old native clients retain screenshots until they install the new host SDK. */
 export function supportsBrowserVideo() {
   if (Platform.OS === "web") return Web.supportsBrowserVideo();
-  // COMPAT(pluginEncodedVideo): added in v0.11.0, remove after 2027-04-04
-  return Platform.OS === "android" && typeof Host.EncodedVideo !== "undefined";
+  // EncodedVideo is an optional extension of the matching Paseo fork.
+  return Platform.OS === "android" && getEncodedVideoComponent(Host) !== undefined;
 }
 
 /** Native lifecycle is owned by AppState and the surrounding panel. */
@@ -127,7 +128,7 @@ interface SurfaceProps {
 
 /** Pointer handling stays on the sibling native touch overlay, never inside the WebView. */
 export function BrowserVideoSurface({ canvasRef, onError, style }: SurfaceProps) {
-  const handle = useRef<Host.EncodedVideoHandle>(null);
+  const handle = useRef<EncodedVideoHandle>(null);
   const node = useRef<NativeNode | null>(null);
   useEffect(
     () => () => {
@@ -138,10 +139,11 @@ export function BrowserVideoSurface({ canvasRef, onError, style }: SurfaceProps)
   );
   if (Platform.OS === "web")
     return <View ref={canvasRef} style={style} pointerEvents="none" accessible={false} />;
-  if (!supportsBrowserVideo()) return null;
+  const EncodedVideo = getEncodedVideoComponent(Host);
+  if (!supportsBrowserVideo() || !EncodedVideo) return null;
   return (
     <View style={style} pointerEvents="none" accessible={false}>
-      <Host.EncodedVideo
+      <EncodedVideo
         ref={handle}
         style={{ flex: 1 }}
         onReady={() => {

@@ -46,6 +46,8 @@ interface CanvasOptions {
   onPoint(point: BrowserGesturePoint): void;
   onActivity(active: boolean): void;
   onInputBoundary(): void;
+  /** The host acknowledged an input that revoked every earlier frame receipt. */
+  onInputAcknowledged?(): void;
 }
 
 /** Native touch coordinates are relative to the controlled overlay, with stable ID mapping. */
@@ -122,6 +124,9 @@ export function useBrowserCanvasInput(options: CanvasOptions) {
         setBrowserCanvasCursor(nodeRef.current, null);
         clearIdle();
         if (alive.current) current.current.onError(error);
+      },
+      onAcknowledged: () => {
+        if (alive.current) current.current.onInputAcknowledged?.();
       },
       onNavigationComplete: () => {
         // Server already closed the acknowledged channel. Quarantine local
@@ -247,6 +252,23 @@ export function useBrowserCanvasInput(options: CanvasOptions) {
     clearIdle();
     idleTimer.current = setTimeout(() => queue.finish(), BROWSER_INPUT_IDLE_MS);
   }, [queue]);
+  /** Insert an explicitly committed draft once; false means nothing was admitted. */
+  const composeText = useCallback(
+    (text: string): boolean => {
+      if (!alive.current || !current.current.enabled || !text) return false;
+      if (text.length > 16_000) {
+        current.current.onError(
+          new Error("Text is too long. Send up to 16,000 characters at once."),
+        );
+        return false;
+      }
+      const accepted = enqueueKeyboard({ kind: "text", text });
+      if (accepted) finishKeyboard();
+      return accepted;
+    },
+    [enqueueKeyboard, finishKeyboard],
+  );
+
   const nativeKeyboard = useBrowserNativeKeyboard({
     enabled: () => alive.current && current.current.enabled,
     ownershipKey: options.ownershipKey,
@@ -368,6 +390,7 @@ export function useBrowserCanvasInput(options: CanvasOptions) {
     canvasRef,
     panHandlers: Platform.OS === "web" ? {} : panResponder.panHandlers,
     cancel: input.cancel,
+    composeText,
     nativeKeyboard,
   };
 }

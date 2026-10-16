@@ -59,7 +59,7 @@ type AgentCreateRequest = {
 
 type AgentCreateHook = (input: { request: AgentCreateRequest }) => Promise<AgentCreateRequest>;
 
-function captureAgentCreateHook(host: "0.10" | "0.11" = "0.11"): AgentCreateHook {
+function captureAgentCreateHook(): AgentCreateHook {
   let hook: AgentCreateHook | undefined;
   contribute({
     registerSettings: vi.fn(),
@@ -69,7 +69,6 @@ function captureAgentCreateHook(host: "0.10" | "0.11" = "0.11"): AgentCreateHook
       return () => {};
     }),
     on: vi.fn(),
-    ...(host === "0.11" ? { registerUsageSource: vi.fn() } : {}),
   } as never);
   if (!hook) throw new Error("agent.create hook was not registered");
   return hook;
@@ -229,19 +228,8 @@ describe("agent MCP injection", () => {
     browserMocks.issueAgentTicket.mockClear();
   });
 
-  it("leaves OMP agent creation untouched on 0.9/0.10 hosts, which reject external MCP servers", async () => {
-    const hook = captureAgentCreateHook("0.10");
-    const request: AgentCreateRequest = {
-      config: { provider: "omp", cwd: "/workspace" },
-      env: { EXISTING: "value" },
-    };
-
-    await expect(hook({ request })).resolves.toBe(request);
-    expect(browserMocks.issueAgentTicket).not.toHaveBeenCalled();
-  });
-
-  it("injects the adapter for the built-in OMP provider on 0.11 hosts", async () => {
-    const hook = captureAgentCreateHook("0.11");
+  it("injects the adapter for the built-in OMP provider", async () => {
+    const hook = captureAgentCreateHook();
     const request: AgentCreateRequest = {
       config: { provider: "omp", cwd: "/workspace" },
       env: { EXISTING: "value" },
@@ -256,22 +244,14 @@ describe("agent MCP injection", () => {
     });
   });
 
-  it("never injects into internal agents, even on 0.11 hosts", async () => {
-    const hook = captureAgentCreateHook("0.11");
+  it("never injects into internal agents", async () => {
+    const hook = captureAgentCreateHook();
     const request: AgentCreateRequest = {
       config: { provider: "omp", cwd: "/workspace", internal: true },
     };
 
     await expect(hook({ request })).resolves.toBe(request);
     expect(browserMocks.issueAgentTicket).not.toHaveBeenCalled();
-  });
-
-  it("keeps injecting other providers on 0.10 hosts", async () => {
-    const hook = captureAgentCreateHook("0.10");
-    const transformed = await hook({
-      request: { config: { provider: "claude", cwd: "/workspace" } },
-    });
-    expect(transformed.config.mcpServers).toHaveProperty("shared-browser");
   });
 
   it("injects the adapter for providers that accept external MCP servers", async () => {
@@ -319,12 +299,13 @@ describe("runtime installation compatibility", () => {
   });
 });
 
-
 describe("agent binding renewal on session open", () => {
   function captureSessionHook() {
     let hook: ((input: { request: Record<string, unknown> }) => Promise<unknown>) | undefined;
     contribute({
-      registerSettings: vi.fn(), handle: vi.fn(), on: vi.fn(),
+      registerSettings: vi.fn(),
+      handle: vi.fn(),
+      on: vi.fn(),
       before: vi.fn((name: string, handler: unknown) => {
         if (name === "agent.session_open") hook = handler as typeof hook;
         return () => {};
@@ -338,11 +319,18 @@ describe("agent binding renewal on session open", () => {
     it(`binds trusted interactive ${reason} launches and retains the renewal override`, async () => {
       browserMocks.bindAgentTicket.mockReset();
       const request = {
-        reason, purpose: "interactive", agentId: "agent-one", workspaceId: "workspace-one",
+        reason,
+        purpose: "interactive",
+        agentId: "agent-one",
+        workspaceId: "workspace-one",
         env: { PASEO_SHARED_BROWSER_TICKET: "private-credential" },
       };
       await expect(captureSessionHook()({ request })).resolves.toBe(request);
-      expect(browserMocks.bindAgentTicket).toHaveBeenCalledWith("private-credential", "agent-one", "workspace-one");
+      expect(browserMocks.bindAgentTicket).toHaveBeenCalledWith(
+        "private-credential",
+        "agent-one",
+        "workspace-one",
+      );
     });
   }
 
@@ -350,7 +338,10 @@ describe("agent binding renewal on session open", () => {
     browserMocks.issueAgentTicket.mockClear();
     browserMocks.bindAgentTicket.mockRejectedValueOnce(new Error("Unknown agent ticket"));
     const request = {
-      reason: "resume", purpose: "interactive", agentId: "agent-one", workspaceId: "workspace-one",
+      reason: "resume",
+      purpose: "interactive",
+      agentId: "agent-one",
+      workspaceId: "workspace-one",
       env: { PASEO_SHARED_BROWSER_TICKET: "private-credential" },
     };
     await captureSessionHook()({ request });
@@ -360,7 +351,10 @@ describe("agent binding renewal on session open", () => {
   it("does not issue browser authority to history-only launches", async () => {
     browserMocks.bindAgentTicket.mockClear();
     const request = {
-      reason: "resume", purpose: "history", agentId: "agent-one", workspaceId: "workspace-one",
+      reason: "resume",
+      purpose: "history",
+      agentId: "agent-one",
+      workspaceId: "workspace-one",
       env: { PASEO_SHARED_BROWSER_TICKET: "private-credential" },
     };
     await captureSessionHook()({ request });

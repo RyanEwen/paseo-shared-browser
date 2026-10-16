@@ -6,7 +6,7 @@ import { SessionManager } from "./browser-policy";
 afterEach(() => vi.useRealTimers());
 
 /** Real policy and native timers share fake elapsed time; only Chromium's CDP transport is stubbed. */
-async function fixture() {
+async function fixture(agent = false) {
   vi.useFakeTimers();
   vi.setSystemTime(1_000);
   const runtime = new AgentBrowserRuntime({
@@ -91,7 +91,9 @@ async function fixture() {
     },
   });
   await manager.connect();
-  const { viewerToken } = await manager.attach("owned", "Fixture");
+  const { viewerToken } = await (agent
+    ? manager.attachAgent("owned", "Fixture")
+    : manager.attach("owned", "Fixture"));
   const { controlToken } = await manager.acquireControl(viewerToken);
   const capture = await manager.capture(viewerToken);
   return {
@@ -136,15 +138,33 @@ it("finishes one click exceeding five seconds overall with each native idle gap 
   }
 });
 
-it("retains native idle expiry, releases the original press once and refuses replay", async () => {
-  const f = await fixture();
-  try {
-    f.setDelays(0, 6_000);
-    await expect(f.send()).rejects.toThrow("attachment changed");
-    expect(f.publications).toEqual(["mouseMoved", "mousePressed", "mouseReleased"]);
-    await expect(f.send()).rejects.toThrow("frame is stale");
-    expect(f.publications).toHaveLength(3);
-  } finally {
-    f.manager.disconnect();
-  }
-});
+it.each([false, true])(
+  "retains native idle expiry and refuses replay (agent=%s)",
+  async (agent) => {
+    const f = await fixture(agent);
+    try {
+      f.setDelays(0, 6_000);
+      await expect(f.send()).rejects.toThrow("attachment changed");
+      expect(f.publications).toEqual(["mouseMoved", "mousePressed", "mouseReleased"]);
+      await expect(f.send()).rejects.toThrow("frame is stale");
+      expect(f.publications).toHaveLength(3);
+    } finally {
+      f.manager.disconnect();
+    }
+  },
+);
+
+it.each([6_000, 59_999])(
+  "admits a %ims-old agent screenshot through a fresh real native input channel",
+  async (age) => {
+    const f = await fixture(true);
+    try {
+      await vi.advanceTimersByTimeAsync(age);
+      await f.send();
+      expect(f.publications).toContain("mousePressed");
+      expect(f.publications).toContain("mouseReleased");
+    } finally {
+      f.manager.disconnect();
+    }
+  },
+);

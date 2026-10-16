@@ -133,7 +133,8 @@ it.each([-1, 0, 40])(
         expected,
         target,
       });
-      expect(reopened).toHaveProperty("gestureId");
+      // The scroll spent this receipt; reopening on it is a known non-admission.
+      expect(reopened).toHaveProperty("admission", "stale-frame");
       const strictInput = () =>
         manager.sendInput({
           viewerToken,
@@ -152,6 +153,8 @@ it.each([-1, 0, 40])(
       const late = await pendingRead;
       pendingRead = null;
       expect(late.packets[0]!.frame.frameId).toBe(frame.frameId);
+      // Late pixels are painted but flagged: the viewer must not try to press on them.
+      expect(late.packets[0]!.actionable).toBe(false);
       // Late pixels still paint, but cannot re-authorize discrete agent input.
       await expect(strictInput()).rejects.toThrow("frame is stale");
       expect(calls).not.toContain("mouse.down");
@@ -174,7 +177,7 @@ it.each([-1, 0, 40])(
         },
       });
       expect(refused).toHaveProperty("admission", "stale-frame");
-      expect(calls.filter((value) => value === "input.begin")).toHaveLength(2);
+      expect(calls.filter((value) => value === "input.begin")).toHaveLength(1);
       // A later genuine source frame admits input without resetting the video codec.
       now += 100;
       monotonicNow += 100;
@@ -184,6 +187,7 @@ it.each([-1, 0, 40])(
       packet.capturedAt = new Date(now).toISOString();
       const fresh = await manager.readVideo(videoInput);
       const freshFrame = fresh.packets[0]!.frame;
+      expect(fresh.packets[0]!.actionable).toBe(true);
       const accepted = await manager.beginGesture({
         viewerToken,
         controlToken,
@@ -196,7 +200,7 @@ it.each([-1, 0, 40])(
         },
       });
       expect(accepted).toHaveProperty("gestureId");
-      expect(calls.filter((value) => value === "input.begin")).toHaveLength(3);
+      expect(calls.filter((value) => value === "input.begin")).toHaveLength(2);
       expect(calls).not.toContain("video.invalidate");
     } finally {
       release.resolve();
