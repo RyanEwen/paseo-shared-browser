@@ -6,4 +6,4 @@ This is the standalone Shared Browser plugin repository. Keep the `shared-browse
 - Production dependencies are locked by `npm-shrinkwrap.json`; development dependencies by `bun.lock`. Do not create a competing `package-lock.json`.
 - Runtime and UI checks must use an isolated Paseo home and explicit host. Use `scripts/dev-daemon.sh` for daemon verification. Never reload an active user plugin or replace its supervisor during development without explicit approval covering browser-state loss.
 - Preserve original license and attribution. Do not change versions/changelogs or publish npm packages unless explicitly requested.
-- Before upstream contributions, read `docs/standalone-migration.md`. The original monorepo remains separate and may contain an unresolved merge.
+- Read `docs/project-handoff.md` for retained behavior and deployment constraints. Before upstream contributions, read `docs/standalone-migration.md`. The retired monorepo and its unfinished merge are preserved in the ignored local recovery archive; do not publish that archive.

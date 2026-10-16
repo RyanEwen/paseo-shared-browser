@@ -7,7 +7,8 @@
       "!!npm-shrinkwrap.json",
       "!!coverage",
       "!!dist",
-      "!!CHANGELOG.md"
+      "!!CHANGELOG.md",
+      "!!.local-history"
     ]
   },
   "formatter": {

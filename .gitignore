@@ -8,3 +8,6 @@ coverage/
 .dev/
 playwright-report/
 test-results/
+
+# Local migration recovery, agent context and private verification receipts.
+/.local-history/

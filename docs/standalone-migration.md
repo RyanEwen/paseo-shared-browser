@@ -41,9 +41,10 @@ Compatible upstream video, Xvfb, and JPEG defaults are retained.
 - Mocked hook tests use individual parameterized cases and a custom-hook harness
   name to satisfy the pinned Biome rules without changing runtime behavior.
 
-The original active plugin installation is independent of this checkout. Creating
-this repository or Paseo project does not switch an installed plugin's source or
-replace any running supervisor.
+Creating the standalone repository did not switch the active plugin. A later,
+explicitly requested retirement of the old local project moved the installed
+source registration to this checkout through a bridge-only reload, preserving
+the existing supervisor and browsers. See [project handoff](project-handoff.md).
 
 ## Isolated verification
 
@@ -84,6 +85,8 @@ git -C /path/to/isolated/upstream apply --directory=paseo-shared-browser /path/t
 ```
 
 Review compatibility with upstream decisions and its current dependency versions,
-run its plugin checks, and open a focused PR. Do not apply patches to the original
-checkout while its pending merge is unresolved. No automatic monorepo deletion,
-release, npm publication, or live installation cutover is part of this migration.
+run its plugin checks, and open a focused PR. Use a fresh isolated monorepo checkout for upstream contributions. The old local
+project and its worktrees were retired in a separate owner-requested cleanup;
+their complete history and unfinished changes are preserved in an ignored local
+recovery archive. The old GitHub repository remains intact. No release or npm
+publication was requested.
