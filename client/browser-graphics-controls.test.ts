@@ -121,3 +121,15 @@ it("disables unsupported and busy choices and does not invent missing startup st
     "Browser graphics status not reported",
   );
 });
+
+it("offers private desktop through the existing picker without applying it implicitly", () => {
+  const p = props();
+  const choices = expand(BrowserGraphicsControls({ ...p, preference: "private-desktop" }));
+  const choice = choices.find(
+    (node) => node.props?.accessibilityLabel === "Graphics mode: Private desktop · Linux",
+  )!;
+  (choice.props!.onPress as () => void)();
+  expect(p.onChange).toHaveBeenCalledExactlyOnceWith("private-desktop");
+  expect(p.onApply).not.toHaveBeenCalled();
+  expect(choices.some((node) => String(node.props?.children).includes("Requires Xvfb"))).toBe(true);
+});

@@ -35,6 +35,7 @@ const browserMocks = vi.hoisted(() => ({
   handleDetachBrowser: vi.fn(),
   handleListOpenBrowserWorkspaces: vi.fn(),
   handleNavigateBrowser: vi.fn(),
+  handlePrintBrowser: vi.fn(),
   handleReleaseControl: vi.fn(),
   handleResizeBrowser: vi.fn(),
   handleSendBrowserInput: vi.fn(),

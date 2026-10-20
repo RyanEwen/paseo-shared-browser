@@ -6,6 +6,7 @@ import {
   domEvaluateInputSchema,
   domSnapshotSchema,
 } from "../shared/agent-dom";
+import { agentPointerPointSchema } from "../shared/agent-pointer";
 import { validateInspectionExpression } from "./agent-dom-expression";
 import { type CdpSession, CdpUnknownOutcomeError } from "./cdp";
 import type { JsonValue } from "./runtime-protocol";
@@ -123,8 +124,16 @@ export class AgentDomRuntime {
       throw new CdpUnknownOutcomeError(
         "Element action failed or reference is stale; observe again before any further action",
       );
-    if (result.result?.value !== true) throw new Error("Element action was not acknowledged");
-    return { acknowledged: true };
+    const value = result.result?.value;
+    if (
+      !value ||
+      typeof value !== "object" ||
+      !("acknowledged" in value) ||
+      value.acknowledged !== true
+    )
+      throw new Error("Element action was not acknowledged");
+    const pointer = agentPointerPointSchema.safeParse("pointer" in value ? value.pointer : null);
+    return { acknowledged: true, ...(pointer.success ? { pointer: pointer.data } : {}) };
   }
 
   async evaluate(
@@ -217,7 +226,15 @@ const SNAPSHOT_FUNCTION = String.raw`function(snapshotId) {
       if (textBudget > 18000) {truncated=true;break;}
       entries.push(entry);refs.set(entry.ref,el);
     }
-    const children = el.shadowRoot ? el.shadowRoot.children : el.children;
+    // Follow the rendered slot tree so controls supplied to open shadow roots
+    // (including Chromium's preview settings) remain discoverable by exact ref.
+    let children = el.children;
+    if (el.shadowRoot) {
+      children = el.shadowRoot.children;
+    } else if (el.localName === 'slot' && typeof el.assignedElements === 'function') {
+      children = el.assignedElements();
+      if (!children.length) children = el.children;
+    }
     const remaining = Math.min(children.length, 2000-stack.length);
     if (remaining < children.length) truncated=true;
     for (let i=remaining-1;i>=0;i--) stack.push({element:children[i],depth:depth+1});
@@ -266,11 +283,40 @@ const ACTION_FUNCTION = `function(snapshotId, action) {
     }
   }
   assertAvailable();
+  // Semantic events do not move the native mouse. Measure their visible target
+  // immediately before dispatch, without scrolling or inventing an offscreen point.
+  let pointer = null;
+  function measurePointerTarget() {
+    const rect = el.getBoundingClientRect();
+    let left = Math.max(0,rect.left), top = Math.max(0,rect.top);
+    let right = Math.min(innerWidth,rect.right), bottom = Math.min(innerHeight,rect.bottom);
+    let ancestor = el.parentElement || el.getRootNode().host;
+    for (let depth=0;ancestor && depth<20;depth++) {
+      const style = getComputedStyle(ancestor), box = ancestor.getBoundingClientRect();
+      if (['hidden','clip','scroll','auto'].includes(style.overflowX)) { left=Math.max(left,box.left);right=Math.min(right,box.right); }
+      if (['hidden','clip','scroll','auto'].includes(style.overflowY)) { top=Math.max(top,box.top);bottom=Math.min(bottom,box.bottom); }
+      ancestor = ancestor.parentElement || ancestor.getRootNode().host;
+    }
+    if (ancestor || right <= left || bottom <= top) return;
+    const x=(left+right)/2,y=(top+bottom)/2;
+    let hit=document.elementFromPoint(x,y);
+    for (let depth=0;hit?.shadowRoot && depth<20;depth++) {
+      const nested=hit.shadowRoot.elementFromPoint(x,y);
+      if (!nested || nested===hit) break;
+      hit=nested;
+    }
+    for (let depth=0;hit && depth<40;depth++) {
+      if (hit===el) { pointer={x,y};return; }
+      hit=hit.parentElement || hit.getRootNode().host;
+    }
+  }
   if (action.kind === 'click') {
     if (typeof el.click !== 'function') throw new Error('Not clickable');
     focusTarget(false);
+    measurePointerTarget();
     el.click();
   } else if (action.kind === 'hover') {
+    measurePointerTarget();
     el.dispatchEvent(new MouseEvent('mouseover',{bubbles:true,composed:true}));
     el.dispatchEvent(new MouseEvent('mouseenter',{composed:true}));
   } else if (action.kind === 'fill' || action.kind === 'type') {
@@ -307,5 +353,5 @@ const ACTION_FUNCTION = `function(snapshotId, action) {
     assertAvailable();
     el.dispatchEvent(new Event('change',{bubbles:true}));
   } else throw new Error('Unknown action');
-  return true;
+  return {acknowledged:true,pointer};
 }`;

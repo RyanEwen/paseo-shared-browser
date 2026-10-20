@@ -40,6 +40,7 @@ export type AgentBrowserOperation =
   | "acquire-control"
   | "release-control"
   | "navigate"
+  | "print"
   | "input"
   | "viewport"
   | "device"
@@ -311,6 +312,7 @@ function requireAgentOperation(value: unknown): AgentBrowserOperation {
     value === "acquire-control" ||
     value === "release-control" ||
     value === "navigate" ||
+    value === "print" ||
     value === "input" ||
     value === "viewport" ||
     value === "device"

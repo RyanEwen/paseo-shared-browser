@@ -12,8 +12,9 @@ import {
   captureBrowserRpc,
   closeBrowserRpc,
   endBrowserGestureRpc,
-  MAX_BROWSER_TABS,
+  MAX_BROWSER_PAGE_TARGETS,
   navigateBrowserRpc,
+  printBrowserRpc,
   resizeBrowserRpc,
   sendBrowserInputRpc,
   setCaptureDensityRpc,
@@ -169,7 +170,7 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
       now: this.now,
       // Each workspace owns one Chromium runtime but may have several
       // independent page sessions with separate viewers and control leases.
-      maxSessions: this.maxWorkspaces * MAX_BROWSER_TABS,
+      maxSessions: this.maxWorkspaces * MAX_BROWSER_PAGE_TARGETS,
     });
   }
 
@@ -379,7 +380,7 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
         if (error instanceof CdpUnknownOutcomeError)
           throw new RuntimeProtocolError(
             "UNKNOWN_OUTCOME",
-            "Browser mutation outcome is unknown; observe the browser before sending another mutation",
+            "Browser mutation outcome is unknown; observe the browser before sending another mutation. If you opened print, inspect the tab list for Print preview and select it explicitly. Do not repeat the print action.",
           );
         throw new RuntimeProtocolError(
           "RUNTIME_FAILURE",
@@ -486,6 +487,10 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
         break;
       case "navigate":
         result = await this.browserPolicy.navigate(data as never);
+        this.invalidateAgentObservationsForState(result);
+        break;
+      case "print":
+        result = await this.browserPolicy.print(data as never);
         this.invalidateAgentObservationsForState(result);
         break;
       case "viewport":
@@ -859,6 +864,10 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
       let result: { state: BrowserState };
       if (operation === "dom.action" || operation === "dom.evaluate") {
         result = await this.browserPolicy.domOperation(viewerToken, controlToken, operation, input);
+      } else if (operation === "print") {
+        result = await this.browserPolicy.print(
+          parseAgentInput(printBrowserRpc.input, { viewerToken, controlToken, expected }),
+        );
       } else if (operation === "navigate") {
         result = await this.browserPolicy.navigate(
           parseAgentInput(navigateBrowserRpc.input, {
@@ -982,7 +991,19 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
       if (binding.selectionRevision !== revision) {
         throw new RuntimeProtocolError("INVALID_REQUEST", "Agent tab selection was replaced");
       }
-      if (previousViewer) await this.browserPolicy.detach(previousViewer);
+      if (previousViewer) {
+        try {
+          await this.browserPolicy.detach(previousViewer);
+        } catch (error) {
+          // Another viewer may have closed the preview. Its retired lease must
+          // not prevent this explicit selection of an independently valid page.
+          if (
+            !isInvalidViewer(error) &&
+            !(error instanceof Error && error.message === "Browser tab is closed")
+          )
+            throw error;
+        }
+      }
       this.assertAgentBindingCurrent(binding);
       binding.viewerToken = attached.viewerToken;
       binding.tabId = attached.state.tabId ?? tabId;

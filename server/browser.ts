@@ -19,6 +19,7 @@ import type {
   listBrowserTabsRpc,
   listOpenBrowserWorkspacesRpc,
   navigateBrowserRpc,
+  printBrowserRpc,
   releaseControlRpc,
   reopenBrowserRpc,
   resizeBrowserRpc,
@@ -64,6 +65,8 @@ type ReleaseControlOutput = RpcOutput<typeof releaseControlRpc>;
 type ListOpenOutput = RpcOutput<typeof listOpenBrowserWorkspacesRpc>;
 type NavigateInput = RpcInput<typeof navigateBrowserRpc>;
 type NavigateOutput = RpcOutput<typeof navigateBrowserRpc>;
+type PrintInput = RpcInput<typeof printBrowserRpc>;
+type PrintOutput = RpcOutput<typeof printBrowserRpc>;
 type ResizeInput = RpcInput<typeof resizeBrowserRpc>;
 type ResizeOutput = RpcOutput<typeof resizeBrowserRpc>;
 type ApplyDevicePresetInput = RpcInput<typeof applyDevicePresetRpc>;
@@ -161,6 +164,10 @@ class RemoteBrowserManager {
 
   navigate(input: NavigateInput): Promise<NavigateOutput> {
     return this.requestBrowser<NavigateOutput>("navigate", input as unknown as JsonValue);
+  }
+
+  print(input: PrintInput): Promise<PrintOutput> {
+    return this.requestBrowser<PrintOutput>("print", input as unknown as JsonValue);
   }
 
   resize(input: ResizeInput): Promise<ResizeOutput> {
@@ -394,6 +401,11 @@ export async function handleReleaseControl({
 
 export async function handleNavigateBrowser(input: NavigateInput): Promise<NavigateOutput> {
   return (await getProductionManager()).navigate(input);
+}
+
+/** Send a controlled print once; preview selection and uncertain outcomes remain explicit. */
+export async function handlePrintBrowser(input: PrintInput): Promise<PrintOutput> {
+  return (await getProductionManager()).print(input);
 }
 
 export async function handleResizeBrowser(input: ResizeInput): Promise<ResizeOutput> {

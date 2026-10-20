@@ -40,6 +40,7 @@ import {
   MAX_VIEWPORT,
   MIN_VIEWPORT,
   navigateBrowserRpc,
+  printBrowserRpc,
   releaseControlRpc,
   reopenBrowserRpc,
   resizeBrowserRpc,
@@ -48,7 +49,9 @@ import {
 } from "../shared/browser";
 import { browserDisplayDemandRpc } from "../shared/browser-display-demand";
 import { browserMediaCapabilitiesRpc } from "../shared/browser-media";
+import { isPrintPreviewUrl } from "../shared/browser-page";
 import type { BrowserFrameAuthority } from "../shared/browser-video";
+import { BrowserAgentPointer } from "./browser-agent-pointer";
 import { type BrowserCanvasDisplayMode, getBrowserCanvasLayout } from "./browser-canvas-layout";
 import { BrowserCanvasViewport } from "./browser-canvas-viewport";
 import {
@@ -110,6 +113,7 @@ interface Size {
 
 interface ControlledActions {
   navigate(action: "back" | "forward" | "reload" | "goto", url?: string): void;
+  print(): void;
   applyViewport(): void;
   fillViewport(): void;
   selectDevicePreset(id: DevicePresetId): void;
@@ -205,6 +209,7 @@ export function SharedBrowserPanel({
   const acquireControl = useRpc(acquireControlRpc);
   const releaseControl = useRpc(releaseControlRpc);
   const navigateBrowser = useRpc(navigateBrowserRpc);
+  const printBrowser = useRpc(printBrowserRpc);
   const resizeBrowser = useRpc(resizeBrowserRpc);
   const reportDisplayDemand = useRpc(browserDisplayDemandRpc);
   const applyDevicePreset = useRpc(applyDevicePresetRpc);
@@ -654,6 +659,22 @@ export function SharedBrowserPanel({
     },
     onError: mutationFailed,
   });
+  const printMutation = useBrowserScopedMutation({
+    identity: mutationIdentity,
+    currentIdentity: currentMutationIdentity,
+    mutationFn: printBrowser,
+    onSuccess: (result) => {
+      mutationSucceeded(result.state);
+      setRuntimeNotice(
+        "Inspect the tab list and select Print preview. Do not repeat Print while a preview is open.",
+      );
+      void tabsQuery.refetch();
+    },
+    onError: (error) => {
+      mutationFailed(error);
+      void tabsQuery.refetch();
+    },
+  });
   const navigateMutation = useBrowserScopedMutation({
     identity: mutationIdentity,
     currentIdentity: currentMutationIdentity,
@@ -709,6 +730,7 @@ export function SharedBrowserPanel({
     acquireMutation.isPending ||
     releaseMutation.isPending ||
     navigateMutation.isPending ||
+    printMutation.isPending ||
     resizeMutation.isPending ||
     deviceMutation.isPending ||
     inputMutation.isPending ||
@@ -865,6 +887,12 @@ export function SharedBrowserPanel({
     }
     return context;
   }, [controlContext]);
+
+  /** Publish once with the current controlled source; tab discovery remains explicit. */
+  const print = () => {
+    const context = requireControlContext();
+    if (context) printMutation.mutate(context);
+  };
 
   const requireInputContext = useCallback(() => {
     const context = inputContext();
@@ -1371,6 +1399,7 @@ export function SharedBrowserPanel({
   // A callback captured before acquisition must never reuse its old control identity.
   controlledActionsRef.current = {
     navigate,
+    print,
     applyViewport,
     fillViewport,
     selectDevicePreset,
@@ -1599,7 +1628,8 @@ export function SharedBrowserPanel({
         canCreate={
           Boolean(viewerToken) &&
           !tabMutationPending &&
-          (tabsQuery.data?.tabs.length ?? 0) < MAX_BROWSER_TABS
+          (tabsQuery.data?.tabs.filter((tab) => !isPrintPreviewUrl(tab.url)).length ?? 0) <
+            MAX_BROWSER_TABS
         }
         canClose={
           Boolean(viewerToken) && !tabMutationPending && (tabsQuery.data?.tabs.length ?? 0) > 1
@@ -1813,6 +1843,14 @@ export function SharedBrowserPanel({
               loading={attachQuery.isPending || reconnecting || captureQuery.isFetching}
             />
           )}
+          {state && currentFrame && displayRect ? (
+            <BrowserAgentPointer
+              state={state}
+              frame={currentFrame}
+              rect={displayRect}
+              theme={theme}
+            />
+          ) : null}
         </BrowserCanvasViewport>
         <View style={styles.canvasFooter}>
           <Text numberOfLines={1} style={styles.canvasFooterText}>
@@ -2212,6 +2250,27 @@ export function SharedBrowserPanel({
               onPress={() => requestControlled("send browser keys", () => setKeysSubmenuOpen(true))}
             />
           </View>
+          <BrowserMenuItem
+            theme={theme}
+            compact={layout.compact}
+            label={printMutation.isPending ? "Opening print…" : "Print…"}
+            detail={
+              state?.canPrint
+                ? "Open real preview, then select its tab"
+                : "Requires Private desktop in Graphics"
+            }
+            icon="Printer"
+            disabled={
+              !viewerToken ||
+              anyMutationPending ||
+              !state?.canPrint ||
+              isPrintPreviewUrl(state?.url ?? "")
+            }
+            onPress={() => {
+              closeToolbarMenu();
+              requestControlled("open print preview", () => controlledActionsRef.current?.print());
+            }}
+          />
           <BrowserMenuItem
             theme={theme}
             compact={layout.compact}

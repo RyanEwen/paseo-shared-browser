@@ -1,6 +1,7 @@
 /** Trusted agent routing must extend observation/idle budgets without changing human admission. */
 import { afterEach, expect, it } from "vitest";
 import type { BrowserFrame, BrowserState } from "../shared/browser";
+import { CdpUnknownOutcomeError } from "./cdp";
 import { RUNTIME_PROTOCOL_VERSION } from "./runtime-protocol";
 import { RuntimeSupervisor } from "./supervisor";
 
@@ -9,12 +10,42 @@ afterEach(async () => {
   await Promise.all(supervisors.splice(0).map((supervisor) => supervisor.stopAll()));
 });
 
+it("requires current control, document state and private-print capability before publication", async () => {
+  const unsupported = await fixture();
+  await expect(unsupported.agent("print")).rejects.toThrow("owned private desktop");
+  expect(unsupported.calls).not.toContain("print");
+
+  const f = await fixture(true);
+  expect((await f.agent("status")).state.canPrint).toBe(true);
+  f.replaceDocument();
+  await expect(f.agent("print")).rejects.toThrow("stale");
+  expect(f.calls).not.toContain("print");
+  await f.agent("status");
+  await f.agent("release-control");
+  await expect(f.agent("print")).rejects.toThrow();
+  expect(f.calls).not.toContain("print");
+  await f.agent("acquire-control");
+  await f.agent("print");
+  expect(f.calls.filter((call) => call === "print")).toHaveLength(1);
+});
+
+it("surfaces an unknown print outcome without retry and discards the old agent frame", async () => {
+  const f = await fixture(true);
+  await f.agent("capture");
+  f.makePrintUncertain();
+  await expect(f.agent("print")).rejects.toMatchObject({ code: "UNKNOWN_OUTCOME" });
+  expect(f.calls.filter((call) => call === "print")).toHaveLength(1);
+  await expect(f.agent("input", { event: click })).rejects.toThrow();
+  expect(f.calls).not.toContain("mouse.down");
+});
+
 /** Real supervisor/policy routing with a controllable host clock and one native document. */
-async function fixture() {
+async function fixture(canPrint = false) {
   let now = 1_000;
   let generation = "1:1";
   let ids = 0;
   let metadataDelay = 0;
+  let printUncertain = false;
   const calls: string[] = [];
   const supervisor = new RuntimeSupervisor({
     now: () => now,
@@ -24,7 +55,9 @@ async function fixture() {
       stop: async () => {},
       request: async (_runtime, operation) => {
         calls.push(operation);
-        if (operation === "identity") return { userAgent: "Policy fixture" };
+        if (operation === "identity") return { userAgent: "Policy fixture", canPrint };
+        if (operation === "print" && printUncertain)
+          throw new CdpUnknownOutcomeError("Print reply timed out");
         if (operation === "state") {
           now += metadataDelay;
           return { url: "about:blank", title: "Fixture", inputGeneration: generation };
@@ -38,6 +71,8 @@ async function fixture() {
             capturedAt: new Date(now).toISOString(),
           };
         }
+        if (operation === "video.read")
+          return { inputGeneration: generation, status: "waiting", streamId: null, packets: [] };
         return null;
       },
     },
@@ -89,6 +124,9 @@ async function fixture() {
     agent,
     human,
     calls,
+    makePrintUncertain: () => {
+      printUncertain = true;
+    },
     advance: (ms: number) => {
       now += ms;
     },
@@ -227,6 +265,70 @@ it("allows final metadata validation beyond five seconds for an agent capture", 
   const f = await fixture();
   f.delayMetadata(6_000);
   await expect(f.agent("capture")).resolves.toHaveProperty("frame");
+});
+
+it("shares actual agent pointer activity and expires click and idle presence independently", async () => {
+  const f = await fixture();
+  expect((await f.agent("status")).state.agentPointer).toBeNull();
+  await f.agent("capture");
+  const clicked = await f.agent("input", { event: click });
+  expect(clicked.state.agentPointer).toMatchObject({
+    x: 10,
+    y: 20,
+    source: "native",
+    clickRemainingMs: 900,
+    remainingMs: 5000,
+  });
+  const human = await f.human("attach", {
+    workspaceId: "fixture-workspace",
+    viewerLabel: "Observer",
+  });
+  expect(human.state.agentPointer).toEqual(clicked.state.agentPointer);
+  f.advance(250);
+  const image = await f.human("capture", { viewerToken: human.viewerToken, quality: "medium" });
+  expect(image.state.agentPointer?.clickRemainingMs).toBe(650);
+  f.advance(500);
+  const video = await f.human("video.read", { viewerToken: human.viewerToken, waitMs: 500 });
+  expect(video.state.agentPointer?.clickRemainingMs).toBe(150);
+  f.advance(150);
+  expect((await f.agent("status")).state.agentPointer?.clickRemainingMs).toBe(0);
+  f.advance(4100);
+  expect((await f.agent("status")).state.agentPointer).toBeNull();
+});
+
+it("does not move the click pulse with the pointer or fabricate one for typing", async () => {
+  const f = await fixture();
+  await f.agent("capture");
+  await f.agent("input", { event: click });
+  await f.agent("capture");
+  const moved = await f.agent("input", {
+    event: { kind: "move", point: { x: 90, y: 80, width: 1280, height: 800 } },
+  });
+  expect(moved.state.agentPointer).toMatchObject({ x: 90, y: 80, clickRemainingMs: 0 });
+  f.advance(5000);
+  await f.agent("capture");
+  expect(
+    (await f.agent("input", { event: { kind: "type", text: "hello" } })).state.agentPointer,
+  ).toBeNull();
+});
+
+it("clears pointer activity on document replacement and human takeover", async () => {
+  const f = await fixture();
+  await f.agent("capture");
+  await f.agent("input", { event: click });
+  f.replaceDocument();
+  expect((await f.agent("status")).state.agentPointer).toBeNull();
+  await f.agent("capture");
+  await f.agent("input", { event: click });
+  const human = await f.human("attach", {
+    workspaceId: "fixture-workspace",
+    viewerLabel: "Agent misleading label",
+  });
+  expect(
+    (await f.human("acquire-control", { viewerToken: human.viewerToken, takeover: true })).state
+      .agentPointer,
+  ).toBeNull();
+  expect((await f.agent("status")).state.agentPointer).toBeNull();
 });
 
 it("human re-observation cannot shorten the agent's receipt for identical cached pixels", async () => {

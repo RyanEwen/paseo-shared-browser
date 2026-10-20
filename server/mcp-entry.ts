@@ -180,11 +180,23 @@ async function main(): Promise<void> {
   server.registerTool(
     "shared_browser_tabs",
     {
-      description: "List tabs in this agent's workspace and identify this agent's selected tab.",
+      description:
+        "List tabs in this agent's workspace and identify this agent's selected tab. In an opted-in private desktop session, real Chromium print previews appear as Print preview tabs at chrome://print/. Select a preview explicitly; no source-tab relationship is inferred.",
       inputSchema: z.object({}),
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
     async () => textResult(await client.request("tabs.list", {})),
+  );
+
+  server.registerTool(
+    "shared_browser_print",
+    {
+      description:
+        "Open real Chromium print once for this agent's selected and controlled source tab. Requires an owned private desktop (Graphics: Private desktop on Linux); activates only that source within the private display. Retain the original tab ID, inspect shared_browser_tabs, then select Print preview explicitly. Acknowledgement does not prove a preview opened. If the result is unknown, inspect tabs without repeating Print. After Cancel/Close explicitly reselect the original. OS print/save dialogs are unavailable.",
+      inputSchema: z.object({}),
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
+    },
+    async () => textResult(await client.request("print", {})),
   );
 
   server.registerTool(
@@ -205,7 +217,7 @@ async function main(): Promise<void> {
     "shared_browser_tab_select",
     {
       description:
-        "Select an existing tab for this agent only. Capture its current frame before sending input.",
+        "Select an existing tab or real Print preview for this agent only. Capture its current frame before sending input, or take a semantic snapshot and acquire control for element actions. After cancelling/closing a preview, explicitly select the original tab ID. OS print/save dialogs are unavailable.",
       inputSchema: z.object({ tabId: browserTabIdSchema }),
       annotations: {
         readOnlyHint: false,

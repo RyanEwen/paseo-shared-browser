@@ -105,7 +105,15 @@ it("uses actual MCP tools for a screenshot-free form and fences replaced documen
       ref: ref(snapshot, "Name"),
       text: "Ada",
     });
+    expect(fill.state.agentPointer).toBeNull();
     expect(JSON.stringify(fill)).not.toContain("Ada");
+    const hover = await call("hover", {
+      snapshotId: snapshot.snapshotId,
+      ref: ref(snapshot, "Submit"),
+    });
+    expect(hover.state.agentPointer).toMatchObject({ source: "semantic", clickRemainingMs: 0 });
+    expect(hover.state.agentPointer.x).toBeGreaterThan(0);
+    expect(hover.state.agentPointer.y).toBeGreaterThan(0);
     await call("select", {
       snapshotId: snapshot.snapshotId,
       ref: ref(snapshot, "Plan"),
@@ -156,6 +164,7 @@ it("uses actual MCP tools for a screenshot-free form and fences replaced documen
     ).rejects.toThrow();
     await call("click", { snapshotId: snapshot.snapshotId, ref: ref(snapshot, "Submit") });
     await vi.waitFor(() => expect(submitted).toBe("Ada:pro"));
+    expect((await call("status")).state.agentPointer).toBeNull();
     await expect(
       call("fill", {
         snapshotId: snapshot.snapshotId,
@@ -169,7 +178,12 @@ it("uses actual MCP tools for a screenshot-free form and fences replaced documen
     await call("status");
     await call("navigate", { action: { kind: "goto", url: origin } });
     const another = await call("snapshot");
-    await call("click", { snapshotId: another.snapshotId, ref: ref(another, "Replace field") });
+    const clicked = await call("click", {
+      snapshotId: another.snapshotId,
+      ref: ref(another, "Replace field"),
+    });
+    expect(clicked.state.agentPointer).toMatchObject({ source: "semantic" });
+    expect(clicked.state.agentPointer.clickRemainingMs).toBeGreaterThan(0);
     await expect(
       call("fill", {
         snapshotId: another.snapshotId,

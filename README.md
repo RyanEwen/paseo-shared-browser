@@ -22,6 +22,8 @@ Forked from Omer Cohen's [Shared Browser in omercnet/paseo-plugins](https://gith
 - **Improved display menus:** compact desktop/mobile menus, current-setting summaries, resolution favorites, device presets, custom sizes and a viewport that follows the panel.
 - **Improved mobile input:** direct keyboard typing, IME composition and Android video support through Paseo++. Mouse, touch, dragging and canvas interaction remain available.
 - **Agents that can use forms:** element snapshots and direct click, fill, select, hover and type tools, plus bounded read-only JavaScript inspection. Screenshots remain available for visual work.
+- **Visible agent activity:** labelled pointers and brief click indications show where the controlling agent acts.
+- **Real Chromium print preview:** opt into a private desktop on Linux, use Actions → Print or the agent Print tool, then select the real preview tab. See the [preview setup and limits](docs/guide.md#real-chromium-print-preview).
 - **Fewer agent interruptions:** reconnect to the same workspace and selected tab after disconnects, keep trusted observations usable longer, and use agent viewports up to 3840 × 3840.
 - **Shared tabs with clear ownership:** independent tab selection, per-tab control, human priority, and confirmed close/reopen actions that preserve saved site data.
 

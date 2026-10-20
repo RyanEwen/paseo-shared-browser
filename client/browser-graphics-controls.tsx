@@ -44,6 +44,7 @@ export function BrowserGraphicsControls(props: BrowserGraphicsControlsProps) {
     { value: "host-default", label: BROWSER_GRAPHICS_LABELS["host-default"] },
     { value: "vulkan", label: `${BROWSER_GRAPHICS_LABELS.vulkan} · Linux` },
     { value: "wayland", label: `${BROWSER_GRAPHICS_LABELS.wayland} · Linux` },
+    { value: "private-desktop", label: `${BROWSER_GRAPHICS_LABELS["private-desktop"]} · Linux` },
   ] as const;
   return (
     <View style={{ gap: 8 }}>
@@ -78,6 +79,13 @@ export function BrowserGraphicsControls(props: BrowserGraphicsControlsProps) {
           Used for new browsers on this host. Host default keeps the existing setup, including WSL
           graphics. Changing the mode keeps open tabs running.
         </Text>
+        {props.preference === "private-desktop" ? (
+          <Text style={{ color: colors.foregroundMuted, fontSize: 11 }}>
+            Enables real Chromium print preview on an invisible private display. Requires Xvfb on
+            this host. Select the Print preview tab after opening print. Use Cancel, then select
+            your original tab. System print and save dialogs are unavailable.
+          </Text>
+        ) : null}
         {description.pending ? (
           <>
             <Text style={{ color: colors.foreground, fontSize: 12 }}>

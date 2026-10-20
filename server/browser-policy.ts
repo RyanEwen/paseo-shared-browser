@@ -7,6 +7,7 @@ import {
   domEvaluateInputSchema,
   domSnapshotSchema,
 } from "../shared/agent-dom";
+import { agentPointerPointSchema } from "../shared/agent-pointer";
 import {
   type applyDevicePresetRpc,
   type BrowserFrame,
@@ -30,6 +31,7 @@ import {
   MIN_VIEWPORT,
   mapDisplayedPoint,
   type navigateBrowserRpc,
+  type printBrowserRpc,
   type resizeBrowserRpc,
   type sendBrowserInputRpc,
   type setCaptureDensityRpc,
@@ -38,6 +40,7 @@ import {
 } from "../shared/browser";
 import type { browserDisplayDemandRpc } from "../shared/browser-display-demand";
 import { browserGraphicsStateSchema } from "../shared/browser-graphics";
+import { browserPageTitle, isPrintPreviewUrl } from "../shared/browser-page";
 import {
   type BrowserFrameAuthority,
   type BrowserVideoReadInput,
@@ -52,6 +55,7 @@ import {
   DEFAULT_CAPTURE_QUALITY,
   JPEG_QUALITY,
 } from "../shared/capture-settings";
+import { AgentPointerPresence } from "./agent-pointer";
 import { frameMatchesBrowserContext } from "./browser-frame-context";
 import { createBrowserFrameRejection } from "./browser-frame-rejection";
 import { BrowserGesture } from "./browser-gesture";
@@ -76,6 +80,7 @@ type CaptureReply = Omit<RpcOutput<typeof captureBrowserRpc>, "state"> & {
 type DensityInput = RpcInput<typeof setCaptureDensityRpc>;
 type CloseInput = RpcInput<typeof closeBrowserRpc>;
 type NavigateInput = RpcInput<typeof navigateBrowserRpc>;
+type PrintInput = RpcInput<typeof printBrowserRpc>;
 type ResizeInput = RpcInput<typeof resizeBrowserRpc>;
 type ApplyDevicePresetInput = RpcInput<typeof applyDevicePresetRpc>;
 type SendInput = RpcInput<typeof sendBrowserInputRpc>;
@@ -141,6 +146,7 @@ interface FrameObservation {
   observedAtMonotonicMs?: number;
 }
 interface BrowserSession {
+  agentPointer?: AgentPointerPresence;
   displayDemand?: ViewerDisplayDemand;
   key: string;
   workspaceId: string;
@@ -152,6 +158,7 @@ interface BrowserSession {
   viewport: Viewport;
   captureScale: number;
   videoCaptureEnabled?: boolean;
+  canPrint?: boolean;
   graphics?: import("../shared/browser-graphics").BrowserGraphicsState;
   navigationGeneration: number;
   viewportGeneration: number;
@@ -440,7 +447,10 @@ export class SessionManager {
           : { viewerCount: 0, controllerLabel: null };
         return browserTabSchema.parse({
           id: tabId,
-          title: boundedText(String(value.title ?? ""), 1_024),
+          title: boundedText(
+            browserPageTitle(String(value.title ?? ""), String(value.url ?? "")),
+            1_024,
+          ),
           url: boundedText(String(value.url ?? ""), 8_192),
           ...presence,
         });
@@ -942,6 +952,33 @@ export class SessionManager {
     });
   }
 
+  /** Open real print on the exact controlled source; preview discovery stays explicit. */
+  async print(input: PrintInput): Promise<{ state: BrowserState }> {
+    const session = this.requireViewer(input.viewerToken);
+    return this.serialize(session, async () => {
+      this.requireMutationAccess(session, input);
+      if (!session.canPrint)
+        throw new Error(
+          "Print requires an owned private desktop; select Private desktop in Graphics and apply it",
+        );
+      await this.refreshPageMetadata(session);
+      this.requireMutationAccess(session, input);
+      if (isPrintPreviewUrl(session.lastUrl))
+        throw new Error("Select the original page before opening print");
+      await this.cancelGesture(session);
+      this.requireMutationAccess(session, input);
+      try {
+        await this.request(session, "print", { expectedInputGeneration: session.inputGeneration });
+      } finally {
+        // Even an unknown modal outcome revokes old input receipts, without
+        // publishing a cursor position or replaying the print request.
+        this.invalidateFrames(session);
+      }
+      this.renewController(session, input.viewerToken);
+      return { state: this.projectState(session, input.viewerToken) };
+    });
+  }
+
   async navigate(input: NavigateInput): Promise<{ state: BrowserState }> {
     const session = this.requireViewer(input.viewerToken);
     return this.serialize(session, async () => {
@@ -1142,6 +1179,15 @@ export class SessionManager {
         }
       }
       this.renewController(session, viewerToken);
+      if (
+        operation === "dom.action" &&
+        "action" in data &&
+        (data.action.kind === "click" || data.action.kind === "hover")
+      ) {
+        const point = agentPointerPointSchema.safeParse(asRecord(result).pointer);
+        if (point.success)
+          this.recordAgentPointer(session, point.data, "semantic", data.action.kind === "click");
+      }
       return { state: await this.snapshotState(session, viewerToken), result };
     });
   }
@@ -1626,6 +1672,7 @@ export class SessionManager {
         ...(typeof identity.videoCaptureEnabled === "boolean"
           ? { videoCaptureEnabled: identity.videoCaptureEnabled }
           : {}),
+        canPrint: identity.canPrint === true,
         ...(browserGraphicsStateSchema.safeParse(identity.graphics).success
           ? { graphics: browserGraphicsStateSchema.parse(identity.graphics) }
           : {}),
@@ -2117,6 +2164,7 @@ export class SessionManager {
     if (event.kind === "move") {
       const point = mapDisplayedPoint(event.point, session.viewport);
       await this.request(session, "mouse.move", { x: point.x, y: point.y, gestureId });
+      this.recordAgentPointer(session, point, "native", false);
       return;
     }
     if (event.kind === "type") {
@@ -2142,6 +2190,7 @@ export class SessionManager {
     if (event.kind === "scroll") {
       const point = mapDisplayedPoint(event.point, session.viewport);
       await this.request(session, "mouse.move", { x: point.x, y: point.y, gestureId });
+      this.recordAgentPointer(session, point, "native", false);
       await assertTargetCurrent();
       await this.request(session, "mouse.wheel", {
         x: point.x,
@@ -2161,6 +2210,7 @@ export class SessionManager {
       y: start.y,
       gestureId,
     });
+    this.recordAgentPointer(session, start, "native", false);
     await assertTargetCurrent();
     const count = event.kind === "click" ? event.clickCount : 1;
     for (let clickCount = 1; clickCount <= count; clickCount += 1) {
@@ -2171,6 +2221,7 @@ export class SessionManager {
         clickCount,
         gestureId,
       });
+      this.recordAgentPointer(session, start, "native", true);
       await runWithInputCleanup(
         async () => {
           await assertTargetCurrent();
@@ -2181,6 +2232,7 @@ export class SessionManager {
               y: end.y,
               gestureId,
             });
+            this.recordAgentPointer(session, end, "native", false);
             await assertTargetCurrent();
           }
         },
@@ -2197,6 +2249,39 @@ export class SessionManager {
         },
       );
     }
+  }
+
+  /** Publish only trusted agent activity after its native/semantic action acknowledges. */
+  private recordAgentPointer(
+    session: BrowserSession,
+    point: { x: number; y: number },
+    source: "native" | "semantic",
+    click: boolean,
+  ): void {
+    const controller = session.controller;
+    const viewer = controller ? session.viewers.get(controller.viewerToken) : null;
+    if (!controller || viewer?.policy.kind !== "agent") return;
+    if (
+      point.x < 0 ||
+      point.y < 0 ||
+      point.x >= session.viewport.width ||
+      point.y >= session.viewport.height
+    )
+      return;
+    session.agentPointer ??= new AgentPointerPresence();
+    session.agentPointer.record(
+      {
+        runtimeId: session.runtimeId,
+        bridgeEpoch: session.bridgeEpoch,
+        controlToken: controller.controlToken,
+        inputGeneration: session.inputGeneration,
+        navigationGeneration: session.navigationGeneration,
+        viewportGeneration: session.viewportGeneration,
+      },
+      { ...point, label: viewer.label, source },
+      click,
+      this.now(),
+    );
   }
 
   private async refreshPageMetadata(session: BrowserSession, timeoutMs?: number): Promise<void> {
@@ -2259,6 +2344,7 @@ export class SessionManager {
         ? {}
         : { videoCaptureEnabled: session.videoCaptureEnabled }),
       ...(session.graphics ? { graphics: session.graphics } : {}),
+      canPrint: session.canPrint === true,
       navigationGeneration: session.navigationGeneration,
       viewportGeneration: session.viewportGeneration,
       devicePresetId: session.devicePresetId,
@@ -2266,9 +2352,29 @@ export class SessionManager {
       controller: !controller ? "none" : controller.viewerToken === viewerToken ? "self" : "other",
       controllerLabel: controllerViewer?.label ?? null,
       controllerExpiresAt: controller ? new Date(controller.expiresAt).toISOString() : null,
+      agentPointer:
+        session.agentPointer?.read(
+          controller && controllerViewer?.policy.kind === "agent" && !session.error
+            ? {
+                runtimeId: session.runtimeId,
+                bridgeEpoch: session.bridgeEpoch,
+                controlToken: controller.controlToken,
+                inputGeneration: session.inputGeneration,
+                navigationGeneration: session.navigationGeneration,
+                viewportGeneration: session.viewportGeneration,
+              }
+            : null,
+          this.now(),
+        ) ?? null,
       viewerCount: session.viewers.size,
       error: session.error,
-      ...(session.notice ? { notice: session.notice } : {}),
+      ...(session.notice || isPrintPreviewUrl(session.lastUrl)
+        ? {
+            notice:
+              session.notice ??
+              "Chromium print preview. Use Cancel or close this preview tab, then select your original tab. System print and save dialogs are unavailable.",
+          }
+        : {}),
     };
   }
 }

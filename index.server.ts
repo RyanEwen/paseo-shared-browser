@@ -19,6 +19,7 @@ import {
   handleListBrowserTabs,
   handleListOpenBrowserWorkspaces,
   handleNavigateBrowser,
+  handlePrintBrowser,
   handleReadBrowserState,
   handleReadBrowserVideo,
   handleReleaseControl,
@@ -51,6 +52,7 @@ import {
   listBrowserTabsRpc,
   listOpenBrowserWorkspacesRpc,
   navigateBrowserRpc,
+  printBrowserRpc,
   releaseControlRpc,
   reopenBrowserRpc,
   resizeBrowserRpc,
@@ -163,6 +165,7 @@ export default function contribute(server: PluginServerContext) {
   server.handle(updateBrowserGestureRpc, handleUpdateBrowserGesture);
   server.handle(endBrowserGestureRpc, handleEndBrowserGesture);
   server.handle(navigateBrowserRpc, handleNavigateBrowser);
+  server.handle(printBrowserRpc, handlePrintBrowser);
   server.handle(resizeBrowserRpc, handleResizeBrowser);
   server.handle(applyDevicePresetRpc, handleApplyDevicePreset);
   server.handle(sendBrowserInputRpc, handleSendBrowserInput);

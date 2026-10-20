@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { browserGestureKeySchema, MAX_BROWSER_TABS } from "../shared/browser";
 import type { BrowserGraphicsPreference } from "../shared/browser-graphics";
+import { isPrintPreviewUrl } from "../shared/browser-page";
 import { videoCodecSchema, videoRequestBitrateSchema } from "../shared/video-codec-settings";
 import { videoFrameRateSchema } from "../shared/video-settings";
 import {
@@ -12,7 +13,7 @@ import {
   type BrowserViewport,
   type RuntimeTarget,
 } from "./agent-browser-runtime";
-import { readBrowserGraphicsMode } from "./browser-graphics";
+import { type BrowserGraphicsMode, readBrowserGraphicsMode } from "./browser-graphics";
 import { CdpUnknownOutcomeError } from "./cdp";
 import type { NativePyrowaveAssets } from "./native-pyrowave-cohort";
 import { createPrivateWaylandDisplay } from "./private-wayland-display";
@@ -146,20 +147,30 @@ export async function createRuntimeOwner(
     async create(workspaceId) {
       const hash = createHash("sha256").update(workspaceId).digest("hex");
       const graphicsPreference = readBrowserGraphicsPreference(home);
-      const graphicsMode =
-        graphicsPreference === "host-default" ? readBrowserGraphicsMode(home) : graphicsPreference;
+      let graphicsMode: BrowserGraphicsMode;
+      if (graphicsPreference === "host-default") {
+        graphicsMode = readBrowserGraphicsMode(home);
+      } else if (graphicsPreference === "private-desktop") {
+        graphicsMode = "default";
+      } else {
+        graphicsMode = graphicsPreference;
+      }
       const videoReady = options.nativeVideo ?? true;
       // Explicit headed mode uses the caller's real display. An opted-in hidden Linux mode
       // gets a private virtual mouse so native pointer media survive emulation.
       let display: PrivateVirtualDisplay | null = null;
       let displayNotice: string | null = null;
       const wantsDisplay = options.virtualDisplay ?? process.env.PASEO_SHARED_BROWSER_XVFB === "1";
+      const requiresDisplay = graphicsPreference === "private-desktop";
+      if (requiresDisplay && process.platform !== "linux") {
+        throw new PrivateDisplayError("Private desktop requires Linux and Xvfb");
+      }
       if (graphicsMode === "wayland") {
         const assets = await readRuntimeWaylandAssets(home);
         if (!assets)
           throw new PrivateDisplayError("Wayland GPU assets are not prepared on this host");
         display = await createPrivateWaylandDisplay(assets);
-      } else if (!options.headed && wantsDisplay) {
+      } else if (requiresDisplay || (!options.headed && wantsDisplay)) {
         try {
           const privateExecutable = join(runtimeRoot, "xvfb", "usr", "bin", "Xvfb");
           const executablePath =
@@ -174,6 +185,7 @@ export async function createRuntimeOwner(
           }.`;
         }
         if (displayNotice) {
+          if (requiresDisplay) throw new PrivateDisplayError(displayNotice);
           // The detached supervisor discards stdio; the notice also reaches the viewer state.
           console.warn(`[shared-browser] ${displayNotice} Using headless mode.`);
         }
@@ -241,8 +253,10 @@ export async function createRuntimeOwner(
         }));
       }
       if (operation === "tabs.create") {
-        if ((await orderedTargets(owned)).length >= MAX_BROWSER_TABS)
-          throw new Error("Browser tab limit reached");
+        const pages = (await orderedTargets(owned)).filter(
+          (target) => !isPrintPreviewUrl(target.url),
+        );
+        if (pages.length >= MAX_BROWSER_TABS) throw new Error("Browser tab limit reached");
         const targetId = await owned.runtime.createTarget();
         owned.tabOrder.push(targetId);
         return { targetId };
@@ -250,18 +264,32 @@ export async function createRuntimeOwner(
       if (operation === "tabs.close") {
         const targetId = String(data.targetId);
         const targets = await orderedTargets(owned);
-        if (!targets.some((target) => target.targetId === targetId)) {
+        const target = targets.find((target) => target.targetId === targetId);
+        if (!target) {
           throw new Error("Browser tab is no longer available");
         }
         if (targets.length <= 1) {
           throw new Error("The last browser tab cannot be closed");
         }
         const controller = owned.tabs.get(targetId);
-        if (controller) await (await controller).shutdown();
-        if (owned.rootTargetId === targetId) {
-          await owned.runtime.releaseTarget();
+        const preview = isPrintPreviewUrl(target.url);
+        let previewController: AgentBrowserRuntime | undefined;
+        let closeError: unknown;
+        if (preview) {
+          // Preview WebContents are tab-modal UI, not ordinary tabs. Chromium
+          // can acknowledge Target.closeTarget without closing them. Use its
+          // actual Cancel control and independently confirm disappearance below.
+          try {
+            previewController = await tabRuntime(owned, targetId);
+            await previewController.cancelPrintPreview();
+          } catch (error) {
+            closeError = error;
+          }
+        } else {
+          if (controller) await (await controller).shutdown();
+          if (owned.rootTargetId === targetId) await owned.runtime.releaseTarget();
+          await owned.runtime.closeTarget(targetId);
         }
-        await owned.runtime.closeTarget(targetId);
         // Target.closeTarget can acknowledge before Chromium drops the page from
         // its target list. Success requires observing its absence; the close is
         // never replayed, and exhaustion is reported rather than assumed.
@@ -273,8 +301,14 @@ export async function createRuntimeOwner(
           setTimeout(resolve, 50);
           await promise;
         }
+        if (!gone) {
+          if (closeError) throw closeError;
+          throw new CdpUnknownOutcomeError("Browser tab close could not be confirmed");
+        }
+        // Closing an unseen preview creates its first controller. Retain that
+        // attachment until disappearance is confirmed, then release its CDP session.
+        if (previewController) await previewController.shutdown();
         owned.tabs.delete(targetId);
-        if (!gone) throw new CdpUnknownOutcomeError("Browser tab close could not be confirmed");
         if (owned.rootTargetId === targetId) owned.rootTargetId = null;
         owned.tabOrder = owned.tabOrder.filter((id) => id !== targetId);
         return null;
@@ -284,6 +318,20 @@ export async function createRuntimeOwner(
           ? data.targetId
           : (owned.rootTargetId ?? (await orderedTargets(owned))[0]?.targetId);
       if (!targetId) throw new Error("Browser has no available page");
+      if (operation === "print") {
+        // A headed flag or DISPLAY variable can name a real user desktop.
+        // Only this owner's actual private-display handle authorizes activation.
+        if (process.platform !== "linux" || !owned.display)
+          throw new Error(
+            "Print requires an owned private desktop; select Private desktop in Graphics and apply it",
+          );
+        const target = (await owned.runtime.targets()).find(
+          (target) => target.targetId === targetId,
+        );
+        if (!target) throw new Error("Print source tab is no longer available");
+        if (isPrintPreviewUrl(target.url))
+          throw new Error("Select the original page before opening print");
+      }
       // Keep the launch page on its original CDP session. A second session on
       // the same target can reset emulation and interrupt its video source.
       const runtime =
@@ -301,6 +349,7 @@ export async function createRuntimeOwner(
           return {
             ...identity,
             videoCaptureEnabled: owned.runtimeOptions.nativeVideo === true,
+            canPrint: process.platform === "linux" && owned.display !== null,
             ...(identity.graphics
               ? {
                   graphics: {
@@ -322,6 +371,12 @@ export async function createRuntimeOwner(
           return runtime.state({ timeoutMs: data.timeoutMs }) as unknown as JsonValue;
         case "navigate":
           await runtime.navigate(String(data.url));
+          return null;
+        case "print":
+          await runtime.print(String(data.expectedInputGeneration), () => {
+            if (!owned.display) throw new Error("Private print display is unavailable");
+            owned.display.assertAvailable();
+          });
           return null;
         case "back":
           await runtime.back();

@@ -1,3 +1,4 @@
+import { agentPointerSchema } from "./agent-pointer";
 import { browserGraphicsStateSchema } from "./browser-graphics";
 import { captureDensitySchema } from "./capture-density";
 
@@ -22,6 +23,8 @@ export { DEVICE_PRESET_IDS, DEVICE_PRESETS, type DevicePresetId } from "./device
 
 export const DEFAULT_VIEWPORT = { width: 1280, height: 800 } as const;
 export const MAX_BROWSER_TABS = 8;
+/** Each content tab can also own a transient Chromium preview, selected independently. */
+export const MAX_BROWSER_PAGE_TARGETS = MAX_BROWSER_TABS * 2;
 export { MAX_VIEWPORT, MIN_VIEWPORT } from "./viewport-limits";
 
 const devicePresetIdSchema = z.enum(DEVICE_PRESET_IDS);
@@ -77,6 +80,8 @@ export const browserStateSchema = z.object({
   captureScale: z.number().min(1).max(2).default(1),
   videoCaptureEnabled: z.boolean().optional(),
   graphics: browserGraphicsStateSchema.optional(),
+  /** True only when the runtime owns an available private display for controlled printing. */
+  canPrint: z.boolean().optional(),
   navigationGeneration: generationSchema,
   viewportGeneration: generationSchema,
   devicePresetId: devicePresetIdSchema.nullable(),
@@ -84,6 +89,7 @@ export const browserStateSchema = z.object({
   controller: z.enum(["none", "self", "other"]),
   controllerLabel: z.string().max(64).nullable(),
   controllerExpiresAt: z.string().datetime().nullable(),
+  agentPointer: agentPointerSchema.nullable().optional(),
   viewerCount: z.number().int().nonnegative(),
   error: z.string().max(2_048).nullable(),
   notice: z.string().max(256).optional(),
@@ -126,7 +132,7 @@ export const attachBrowserRpc = defineRpc({
 export const listBrowserTabsRpc = defineRpc({
   name: "shared-browser.tabs.list",
   input: z.object({ viewerToken: opaqueTokenSchema }),
-  output: z.object({ tabs: z.array(browserTabSchema).max(MAX_BROWSER_TABS) }),
+  output: z.object({ tabs: z.array(browserTabSchema).max(MAX_BROWSER_PAGE_TARGETS) }),
 });
 
 export const createBrowserTabRpc = defineRpc({
@@ -219,6 +225,20 @@ export const expectedStateSchema = z.object({
 });
 
 export type ExpectedBrowserState = z.infer<typeof expectedStateSchema>;
+
+/** Activate this controlled source on its private display and invoke real print once.
+ * An acknowledgement is not proof a preview opened. Unknown outcomes are errors;
+ * callers inspect tabs without replay and select the preview explicitly.
+ */
+export const printBrowserRpc = defineRpc({
+  name: "shared-browser.print",
+  input: z.object({
+    viewerToken: opaqueTokenSchema,
+    controlToken: opaqueTokenSchema,
+    expected: expectedStateSchema,
+  }),
+  output: z.object({ state: browserStateSchema }),
+});
 
 export const navigateBrowserRpc = defineRpc({
   name: "shared-browser.navigate",

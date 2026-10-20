@@ -1,11 +1,15 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { AgentBrowserRuntime } from "./agent-browser-runtime";
 import { createRuntimeOwner } from "./runtime-owner";
 
 type Owner = Awaited<ReturnType<typeof createRuntimeOwner>>;
 type Owned = Parameters<Owner["request"]>[0];
 
 beforeEach(() => vi.useFakeTimers());
-afterEach(() => vi.useRealTimers());
+afterEach(() => {
+  vi.useRealTimers();
+  vi.restoreAllMocks();
+});
 
 async function fixture(lingerSnapshots: number | null) {
   const owner = await createRuntimeOwner({ virtualDisplay: false, nativeVideo: false });
@@ -132,5 +136,49 @@ it("keeps an unconfirmed launch-page close pinned to its original target", async
   expect(f.owned.rootTargetId).toBe("closing");
   expect(f.native.releaseTarget).toHaveBeenCalledTimes(1);
   expect(f.native.closeTarget).toHaveBeenCalledTimes(1);
+  expect(f.native.selectTarget).not.toHaveBeenCalled();
+});
+
+it("releases a previously unattached preview controller only after confirmed cancellation", async () => {
+  const f = await fixture(2);
+  f.owned.runtimeOptions = {
+    binaryPath: "/unused/agent-browser",
+    executablePath: "/unused/chrome",
+    profilePath: "/unused/profile",
+    ipcDirectory: "/unused/ipc",
+    session: "preview-close-fixture",
+  };
+  const targets = f.native.targets.getMockImplementation()!;
+  f.native.targets.mockImplementation(async () =>
+    (await targets()).map((target) => ({
+      ...target,
+      url: target.targetId === "closing" ? "chrome://print/" : target.url,
+    })),
+  );
+  const attach = vi.spyOn(AgentBrowserRuntime.prototype, "attachTarget").mockResolvedValue();
+  const cancel = vi
+    .spyOn(AgentBrowserRuntime.prototype, "cancelPrintPreview")
+    .mockImplementation(async () => {
+      f.state.closing = true;
+    });
+  const shutdown = vi
+    .spyOn(AgentBrowserRuntime.prototype, "shutdown")
+    .mockImplementation(async () => {
+      expect(f.state.ids).toEqual(["root"]);
+    });
+
+  expect(f.owned.tabs.size).toBe(0);
+  const pending = f.owner.request(f.owned, "tabs.close", { targetId: "closing" });
+  await vi.runAllTimersAsync();
+  await expect(pending).resolves.toBeNull();
+
+  expect(attach).toHaveBeenCalledExactlyOnceWith("closing");
+  expect(cancel).toHaveBeenCalledOnce();
+  expect(shutdown).toHaveBeenCalledOnce();
+  expect(shutdown.mock.instances[0]).toBe(cancel.mock.instances[0]);
+  expect(f.owned.tabs.size).toBe(0);
+  expect(f.owned.rootTargetId).toBe("root");
+  expect(f.native.closeTarget).not.toHaveBeenCalled();
+  expect(f.native.releaseTarget).not.toHaveBeenCalled();
   expect(f.native.selectTarget).not.toHaveBeenCalled();
 });

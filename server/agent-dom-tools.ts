@@ -25,7 +25,7 @@ export function registerDomTools(server: McpServer, client: AgentSupervisorClien
     server.registerTool(
       `shared_browser_${kind}`,
       {
-        description: `${kind === "click" ? "Focus the nearest focusable target (or blur the previous field), then click" : "Hover"} the exact element ref from shared_browser_snapshot. Requires control. Uses DOM events; use screenshots and native input for trusted pointer events or canvas work. Never retry an uncertain action.`,
+        description: `${kind === "click" ? "Focus the nearest focusable target (or blur the previous field), then click" : "Hover"} the exact element ref from shared_browser_snapshot. Requires control. Uses DOM events; use screenshots and native input for trusted pointer events or canvas work. Never retry an uncertain action. Print can block the action acknowledgement: list tabs and explicitly select Print preview rather than clicking print again.`,
         inputSchema: z.object(target),
         annotations: mutation,
       },

@@ -17,6 +17,7 @@ import {
   listPageTargets,
 } from "./cdp";
 import { readJpegFrameDimensions } from "./jpeg-frame";
+import { cancelPrintPreview, openPrintPreview } from "./print-preview";
 import { needsSoftwareCaptureColorCorrection } from "./video-capture-color-policy";
 
 export { readJpegFrameDimensions as jpegDimensions } from "./jpeg-frame";
@@ -536,6 +537,38 @@ export class AgentBrowserRuntime {
       { mutation: true },
     );
     if (!result.success) throw new CdpUnavailableError("Browser tab could not be closed");
+  }
+
+  /** Close the exact attached preview through Chromium's Cancel UI, never an OS dialog or source tab. */
+  async cancelPrintPreview(): Promise<void> {
+    const page = await this.requirePage();
+    const generation = this.attachmentGeneration;
+    await cancelPrintPreview(page, () => {
+      this.assertRuntimeOpen();
+      if (this.page !== page || this.attachmentGeneration !== generation)
+        throw new CdpUnavailableError("Print preview attachment changed");
+    });
+    this.invalidateScreencastFrame();
+  }
+
+  /** Open print on this exact document; the owner supplies its private-display authority check. */
+  async print(expectedInputGeneration: string, assertPrivateDisplay: () => void): Promise<void> {
+    const page = await this.requirePage();
+    const assertCurrent = () => {
+      assertPrivateDisplay();
+      this.assertRuntimeOpen();
+      if (
+        this.page !== page ||
+        expectedInputGeneration !==
+          formatRuntimeInputGeneration(this.attachmentGeneration, this.documentGeneration)
+      )
+        throw new CdpUnavailableError("Print source document or attachment changed");
+    };
+    try {
+      await openPrintPreview(page, assertCurrent);
+    } finally {
+      this.invalidateScreencastFrame();
+    }
   }
 
   /**

@@ -17,6 +17,8 @@ const fake = vi.hoisted(() => ({
   stop: vi.fn(),
   wayland: vi.fn(),
   waylandAssets: vi.fn(),
+  print: vi.fn(),
+  targets: vi.fn(),
 }));
 vi.mock("./private-wayland-display", () => ({ createPrivateWaylandDisplay: fake.wayland }));
 vi.mock("./wayland-assets", () => ({ readRuntimeWaylandAssets: fake.waylandAssets }));
@@ -32,6 +34,8 @@ vi.mock("./agent-browser-runtime", () => ({
     launch = fake.launch;
     shutdown = fake.shutdown;
     identity = async () => ({ userAgent: "Fixture", targetId: "fixture-root" });
+    print = fake.print;
+    targets = fake.targets;
     constructor(options: unknown) {
       fake.runtime(options);
     }
@@ -64,7 +68,78 @@ beforeEach(async () => {
     assertAvailable: fake.assertAvailable,
     stop: fake.stop,
   });
+  fake.targets.mockResolvedValue([
+    { targetId: "fixture-root", url: "about:blank", title: "Source" },
+  ]);
+  fake.print.mockImplementation(async (_generation, assertPrivateDisplay) =>
+    assertPrivateDisplay(),
+  );
 });
+
+it("refuses controlled print on a real-user headed display despite display environment hints", async () => {
+  const owner = await createRuntimeOwner({
+    headed: true,
+    virtualDisplay: false,
+    nativeVideo: false,
+  });
+  const owned = await owner.create("unowned-display");
+  owned.runtimeOptions.launchEnvironment = { DISPLAY: ":0" };
+  expect(await owner.request(owned, "identity", null)).toMatchObject({ canPrint: false });
+  await expect(owner.request(owned, "print", { targetId: "fixture-root" })).rejects.toThrow(
+    "owned private desktop",
+  );
+  expect(fake.print).not.toHaveBeenCalled();
+  await owner.stop(owned);
+});
+
+it.skipIf(process.platform !== "linux")(
+  "authorizes an owned private source and refuses to print a preview",
+  async () => {
+    await createRuntimeGraphicsSettings(fixtureHome).update("private-desktop");
+    const owner = await createRuntimeOwner({ nativeVideo: false });
+    const owned = await owner.create("private-print");
+    expect(await owner.request(owned, "identity", null)).toMatchObject({ canPrint: true });
+    await owner.request(owned, "print", {
+      targetId: "fixture-root",
+      expectedInputGeneration: "1:1",
+    });
+    expect(fake.print).toHaveBeenCalledExactlyOnceWith("1:1", expect.any(Function));
+    fake.targets.mockResolvedValueOnce([
+      { targetId: "fixture-root", url: "chrome://print/", title: "Preview" },
+    ]);
+    await expect(owner.request(owned, "print", { targetId: "fixture-root" })).rejects.toThrow(
+      "original page",
+    );
+    expect(fake.print).toHaveBeenCalledOnce();
+    await owner.stop(owned);
+  },
+);
+
+it.skipIf(process.platform !== "linux")(
+  "requires an authenticated private display for the saved private desktop choice",
+  async () => {
+    await createRuntimeGraphicsSettings(fixtureHome).update("private-desktop");
+    const owner = await createRuntimeOwner({ nativeVideo: false });
+    const owned = await owner.create("private-desktop");
+    expect(owned.runtimeOptions).toMatchObject({
+      headed: true,
+      graphicsMode: "default",
+      launchEnvironment: { DISPLAY: ":23067", XAUTHORITY: "/tmp/private/authority" },
+    });
+    expect(owned.graphicsPreference).toBe("private-desktop");
+    await owner.stop(owned);
+    expect(fake.stop).toHaveBeenCalledOnce();
+
+    fake.display.mockResolvedValueOnce(null);
+    await expect(owner.create("missing-display")).rejects.toThrow("Xvfb was not found");
+    expect(fake.runtime).toHaveBeenCalledTimes(1);
+    fake.display.mockRejectedValueOnce(
+      new PrivateDisplayError("Private browser display failed to start"),
+    );
+    await expect(owner.create("failed-display")).rejects.toThrow("failed to start");
+    expect(fake.runtime).toHaveBeenCalledTimes(1);
+  },
+);
 
 it("uses saved Wayland choice with owned native display and never silently falls back when assets are missing", async () => {
   const home = await mkdtemp(join(tmpdir(), "shared-browser-owner-wayland-"));
