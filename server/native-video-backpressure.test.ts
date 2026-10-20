@@ -4,105 +4,9 @@
  */
 import { createContext, runInContext } from "node:vm";
 import { expect, it } from "vitest";
+import { createNativeVideoEncoderFixture as fixture } from "../tests/fixtures/native-video-encoder";
+import { nativeVideoSynchronousTimers } from "../tests/fixtures/native-video-timers";
 import { NATIVE_VIDEO_EXTENSION_SOURCE } from "./native-video-extension-source";
-
-/** Delayed native codec output and ACKs, with the shipped trusted program unmodified. */
-async function fixture(failFirstEncoder = false) {
-  const packets: { sequence: number; type: string; timestampUs: number }[] = [];
-  let deliver: (result: unknown) => void = () => {};
-  const reader = {
-    read: () =>
-      new Promise((resolve) => {
-        deliver = resolve;
-      }),
-    cancel: async () => deliver({ done: true }),
-  };
-  const pending: { timestamp: number; type: string }[] = [];
-  const encoded: { timestamp: number; keyFrame: boolean }[] = [];
-  let encoder: Encoder;
-  const instances: Encoder[] = [];
-  class Encoder {
-    static async isConfigSupported(candidate: unknown) {
-      return { supported: true, config: candidate };
-    }
-    encodeQueueSize = 0;
-    constructor(readonly callbacks: { output(chunk: unknown, metadata: unknown): void }) {
-      encoder = this;
-      instances.push(this);
-    }
-    configure() {}
-    reset() {}
-    close() {}
-    encode(frame: { timestamp: number }, options: { keyFrame: boolean }) {
-      if (failFirstEncoder && this === instances[0]) throw new Error("Codec stopped");
-      this.encodeQueueSize++;
-      encoded.push({ timestamp: frame.timestamp, keyFrame: options.keyFrame });
-      pending.push({ timestamp: frame.timestamp, type: options.keyFrame ? "key" : "delta" });
-    }
-    output() {
-      const value = pending.shift();
-      if (!value) throw new Error("No queued fixture frame");
-      this.encodeQueueSize--;
-      this.callbacks.output(
-        { ...value, byteLength: 10, copyTo: (bytes: Uint8Array) => bytes.fill(1) },
-        {},
-      );
-    }
-  }
-  const context = createContext({
-    chrome: {
-      debugger: { getTargets: async () => [{ id: "exact", type: "page", tabId: 7 }] },
-      tabCapture: { getMediaStreamId: async () => "stream" },
-    },
-    navigator: {
-      mediaDevices: {
-        getUserMedia: async () => ({
-          getVideoTracks: () => [{ getSettings: () => ({ width: 320, height: 240 }) }],
-          getTracks: () => [{ stop() {} }],
-        }),
-      },
-    },
-    MediaStreamTrackProcessor: class {
-      readable = { getReader: () => reader };
-    },
-    VideoEncoder: Encoder,
-    nativeVideoPacket: (json: string) => packets.push(JSON.parse(json)),
-    performance: { now: () => 100 },
-    Uint8Array,
-    Map,
-    Set,
-    Object,
-    JSON,
-    Number,
-    btoa: (value: string) => Buffer.from(value, "binary").toString("base64"),
-  });
-  runInContext(NATIVE_VIDEO_EXTENSION_SOURCE, context);
-  await runInContext('startCapture("exact",320,240,1)', context);
-  await runInContext('addEncoder("high","stream",12000000,30)', context);
-  if (failFirstEncoder) {
-    await runInContext('addEncoder("low","healthy",2000000,30)', context);
-  }
-  const turn = () => new Promise<void>((resolve) => setImmediate(resolve));
-  return {
-    packets,
-    encoded,
-    async frame(timestamp: number) {
-      deliver({
-        value: { timestamp, displayWidth: 320, displayHeight: 240, close() {} },
-        done: false,
-      });
-      await turn();
-    },
-    output: () => encoder!.output(),
-    ack: () =>
-      runInContext(
-        'for(const p of fixturePackets) acknowledge("stream",p.sequence)',
-        Object.assign(context, { fixturePackets: packets }),
-      ),
-    request: () => runInContext('requestKeyFrame("high")', context),
-    stop: () => runInContext("stopCapture()", context),
-  };
-}
 
 it("preserves encoded deltas during source backpressure with no extra recovery key", async () => {
   const f = await fixture();
@@ -167,7 +71,7 @@ it("adds a requested key without suppressing an intact pending delta", async () 
   }
 });
 
-it("still suppresses dependencies after an actual encoded output is dropped", async () => {
+it("still requires recovery after an unassociated late encoded output", async () => {
   const f = await fixture();
   try {
     await f.frame(0);
@@ -176,10 +80,9 @@ it("still suppresses dependencies after an actual encoded output is dropped", as
     await f.frame(33333);
     await f.frame(66666);
     f.output();
-    await f.frame(99999);
+    f.repeatOutput();
     f.output();
-    f.output();
-    expect(f.packets.map((p) => p.timestampUs)).toEqual([0, 33333, 66666]);
+    expect(f.packets.map((p) => p.timestampUs)).toEqual([0, 33333]);
     f.ack();
     await f.frame(133332);
     f.output();
@@ -192,6 +95,7 @@ it("still suppresses dependencies after an actual encoded output is dropped", as
 it("shipped packet conversion is exact with native and legacy byte APIs", () => {
   for (const native of [true, false]) {
     const context = createContext({
+      ...nativeVideoSynchronousTimers,
       btoa: (value: string) => Buffer.from(value, "binary").toString("base64"),
     });
     runInContext(NATIVE_VIDEO_EXTENSION_SOURCE, context);

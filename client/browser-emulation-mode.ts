@@ -49,7 +49,7 @@ export function selectionMode(presetId: DevicePresetId | null): BrowserEmulation
   return DEVICE_PRESETS.find((preset) => preset.id === presetId)?.isMobile ? "mobile" : "desktop";
 }
 
-/** A profile ID alone must not check a resolution that differs from the actual display. */
+/** Match CSS size and device behavior; automatic capture detail is independent of preset identity. */
 export function matchingResolutionPresetId(
   state: Pick<BrowserState, "devicePresetId" | "viewport" | "captureScale"> | null,
 ): DevicePresetId | null {
@@ -57,8 +57,7 @@ export function matchingResolutionPresetId(
   const preset = DEVICE_PRESETS.find((item) => item.id === state.devicePresetId);
   return preset &&
     preset.viewport.width === state.viewport.width &&
-    preset.viewport.height === state.viewport.height &&
-    preset.captureScale === state.captureScale
+    preset.viewport.height === state.viewport.height
     ? preset.id
     : null;
 }

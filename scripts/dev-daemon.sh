@@ -7,7 +7,8 @@ root=$(git rev-parse --show-toplevel)
 cli="$root/node_modules/.bin/paseo"
 [ -x "$cli" ] || { echo 'Run bun install first' >&2; exit 1; }
 key=$(node -e 'process.stdout.write(require("node:crypto").createHash("sha256").update(process.argv[1]).digest("hex").slice(0,12))' "$root")
-state="${TMPDIR:-/tmp}/shared-browser-dev-$key"
+# Keep durable private test homes separate from Chromium's short Unix-socket temp paths.
+state="${PASEO_SHARED_BROWSER_DEV_ROOT:-${TMPDIR:-/tmp}}/shared-browser-dev-$key"
 home="$state/home"
 clean() {
   env -u PASEO_AGENT_ID -u PASEO_AGENT_CWD -u PASEO_WORKSPACE_ID -u PASEO_HOST -u PASEO_HOME -u PASEO_LISTEN \
@@ -18,7 +19,7 @@ clean() {
 dev_host() { clean "$cli" daemon status --home "$home" --json | node -e 'let s="";process.stdin.on("data",x=>s+=x).on("end",()=>process.stdout.write(JSON.parse(s).listen))'; }
 stage() {
   rm -rf "$state/plugin"
-  node -e 'const fs=require("node:fs"),path=require("node:path");const excluded=new Set([".git","node_modules","coverage","dist",".dev","test-results","playwright-report"]);fs.cpSync(process.argv[1],process.argv[2],{recursive:true,filter:p=>!excluded.has(path.basename(p))&&!path.basename(p).startsWith(".env")})' "$root" "$state/plugin"
+  node "$root/scripts/stage-dev-plugin.mjs" "$root" "$state/plugin"
 }
 case "$cmd" in
   up)

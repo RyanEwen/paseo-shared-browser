@@ -4,6 +4,7 @@
  * HTTP fixture, consumer target and virtual display. Never uses the live browser.
  */
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { homedir, tmpdir } from "node:os";
@@ -14,6 +15,7 @@ import { expect, it, vi } from "vitest";
 import { attachToTarget, type CdpConnection, type CdpSession } from "../server/cdp";
 import { createRuntimeOwner } from "../server/runtime-owner";
 import { resolveBrowserRuntimeRoot } from "../server/runtime-path";
+import { createRuntimeVideoSettings } from "../server/runtime-video-settings";
 import { resolveSupervisorPaths, startSupervisorServer } from "../server/supervisor";
 import { SupervisorClient } from "../server/supervisor-client";
 import type { BrowserState, DevicePresetId } from "../shared/browser";
@@ -42,6 +44,8 @@ html,body{margin:0;height:100%;overflow:hidden;background:#243448}.corner{positi
 <button style="position:fixed;left:300px;top:300px;width:100px;height:40px" onclick="a.style.background='cyan';window.humanClicks=(window.humanClicks||0)+1">Change view</button><div id=a class=corner></div><div id=b class=corner></div><div id=c class=corner></div><div id=d class=corner></div><div id=moving></div>
 <div style="position:fixed;left:100px;top:100px;width:32px;height:8px;background:repeating-linear-gradient(to right,#f00 0px 1px,#00f 1px 2px)"></div>
 <div style="position:fixed;left:100px;top:112px;width:32px;height:8px;background:repeating-linear-gradient(to right,#f00 0px .5px,#00f .5px 1px)"></div>
+<div style="position:fixed;left:100px;top:128px;width:32px;height:8px;background:repeating-linear-gradient(to right,#000 0px 1px,#fff 1px 2px)"></div>
+<div style="position:fixed;left:100px;top:140px;width:32px;height:8px;background:repeating-linear-gradient(to right,#000 0px .5px,#fff .5px 1px)"></div>
 <script>function tick(t){moving.style.left=((t/5)%200)+'px';requestAnimationFrame(tick)}requestAnimationFrame(tick)</script>`;
 function expected(state: BrowserState) {
   return {
@@ -51,6 +55,56 @@ function expected(state: BrowserState) {
     navigationGeneration: state.navigationGeneration,
     viewportGeneration: state.viewportGeneration,
   };
+}
+
+/** Read the actual authenticated, encoded and decoded canvas, never a source screenshot. */
+async function decodedPixels(
+  client: SupervisorClient,
+  consumer: CdpSession,
+  viewerToken: string,
+  state: BrowserState,
+  expression: string,
+): Promise<number[][]> {
+  await consumer.send("Runtime.evaluate", {
+    expression: `prepareVideo(${JSON.stringify(state)})`,
+  });
+  let video: BrowserVideoReadReply | null = null;
+  const readStarted = Date.now();
+  const attempts: { status: string; elapsedMs: number }[] = [];
+  // waitMs is a maximum: source resets may reply immediately. Match the viewer’s
+  // paced empty-read loop within the original nominal ten-by-250ms budget.
+  while (!video?.packets.length && Date.now() - readStarted < 2500) {
+    video = await client.requestBrowser<BrowserVideoReadReply>("video.read", {
+      viewerToken,
+      quality: "high",
+      streamId: null,
+      afterSequence: 0,
+      waitMs: 250,
+      requestKeyFrame: true,
+    });
+    attempts.push({ status: video.status, elapsedMs: Date.now() - readStarted });
+    expect(video.status).not.toBe("unsupported");
+    if (!video.packets.length) await new Promise((resolve) => setTimeout(resolve, 40));
+  }
+  expect(video?.packets.length, JSON.stringify(attempts)).toBeGreaterThan(0);
+  await consumer.send("Runtime.evaluate", {
+    expression: `consumeVideo(${JSON.stringify(video)})`,
+  });
+  await vi.waitFor(async () => {
+    const readback = await consumer.send<{ result: { value: Readback } }>("Runtime.evaluate", {
+      expression: "({presented,failures,needsKey})",
+      returnByValue: true,
+    });
+    expect(readback.result.value.failures).toEqual([]);
+    expect(readback.result.value.presented.at(-1)?.frameId).toBe(
+      video!.packets.at(-1)!.frame.frameId,
+    );
+  });
+  const pixels = await consumer.send<{ result: { value: number[][] } }>("Runtime.evaluate", {
+    expression: `(() => {const c=document.querySelector('canvas'),g=c.getContext('2d');return (${expression});})()`,
+    returnByValue: true,
+  });
+  return pixels.result.value;
 }
 
 /** Inspect owned source pixels only for density validation, never as a viewer presentation. */
@@ -197,9 +251,12 @@ async function proveNativeVideo(pointerKind: "mouse" | "touch") {
     vi.stubEnv("PASEO_SHARED_BROWSER_CHROMIUM_EXECUTABLE", executablePath);
     const owner = await createRuntimeOwner({
       initialUrl: `${origin}/source`,
-      nativeVideo: true,
       headed: process.platform === "win32",
+      ...(existsSync(join(runtimeRoot, "xvfb", "usr", "bin", "Xvfb"))
+        ? { virtualDisplayExecutablePath: join(runtimeRoot, "xvfb", "usr", "bin", "Xvfb") }
+        : {}),
     });
+    const videoChoice = createRuntimeVideoSettings(home);
     let owned: Awaited<ReturnType<typeof owner.create>> | null = null;
     const paths = resolveSupervisorPaths(home);
     running = await startSupervisorServer(
@@ -218,6 +275,13 @@ async function proveNativeVideo(pointerKind: "mouse" | "touch") {
       "attach",
       { workspaceId: "video-smoke", viewerLabel: "Owned video test" },
     );
+    expect(attached.state.videoCaptureEnabled).toBe(true);
+    expect(
+      await client.requestBrowser("video.read", {
+        viewerToken: attached.viewerToken,
+        quality: "high",
+      }),
+    ).toMatchObject({ status: "unsupported", reasonCode: "video-disabled", packets: [] });
     const lease = await client.requestBrowser<{ controlToken: string; state: BrowserState }>(
       "acquire-control",
       { viewerToken: attached.viewerToken },
@@ -231,6 +295,49 @@ async function proveNativeVideo(pointerKind: "mouse" | "touch") {
       }
     ).runtime;
     const connection = runtime.connection;
+    await runtime.page.send("Runtime.evaluate", {
+      expression: `window.unsavedDraft={text:"preserve this draft",count:17};
+        window.draftField=document.createElement('input');draftField.value="draft not submitted";
+        document.body.append(draftField);`,
+    });
+    const originalState = {
+      sessionId: state.sessionId,
+      runtimeId: state.runtimeId,
+      tabId: state.tabId!,
+      navigationGeneration: state.navigationGeneration,
+      viewportGeneration: state.viewportGeneration,
+    };
+    for (const enabled of [true, false, true]) {
+      await videoChoice.update(enabled);
+      const read = await client.requestBrowser<BrowserVideoReadReply>("video.read", {
+        viewerToken: attached.viewerToken,
+        quality: "high",
+        waitMs: 250,
+        requestKeyFrame: true,
+      });
+      if (!enabled) expect(read).toMatchObject({ status: "unsupported", packets: [] });
+      else expect(read.status).not.toBe("unsupported");
+      expect(read.state).toMatchObject(originalState);
+      expect(read.state.controller).toBe("self");
+      const draft = await runtime.page.send<{ result: { value: unknown } }>("Runtime.evaluate", {
+        expression: "[unsavedDraft.text,unsavedDraft.count,draftField.value]",
+        returnByValue: true,
+      });
+      expect(draft.result.value).toEqual(["preserve this draft", 17, "draft not submitted"]);
+    }
+    const graphics = await runtime.page.send<{ result: { value: unknown } }>("Runtime.evaluate", {
+      expression: `['webgl','webgl2'].map(kind=>{const c=document.createElement('canvas');
+        c.width=c.height=2;const gl=c.getContext(kind,{preserveDrawingBuffer:true});
+        if(!gl)return {kind,rendered:false};gl.clearColor(0,1,1,1);gl.clear(gl.COLOR_BUFFER_BIT);
+        const pixel=new Uint8Array(4);gl.readPixels(0,0,1,1,gl.RGBA,gl.UNSIGNED_BYTE,pixel);
+        return {kind,rendered:true,pixel:Array.from(pixel)};})`,
+      returnByValue: true,
+    });
+    expect(graphics.result.value).toEqual([
+      { kind: "webgl", rendered: true, pixel: [0, 255, 255, 255] },
+      { kind: "webgl2", rendered: true, pixel: [0, 255, 255, 255] },
+    ]);
+
     const created = await connection.send<{ targetId: string }>("Target.createTarget", {
       url: `${origin}/consumer`,
       background: true,
@@ -396,6 +503,22 @@ async function proveNativeVideo(pointerKind: "mouse" | "touch") {
         1280 * density,
         800 * density,
       ]);
+      // Black/white avoids H.264's chroma subsampling. At 2x, half-CSS-pixel
+      // stripes must survive the whole capture/codec/client path as alternating
+      // dark/light pixels. Merely enlarging a 1x capture cannot pass this check.
+      const detail = await decodedPixels(
+        client,
+        consumer,
+        attached.viewerToken,
+        state,
+        `Array.from({length:16},(_,i)=>Array.from(g.getImageData(${100 * density}+i,${(density === 2 ? 142 : 130) * density},1,1).data))`,
+      );
+      detail.forEach((pixel, index) => {
+        for (const channel of pixel.slice(0, 3)) {
+          if (index % 2 === 0) expect(channel).toBeLessThan(60);
+          else expect(channel).toBeGreaterThan(195);
+        }
+      });
       // RGB readback proves DPR2 source detail, not lossless video encoding.
       // This owned DevTools inspection is not a plugin capture API or idle overlay.
       const sourceImage = await runtime.page.send<{ data: string }>("Page.captureScreenshot", {
@@ -425,6 +548,197 @@ async function proveNativeVideo(pointerKind: "mouse" | "touch") {
             index % 2 === 0 ? [255, 0, 0, 255] : [0, 0, 255, 255],
           ),
         );
+      }
+    }
+    // A viewport-clip workaround also sharpens stationary content, but pins
+    // video to the top of the document. Verify real scroll-following at 2x.
+    await runtime.page.send("Runtime.evaluate", {
+      expression: `document.documentElement.style.overflow='auto';document.body.style.height='2400px';
+        window.scrollMarker=document.createElement('div');
+        scrollMarker.style.cssText='position:absolute;left:300px;top:800px;width:500px;height:600px;background:cyan';
+        document.body.append(scrollMarker);window.scrollTo(0,800);`,
+    });
+    const scrolled = await runtime.page.send<{ result: { value: number[] } }>("Runtime.evaluate", {
+      expression: "[scrollX,scrollY,innerWidth,innerHeight,devicePixelRatio]",
+      returnByValue: true,
+    });
+    expect(scrolled.result.value).toEqual([0, 800, 1280, 800, 2]);
+    await new Promise<void>((resolve) => setTimeout(resolve, 150));
+    const [scrollPixel] = await decodedPixels(
+      client,
+      consumer,
+      attached.viewerToken,
+      state,
+      "[Array.from(g.getImageData(800,400,1,1).data)]",
+    );
+    expect(scrollPixel![0]).toBeLessThan(60);
+    expect(scrollPixel![1]).toBeGreaterThan(195);
+    expect(scrollPixel![2]).toBeGreaterThan(195);
+    await runtime.page.send("Runtime.evaluate", {
+      expression:
+        "scrollMarker.remove();window.scrollTo(0,0);document.documentElement.style.overflow='hidden';document.body.style.height='100%';",
+    });
+    if (pointerKind === "mouse") {
+      // A SPA route change revokes frame authority but keeps its native codec.
+      // Inspect only this fixture's extension, then prove the public path still
+      // rejects the old receipt and paints the new route through the real decoder.
+      let beforeRoute: BrowserVideoReadReply | undefined;
+      await vi.waitFor(async () => {
+        beforeRoute = await client!.requestBrowser("video.read", {
+          viewerToken: attached.viewerToken,
+          requestKeyFrame: true,
+          waitMs: 250,
+        });
+        expect(beforeRoute!.packets.length).toBeGreaterThan(0);
+      });
+      const oldPacket = beforeRoute!.packets.at(-1)!;
+      const targets = await connection.send<{ targetInfos: { targetId: string; url: string }[] }>(
+        "Target.getTargets",
+      );
+      const helperTarget = targets.targetInfos.find(
+        (target) =>
+          target.url.startsWith("chrome-extension://") && target.url.endsWith("/recorder.html"),
+      );
+      expect(helperTarget).toBeDefined();
+      const helper = await attachToTarget(connection, helperTarget!.targetId);
+      try {
+        await helper.send("Runtime.evaluate", {
+          expression: `globalThis.routeFixtureEncoder=[...encoders.values()].find(s=>s.streamId===${JSON.stringify(oldPacket.streamId)}).encoder`,
+        });
+        await runtime.page.send("Runtime.evaluate", {
+          expression: `history.pushState({},"","/owned-spa-route");a.style.background="red";`,
+        });
+        const observed = await client.requestBrowser<{ state: BrowserState }>("status", {
+          viewerToken: attached.viewerToken,
+        });
+        expect(observed.state.navigationGeneration).toBeGreaterThan(state.navigationGeneration);
+        state = observed.state;
+        await expect(
+          client.requestBrowser("input", {
+            viewerToken: attached.viewerToken,
+            controlToken: lease.controlToken,
+            expected: expected(state),
+            target: {
+              frameId: oldPacket.frame.frameId,
+              navigationGeneration: oldPacket.frame.navigationGeneration,
+              viewportGeneration: oldPacket.frame.viewportGeneration,
+            },
+            event: { kind: "key", key: "Enter" },
+          }),
+        ).rejects.toThrow();
+        const [red] = await decodedPixels(
+          client,
+          consumer,
+          attached.viewerToken,
+          state,
+          "[Array.from(g.getImageData(10,10,1,1).data)]",
+        );
+        expect(red![0]).toBeGreaterThan(180);
+        expect(red![1]).toBeLessThan(90);
+        const retained = await helper.send<{ result: { value: boolean } }>("Runtime.evaluate", {
+          expression: `[...encoders.values()].some(s=>s.encoder===globalThis.routeFixtureEncoder)`,
+          returnByValue: true,
+        });
+        expect(retained.result.value).toBe(true);
+      } finally {
+        await helper.detach();
+      }
+    }
+    if (pointerKind === "mouse") {
+      // A long idle GOP must not strand a new viewer after the last key ages
+      // out of the one-second receipt history. Keep the existing viewer reading
+      // while the owned page stops animating, then join through the public RPC.
+      await runtime.page.send("Runtime.evaluate", {
+        expression: "window.requestAnimationFrame=()=>0;moving.style.left='20px'",
+      });
+      let cursor = 0;
+      let stream: string | null = null;
+      const idleStarted = Date.now();
+      while (Date.now() - idleStarted < 2200) {
+        const reply: BrowserVideoReadReply = await client.requestBrowser("video.read", {
+          viewerToken: attached.viewerToken,
+          streamId: stream,
+          afterSequence: cursor,
+          waitMs: 500,
+          requestKeyFrame: false,
+        });
+        stream = reply.streamId;
+        if (reply.packets.length) cursor = reply.packets.at(-1)!.sequence;
+      }
+      const joined = await client.requestBrowser<{ viewerToken: string; state: BrowserState }>(
+        "attach",
+        {
+          workspaceId: "video-smoke",
+          viewerLabel: "Idle stream join",
+          tabId: state.tabId!,
+        },
+      );
+      try {
+        await consumer.send("Runtime.evaluate", {
+          expression: `prepareVideo(${JSON.stringify(joined.state)})`,
+        });
+        let fresh: BrowserVideoReadReply | undefined;
+        await vi.waitFor(
+          async () => {
+            fresh = await client!.requestBrowser("video.read", {
+              viewerToken: joined.viewerToken,
+              streamId: null,
+              afterSequence: 0,
+              waitMs: 500,
+              requestKeyFrame: false,
+            });
+            expect(fresh!.packets[0]?.type).toBe("key");
+          },
+          { timeout: 5000 },
+        );
+        await consumer.send("Runtime.evaluate", {
+          expression: `consumeVideo(${JSON.stringify(fresh)})`,
+        });
+        cursor = fresh!.packets.at(-1)!.sequence;
+        stream = fresh!.streamId;
+        // Drop one genuine delta before the production decoder sees the next.
+        let dropped = false;
+        await vi.waitFor(
+          async () => {
+            const reply: BrowserVideoReadReply = await client!.requestBrowser("video.read", {
+              viewerToken: joined.viewerToken,
+              streamId: stream,
+              afterSequence: cursor,
+              waitMs: 500,
+              requestKeyFrame: false,
+            });
+            if (reply.packets.length) cursor = reply.packets.at(-1)!.sequence;
+            const delivered = reply.packets.filter((packet) => {
+              if (!dropped && packet.type === "delta") {
+                dropped = true;
+                return false;
+              }
+              return true;
+            });
+            await consumer!.send("Runtime.evaluate", {
+              expression: `consumeVideo(${JSON.stringify({ ...reply, packets: delivered })})`,
+            });
+            const status = await consumer!.send<{ result: { value: boolean } }>(
+              "Runtime.evaluate",
+              {
+                expression: "needsKey",
+                returnByValue: true,
+              },
+            );
+            expect(status.result.value).toBe(true);
+          },
+          { timeout: 6000 },
+        );
+        expect(dropped).toBe(true);
+        await decodedPixels(
+          client,
+          consumer,
+          joined.viewerToken,
+          joined.state,
+          "[Array.from(g.getImageData(10,10,1,1).data)]",
+        );
+      } finally {
+        await client.requestBrowser("detach", { viewerToken: joined.viewerToken });
       }
     }
     await consumer.send("Runtime.evaluate", { expression: "finishVideo()" });
@@ -739,5 +1053,5 @@ async function proveNativeVideo(pointerKind: "mouse" | "touch") {
 it.each(["mouse", "touch"] as const)(
   "paints native video at genuine capture density after %s input",
   proveNativeVideo,
-  30000,
+  45000,
 );

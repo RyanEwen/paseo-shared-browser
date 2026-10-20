@@ -1,9 +1,11 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { vi } from "vitest";
 import type { BrowserGraphicsMode } from "../server/browser-graphics";
+import { createRuntimeGraphicsSettings } from "../server/runtime-graphics-settings";
 import { createRuntimeOwner } from "../server/runtime-owner";
+import { readRuntimeWaylandAssets } from "../server/wayland-assets";
 
 type Owner = Awaited<ReturnType<typeof createRuntimeOwner>>;
 type Runtime = Awaited<ReturnType<Owner["create"]>>;
@@ -19,6 +21,7 @@ export async function withIsolatedBrowser(
   ) {
     throw new Error("Browser smoke requires explicit agent-browser and Chromium binary paths");
   }
+  const preparedHome = process.env.PASEO_HOME;
   const home = await mkdtemp(join(tmpdir(), "shared-browser-smoke-"));
   vi.stubEnv("PASEO_HOME", home);
   let owner: Owner | null = null;
@@ -27,7 +30,17 @@ export async function withIsolatedBrowser(
     if (graphicsMode) {
       const root = join(home, "plugin-data", "shared-browser");
       await mkdir(root, { recursive: true });
-      await writeFile(join(root, "graphics.json"), JSON.stringify({ mode: graphicsMode }));
+      if (graphicsMode === "wayland") {
+        const assets = preparedHome ? await readRuntimeWaylandAssets(preparedHome) : null;
+        if (!assets)
+          throw new Error("Wayland smoke requires prepared assets in explicit PASEO_HOME");
+        await cp(assets, join(root, "runtime", "wayland"), { recursive: true });
+        await createRuntimeGraphicsSettings(home).update("wayland");
+      } else if (graphicsMode === "vulkan") {
+        await createRuntimeGraphicsSettings(home).update("vulkan");
+      } else {
+        await writeFile(join(root, "graphics.json"), JSON.stringify({ mode: graphicsMode }));
+      }
       // Verify the deployed file path independently of the shell environment.
       vi.stubEnv("PASEO_SHARED_BROWSER_GRAPHICS", undefined);
     }

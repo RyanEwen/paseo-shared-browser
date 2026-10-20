@@ -15,6 +15,10 @@ it("retains current defaults and migrates the old coupled quality without losing
     1,
   );
   expect(browserDisplayPreferencesSchema.parse(migrated)).toEqual({
+    videoCodec: "webcodecs",
+    pyrowaveBitrate: 100_000_000,
+    graphicsPreference: "host-default",
+    liveVideoEnabled: false,
     captureQuality: "low",
     favoritePresetIds: ["pixel-7-sharp"],
     videoBitrate: 2_000_000,
@@ -35,4 +39,103 @@ it("accepts explicit JPEG100 and video24Mbps60fps, and refuses arbitrary setting
   expect(videoEncoderKey(resolveVideoEncoderSettings({ bitrate: 24_000_000, fps: 15 }))).toBe(
     "24000000:15",
   );
+});
+
+it.each([48_000_000, 96_000_000])(
+  "admits optional %s Standard video without migrating saved choices",
+  (bitrate) => {
+    const viewerToken = "v".repeat(32);
+    expect(readBrowserVideoRpc.input.parse({ viewerToken, bitrate, fps: 60 })).toMatchObject({
+      bitrate,
+      fps: 60,
+    });
+    expect(browserDisplayPreferencesSchema.parse({ videoBitrate: bitrate }).videoBitrate).toBe(
+      bitrate,
+    );
+    expect(resolveVideoEncoderSettings({}).bitrate).toBe(12_000_000);
+    expect(browserDisplayPreferencesSchema.parse({ videoBitrate: 24_000_000 }).videoBitrate).toBe(
+      24_000_000,
+    );
+    expect(
+      readBrowserVideoRpc.input.safeParse({ viewerToken, codec: "pyrowave", bitrate }).success,
+    ).toBe(false);
+  },
+);
+
+it("migrates old host settings to an explicit off choice and preserves a saved on choice", () => {
+  const old = {
+    captureQuality: "maximum",
+    videoBitrate: 24_000_000,
+    videoFps: 60,
+    favoritePresetIds: ["pixel-7-sharp"],
+  };
+  const migrated = browserDisplayPreferencesSchema.parse(
+    browserDisplayPreferences.migrate?.(old, 2),
+  );
+  expect(migrated).toEqual({
+    ...old,
+    liveVideoEnabled: false,
+    graphicsPreference: "host-default",
+    videoCodec: "webcodecs",
+    pyrowaveBitrate: 100_000_000,
+  });
+  expect(
+    browserDisplayPreferencesSchema.parse({ ...old, liveVideoEnabled: true }).liveVideoEnabled,
+  ).toBe(true);
+  expect(browserDisplayPreferencesSchema.safeParse({ liveVideoEnabled: "true" }).success).toBe(
+    false,
+  );
+});
+
+it("migrates version3 graphics without changing saved video or favorites and validates an explicit choice", () => {
+  const previous = {
+    liveVideoEnabled: true,
+    captureQuality: "maximum",
+    videoBitrate: 24_000_000,
+    videoFps: 60,
+    favoritePresetIds: ["pixel-7-sharp"],
+  };
+  expect(
+    browserDisplayPreferencesSchema.parse(browserDisplayPreferences.migrate?.(previous, 3)),
+  ).toEqual({
+    ...previous,
+    graphicsPreference: "host-default",
+    videoCodec: "webcodecs",
+    pyrowaveBitrate: 100_000_000,
+  });
+  expect(
+    browserDisplayPreferencesSchema.parse({ ...previous, graphicsPreference: "vulkan" })
+      .graphicsPreference,
+  ).toBe("vulkan");
+  expect(
+    browserDisplayPreferencesSchema.safeParse({ graphicsPreference: "automatic" }).success,
+  ).toBe(false);
+});
+
+it("migrates version4 without changing graphics, video rates or favorites and adds an explicit compatible codec default", () => {
+  const previous = {
+    graphicsPreference: "vulkan",
+    liveVideoEnabled: true,
+    captureQuality: "maximum",
+    videoBitrate: 24000000,
+    videoFps: 60,
+    favoritePresetIds: ["pixel-7-sharp"],
+  };
+  expect(
+    browserDisplayPreferencesSchema.parse(browserDisplayPreferences.migrate?.(previous, 4)),
+  ).toEqual({ ...previous, videoCodec: "webcodecs", pyrowaveBitrate: 100000000 });
+  expect(
+    browserDisplayPreferencesSchema.parse({
+      ...previous,
+      videoCodec: "pyrowave",
+      pyrowaveBitrate: 250000000,
+    }).videoBitrate,
+  ).toBe(24000000);
+  expect(
+    browserDisplayPreferencesSchema.safeParse({
+      ...previous,
+      videoCodec: "pyrowave",
+      pyrowaveBitrate: 24000000,
+    }).success,
+  ).toBe(false);
 });

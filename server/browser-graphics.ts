@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
-export type BrowserGraphicsMode = "default" | "wsl-d3d12";
+export type BrowserGraphicsMode = "default" | "wsl-d3d12" | "vulkan" | "wayland";
 
 /** Explicit host graphics policy, separate from viewport and device emulation. */
 export interface BrowserGraphicsConfiguration {
@@ -46,8 +46,40 @@ export function resolveBrowserGraphics(
   if (mode === "default") {
     return { mode, chromiumArguments: [], environment: {} };
   }
+  if (mode === "wayland") {
+    if (platform !== "linux") throw new Error("Wayland GPU graphics requires a Linux host");
+    return {
+      mode,
+      chromiumArguments: [
+        "--enable-gpu",
+        "--ozone-platform=wayland",
+        "--use-gl=angle",
+        "--use-angle=gl-egl",
+        "--enable-unsafe-webgpu",
+        "--disable-infobars",
+        "--start-fullscreen",
+      ],
+      environment: {},
+    };
+  }
+  if (mode === "vulkan") {
+    if (platform !== "linux") throw new Error("Vulkan GPU graphics requires a Linux host");
+    return {
+      mode,
+      chromiumArguments: [
+        "--enable-gpu",
+        "--use-angle=vulkan",
+        "--enable-features=Vulkan",
+        "--disable-vulkan-surface",
+        "--enable-unsafe-webgpu",
+      ],
+      environment: {},
+    };
+  }
   if (mode !== "wsl-d3d12") {
-    throw new Error("PASEO_SHARED_BROWSER_GRAPHICS must be default or wsl-d3d12");
+    throw new Error(
+      "PASEO_SHARED_BROWSER_GRAPHICS must be default or wsl-d3d12 or vulkan or wayland",
+    );
   }
   if (platform !== "linux") {
     throw new Error("Shared Browser wsl-d3d12 graphics requires a Linux WSL host");
@@ -60,6 +92,22 @@ export function resolveBrowserGraphics(
       LD_LIBRARY_PATH: "/usr/lib/wsl/lib",
     },
   };
+}
+
+export function isHardwareRenderer(renderer: unknown): renderer is string {
+  return (
+    typeof renderer === "string" &&
+    renderer.length > 0 &&
+    !/llvmpipe|softpipe|swiftshader|software|basic render|lavapipe/i.test(renderer)
+  );
+}
+
+export function assertVulkanHardwareRenderer(renderer: unknown): void {
+  if (!isHardwareRenderer(renderer) || !/vulkan/i.test(renderer)) {
+    throw new Error(
+      "Vulkan GPU graphics did not select a hardware GPU. Check render-device access and Vulkan drivers, or choose Host default in Browser graphics.",
+    );
+  }
 }
 
 /** Refuse a software substitute when the host explicitly requested hardware rendering. */

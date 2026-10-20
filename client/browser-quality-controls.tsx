@@ -1,88 +1,40 @@
-/** Independent viewer compression/rate choices. These settings never resize or
- * navigate the shared page; pixel density remains its existing owner control. */
+/** Viewer compression and rate pages, independent of page size and browser startup graphics. */
+
 import type { PluginHostProps } from "@getpaseo/plugin/client";
-import { Pressable, StyleSheet, Text, View } from "react-native";
+import type { ReactNode } from "react";
+import { Text, View } from "react-native";
 import type { BrowserDisplayPreferences } from "../shared/browser-display-preferences";
 import { DEFAULT_CAPTURE_QUALITY, JPEG_QUALITY } from "../shared/capture-settings";
-import { VIDEO_BITRATES, VIDEO_FRAME_RATES } from "../shared/video-settings";
-import type { CaptureDensityMode } from "./browser-auto-capture-density";
-import { BrowserCaptureDensityControls } from "./browser-capture-density-controls";
+import { formatVideoBitrate, VIDEO_BITRATES, VIDEO_FRAME_RATES } from "../shared/video-settings";
+import { BrowserMenuChoices } from "./browser-menu-choices";
+import {
+  BrowserVideoCodecControls,
+  type BrowserVideoCodecSelection,
+} from "./browser-video-codec-controls";
 
-const styles = StyleSheet.create({
-  group: { gap: 8 },
-  heading: { fontSize: 11, fontWeight: "600" },
-  choice: {
-    minHeight: 44,
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    borderWidth: 1,
-    borderRadius: 8,
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 8,
-  },
-  label: { flex: 1, fontSize: 13, fontWeight: "600" },
-  detail: { fontSize: 11 },
-});
-interface Props {
+import type { BrowserVideoStatus } from "./browser-video-status";
+
+export { type BrowserVideoStatus, describeBrowserVideoStatus } from "./browser-video-status";
+export type BrowserQualitySection = "video" | "jpeg" | "bitrate" | "fps" | "codec";
+
+export interface BrowserQualityControlsProps {
+  codec?: BrowserVideoCodecSelection;
+  playbackLabel?: string;
   theme: PluginHostProps["theme"];
+  compact: boolean;
   disabled: boolean;
-  density: number;
-  densityMode: CaptureDensityMode;
-  viewport: { width: number; height: number } | null;
-  densityDisabled: boolean;
-  onDensityChange(value: CaptureDensityMode): void;
   captureQuality: BrowserDisplayPreferences["captureQuality"];
+  liveVideoEnabled: boolean;
+  videoStatus: BrowserVideoStatus;
+  onLiveVideoChange(value: boolean): void;
   videoBitrate: BrowserDisplayPreferences["videoBitrate"];
   videoFps: BrowserDisplayPreferences["videoFps"];
-  onQualityChange(value: Props["captureQuality"]): void;
-  onVideoBitrateChange(value: Props["videoBitrate"]): void;
-  onVideoFpsChange(value: Props["videoFps"]): void;
+  onQualityChange(value: BrowserDisplayPreferences["captureQuality"]): void;
+  onVideoBitrateChange(value: BrowserDisplayPreferences["videoBitrate"]): void;
+  onVideoFpsChange(value: BrowserDisplayPreferences["videoFps"]): void;
 }
-function Choices<T extends string | number>(props: {
-  theme: Props["theme"];
-  disabled: boolean;
-  title: string;
-  value: T;
-  options: readonly { value: T; label: string; detail?: string }[];
-  onChange(value: T): void;
-}) {
-  const colors = props.theme.colors;
-  return (
-    <View style={styles.group}>
-      <Text style={[styles.heading, { color: colors.foregroundMuted }]}>{props.title}</Text>
-      {props.options.map((option) => {
-        const selected = option.value === props.value;
-        return (
-          <Pressable
-            key={option.value}
-            accessibilityRole="button"
-            accessibilityLabel={`${props.title}: ${option.label}`}
-            accessibilityState={{ selected, disabled: props.disabled }}
-            disabled={props.disabled}
-            onPress={() => props.onChange(option.value)}
-            style={({ pressed }) => [
-              styles.choice,
-              {
-                borderColor: selected ? colors.accent : colors.border,
-                backgroundColor: selected ? colors.surface2 : colors.surface1,
-                opacity: props.disabled ? 0.45 : pressed ? 0.72 : 1,
-              },
-            ]}
-          >
-            <Text style={[styles.label, { color: colors.foreground }]}>{option.label}</Text>
-            {option.detail ? (
-              <Text style={[styles.detail, { color: colors.foregroundMuted }]}>
-                {option.detail}
-              </Text>
-            ) : null}
-          </Pressable>
-        );
-      })}
-    </View>
-  );
-}
-/** Explicit values describe the actual JPEG encoder and independently bounded video cohorts. */
+
+/** Show the actual encoder values and badge the shared default instead of a UI assumption. */
 export function jpegQualityOptions() {
   return (["low", "medium", "high", "maximum"] as const).map((value) => ({
     value,
@@ -94,46 +46,104 @@ export function jpegQualityOptions() {
         : {}),
   }));
 }
-export function BrowserQualityControls(props: Props) {
-  const jpeg = jpegQualityOptions();
+
+/** Render one short settings page; changing these choices keeps open tabs running. */
+export function BrowserQualityControls(
+  props: BrowserQualityControlsProps & { section: BrowserQualitySection },
+) {
+  const common = { theme: props.theme, compact: props.compact, disabled: props.disabled };
+  let controls: ReactNode;
+  let detail: string;
+  switch (props.section) {
+    case "codec":
+      controls = props.codec ? (
+        <BrowserVideoCodecControls
+          {...common}
+          disabled={props.disabled || !props.liveVideoEnabled}
+          selection={props.codec}
+          section="codec"
+        />
+      ) : null;
+      detail = "";
+      break;
+    case "video":
+      controls = (
+        <BrowserMenuChoices
+          {...common}
+          title="Mode"
+          value={props.liveVideoEnabled}
+          options={[
+            { value: false, label: "Screenshots" },
+            { value: true, label: "Video" },
+          ]}
+          onChange={props.onLiveVideoChange}
+        />
+      );
+      detail =
+        "Saved for this host and shared across its workspaces. Changes apply automatically. Your tabs and unsaved work stay open.";
+      break;
+    case "jpeg":
+      controls = (
+        <BrowserMenuChoices
+          {...common}
+          title="JPEG quality target"
+          value={props.captureQuality}
+          options={jpegQualityOptions()}
+          onChange={props.onQualityChange}
+        />
+      );
+      detail =
+        "Large JPEGs may reduce quality to fit the frame limit. Screenshots remain available when video is unsupported.";
+      break;
+    case "bitrate":
+      if (props.codec?.value === "pyrowave") {
+        controls = (
+          <BrowserVideoCodecControls
+            {...common}
+            disabled={props.disabled || !props.liveVideoEnabled}
+            selection={props.codec}
+            section="bitrate"
+          />
+        );
+        detail = "";
+        break;
+      }
+      controls = (
+        <BrowserMenuChoices
+          {...common}
+          disabled={props.disabled || !props.liveVideoEnabled}
+          title="Video bitrate"
+          value={props.videoBitrate}
+          options={VIDEO_BITRATES.map((value) => ({ value, label: formatVideoBitrate(value) }))}
+          onChange={props.onVideoBitrateChange}
+        />
+      );
+      detail =
+        "Higher bitrate keeps movement clearer and uses more bandwidth. Use 48 or 96 Mbps on a fast connection.";
+      break;
+    case "fps":
+      controls = (
+        <BrowserMenuChoices
+          {...common}
+          disabled={props.disabled || !props.liveVideoEnabled}
+          title="Video frame rate"
+          value={props.videoFps}
+          options={VIDEO_FRAME_RATES.map((value) => ({ value, label: `${value} FPS` }))}
+          onChange={props.onVideoFpsChange}
+        />
+      );
+      detail =
+        "Higher frame rates use more bandwidth. Applies where live video is supported; other clients use JPEGs.";
+      break;
+  }
   return (
-    <View style={{ gap: 12 }}>
-      <BrowserCaptureDensityControls
-        theme={props.theme}
-        density={props.density}
-        mode={props.densityMode}
-        viewport={props.viewport}
-        disabled={props.densityDisabled}
-        onChange={props.onDensityChange}
-      />
-      <Choices
-        theme={props.theme}
-        disabled={props.disabled}
-        title="JPEG quality target"
-        value={props.captureQuality}
-        options={jpeg}
-        onChange={props.onQualityChange}
-      />
-      <Choices
-        theme={props.theme}
-        disabled={props.disabled}
-        title="Video bitrate"
-        value={props.videoBitrate}
-        options={VIDEO_BITRATES.map((value) => ({ value, label: `${value / 1_000_000} Mbps` }))}
-        onChange={props.onVideoBitrateChange}
-      />
-      <Choices
-        theme={props.theme}
-        disabled={props.disabled}
-        title="Video frame rate"
-        value={props.videoFps}
-        options={VIDEO_FRAME_RATES.map((value) => ({ value, label: `${value} FPS` }))}
-        onChange={props.onVideoFpsChange}
-      />
-      <Text style={[styles.detail, { color: props.theme.colors.foregroundMuted }]}>
-        Large JPEGs may reduce quality to fit the frame limit. Video settings apply where supported.
-        Other clients use JPEGs. Capture density changes detail without resizing the page.
-      </Text>
+    <View>
+      {controls}
+      {detail ? (
+        <Text style={{ padding: 12, fontSize: 11, color: props.theme.colors.foregroundMuted }}>
+          {detail}
+        </Text>
+      ) : null}
     </View>
   );
 }

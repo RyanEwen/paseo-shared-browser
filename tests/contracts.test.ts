@@ -29,7 +29,9 @@ const browserMocks = vi.hoisted(() => ({
   handleListBrowserTabs: vi.fn(),
   handleReopenBrowser: vi.fn(),
   handleSetCaptureDensity: vi.fn(),
+  handleReportDisplayDemand: vi.fn(),
   handleReadBrowserVideo: vi.fn(),
+  handleReadBrowserState: vi.fn(),
   handleDetachBrowser: vi.fn(),
   handleListOpenBrowserWorkspaces: vi.fn(),
   handleNavigateBrowser: vi.fn(),
@@ -46,6 +48,25 @@ const browserMocks = vi.hoisted(() => ({
 const testDirectory = dirname(fileURLToPath(import.meta.url));
 
 vi.mock("../server/browser", () => browserMocks);
+vi.mock("../server/runtime-video-settings", () => ({
+  createRuntimeVideoSettings: () => ({
+    update: vi.fn().mockResolvedValue(undefined),
+    flush: vi.fn(),
+  }),
+}));
+vi.mock("../server/runtime-graphics-settings", () => ({
+  createRuntimeGraphicsSettings: () => ({
+    update: vi.fn().mockResolvedValue(undefined),
+    flush: vi.fn(),
+  }),
+}));
+
+function registerSettings() {
+  return {
+    read: vi.fn().mockResolvedValue({ status: "ready", values: { liveVideoEnabled: false } }),
+    subscribe: vi.fn().mockReturnValue(() => {}),
+  };
+}
 
 type AgentCreateRequest = {
   config: {
@@ -62,7 +83,7 @@ type AgentCreateHook = (input: { request: AgentCreateRequest }) => Promise<Agent
 function captureAgentCreateHook(): AgentCreateHook {
   let hook: AgentCreateHook | undefined;
   contribute({
-    registerSettings: vi.fn(),
+    registerSettings,
     handle: vi.fn(),
     before: vi.fn((name: string, handler: unknown) => {
       if (name === "agent.create") hook = handler as AgentCreateHook;
@@ -303,7 +324,7 @@ describe("agent binding renewal on session open", () => {
   function captureSessionHook() {
     let hook: ((input: { request: Record<string, unknown> }) => Promise<unknown>) | undefined;
     contribute({
-      registerSettings: vi.fn(),
+      registerSettings,
       handle: vi.fn(),
       on: vi.fn(),
       before: vi.fn((name: string, handler: unknown) => {

@@ -56,6 +56,7 @@ describe("encoded video opt-in", () => {
       const [args] = f.launches;
       expect(args).not.toContain("--extension");
       expect(args?.join(" ")).not.toContain("allowlisted-extension-id");
+      expect(args?.join(" ")).not.toContain("force-device-scale-factor");
       expect(await readdir(f.ipcDirectory)).toEqual([]);
     }
   });
@@ -66,6 +67,7 @@ describe("encoded video opt-in", () => {
     const [args] = f.launches;
     expect(args).toContain("--extension");
     expect(args?.join(" ")).toContain("--allowlisted-extension-id=");
+    expect(args?.join(" ")).toContain("--force-device-scale-factor=2");
   });
 
   it("reports a typed disabled reply without creating any capture source", async () => {

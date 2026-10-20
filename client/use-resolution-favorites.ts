@@ -61,7 +61,14 @@ export function useResolutionFavorites(hostId: string) {
   };
 
   return {
+    videoCodec:
+      settings.status === "ready" ? (settings.values.videoCodec ?? "webcodecs") : "webcodecs",
+    pyrowaveBitrate:
+      settings.status === "ready" ? (settings.values.pyrowaveBitrate ?? 100_000_000) : 100_000_000,
+    graphicsPreference:
+      settings.status === "ready" ? settings.values.graphicsPreference : "host-default",
     favoritePresetIds,
+    liveVideoEnabled: settings.status === "ready" && settings.values.liveVideoEnabled,
     captureQuality:
       settings.status === "ready" ? settings.values.captureQuality : DEFAULT_CAPTURE_QUALITY,
     videoBitrate:
@@ -80,10 +87,19 @@ export function useResolutionFavorites(hostId: string) {
     },
     changeQuality: (captureQuality: BrowserDisplayPreferences["captureQuality"]) =>
       savePreferences((values) => ({ ...values, captureQuality })),
+    changeLiveVideoEnabled: (liveVideoEnabled: boolean) =>
+      savePreferences((values) => ({ ...values, liveVideoEnabled })),
+    changeGraphicsPreference: (
+      graphicsPreference: BrowserDisplayPreferences["graphicsPreference"],
+    ) => savePreferences((values) => ({ ...values, graphicsPreference })),
     changeVideoBitrate: (videoBitrate: BrowserDisplayPreferences["videoBitrate"]) =>
       savePreferences((values) => ({ ...values, videoBitrate })),
     changeVideoFps: (videoFps: BrowserDisplayPreferences["videoFps"]) =>
       savePreferences((values) => ({ ...values, videoFps })),
+    changeVideoCodec: (videoCodec: BrowserDisplayPreferences["videoCodec"]) =>
+      savePreferences((values) => ({ ...values, videoCodec })),
+    changePyrowaveBitrate: (pyrowaveBitrate: BrowserDisplayPreferences["pyrowaveBitrate"]) =>
+      savePreferences((values) => ({ ...values, pyrowaveBitrate })),
     reload: settings.reload,
     resetPreferences: settings.reset,
   };

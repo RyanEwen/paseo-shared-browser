@@ -27,7 +27,7 @@ export class PrivateDisplayError extends Error {
 }
 
 export interface PrivateVirtualDisplay {
-  readonly launchEnvironment: Readonly<{ DISPLAY: string; XAUTHORITY: string }>;
+  readonly launchEnvironment: Readonly<Record<string, string>>;
   /** Throws RuntimeLostError after the display exits; it never creates a replacement display. */
   assertAvailable(): void;
   /** Idempotently terminates only the owned child and removes its private auth file. */

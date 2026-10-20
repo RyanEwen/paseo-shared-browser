@@ -14,7 +14,11 @@ import {
   useState,
 } from "react";
 import { BackHandler, Platform, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
-import { browserMenuPlacement, type MenuRect } from "./browser-menu-placement";
+import {
+  browserMenuPlacement,
+  browserMenuUsesBackNavigation,
+  type MenuRect,
+} from "./browser-menu-placement";
 import { bindBrowserToolbarMenuWeb, focusBrowserMenuTrigger } from "./browser-toolbar-menu-web";
 import { type BrowserSubmenu, BrowserToolbarSubmenu } from "./browser-toolbar-submenu";
 
@@ -31,7 +35,8 @@ const STYLES = StyleSheet.create({
     alignItems: "center",
     gap: 8,
   },
-  label: { fontSize: 13, flexShrink: 1, flex: 1 },
+  // The parent fills the row width. Text keeps its measured height, including scaled/wrapped lines.
+  label: { fontSize: 13 },
   heading: {
     fontSize: 11,
     fontWeight: "600",
@@ -60,7 +65,7 @@ export interface BrowserToolbarMenuProps {
 
 /** Measure after layout, reject obsolete callbacks, and re-anchor on pane resizing. */
 export function BrowserToolbarMenu(props: BrowserToolbarMenuProps) {
-  const compact = props.compact || Platform.OS !== "web";
+  const compact = browserMenuUsesBackNavigation(props.paneSize.width, props.compact, Platform.OS);
   const previousSubmenu = useRef<BrowserSubmenu | undefined>(undefined);
   const [placement, setPlacement] = useState<MenuRect | null>(null);
   const menuRef = useRef<View | null>(null);
@@ -92,7 +97,7 @@ export function BrowserToolbarMenu(props: BrowserToolbarMenuProps) {
     props.paneSize.height,
     props.preferredHeight,
     compact,
-    Boolean(props.submenu),
+    props.submenu?.preferredHeight,
   ]);
 
   useEffect(() => {
@@ -105,6 +110,9 @@ export function BrowserToolbarMenu(props: BrowserToolbarMenuProps) {
       overlayRef.current,
       {
         openSubmenu: () => current.current.onSubmenuOpen?.(),
+        ...(compact && props.submenu?.initialFocusLabel
+          ? { initialFocusLabel: props.submenu.initialFocusLabel }
+          : {}),
         ...(compact && props.submenu ? { back: () => current.current.submenu?.onBack() } : {}),
       },
     );
@@ -113,7 +121,13 @@ export function BrowserToolbarMenu(props: BrowserToolbarMenuProps) {
     }
     previousSubmenu.current = props.submenu;
     return dispose;
-  }, [Boolean(placement), props.anchorRef, compact, compact && Boolean(props.submenu)]);
+  }, [
+    Boolean(placement),
+    props.anchorRef,
+    compact,
+    compact && Boolean(props.submenu),
+    compact && props.submenu?.pageKey,
+  ]);
   useEffect(() => {
     if (Platform.OS === "web") return;
     const subscription = BackHandler.addEventListener("hardwareBackPress", () => {
@@ -152,26 +166,29 @@ export function BrowserToolbarMenu(props: BrowserToolbarMenuProps) {
             },
           ]}
         >
+          {compact && props.submenu ? (
+            <View style={{ flexShrink: 0 }}>
+              <BrowserMenuItem
+                theme={props.theme}
+                compact
+                label="Back"
+                icon="ChevronLeft"
+                onPress={props.submenu.onBack}
+              />
+              <BrowserMenuHeading theme={props.theme}>{props.submenu.title}</BrowserMenuHeading>
+            </View>
+          ) : null}
           <ScrollView
-            style={{ maxHeight: placement.height - 2, borderRadius: 8, overflow: "hidden" }}
+            style={{
+              maxHeight: placement.height - 2,
+              flexShrink: 1,
+              borderRadius: 8,
+              overflow: "hidden",
+            }}
             keyboardShouldPersistTaps="handled"
             contentContainerStyle={STYLES.content}
           >
-            {compact && props.submenu ? (
-              <>
-                <BrowserMenuItem
-                  theme={props.theme}
-                  compact
-                  label="Back"
-                  icon="ChevronLeft"
-                  onPress={props.submenu.onBack}
-                />
-                <BrowserMenuHeading theme={props.theme}>{props.submenu.title}</BrowserMenuHeading>
-                {props.submenu.children}
-              </>
-            ) : (
-              props.children
-            )}
+            {compact && props.submenu ? props.submenu.children : props.children}
           </ScrollView>
           {!compact && props.submenu ? (
             <BrowserToolbarSubmenu
@@ -194,6 +211,8 @@ export function BrowserMenuItem({
   theme,
   compact,
   label,
+  accessibilityLabel,
+  detail,
   icon,
   selected,
   disabled = false,
@@ -203,6 +222,8 @@ export function BrowserMenuItem({
   theme: Theme;
   compact: boolean;
   label: string;
+  accessibilityLabel?: string;
+  detail?: string;
   icon?: string;
   selected?: boolean;
   disabled?: boolean;
@@ -214,7 +235,7 @@ export function BrowserMenuItem({
   return (
     <Pressable
       accessibilityRole="menuitem"
-      accessibilityLabel={label}
+      accessibilityLabel={accessibilityLabel ?? label}
       accessibilityState={{
         disabled,
         ...(expanded === undefined ? {} : { expanded }),
@@ -236,7 +257,12 @@ export function BrowserMenuItem({
       ]}
     >
       {icon ? <Icon name={icon} size={16} color={theme.colors.foregroundMuted} /> : null}
-      <Text style={[STYLES.label, { color: theme.colors.foreground }]}>{label}</Text>
+      <View style={{ flex: 1 }}>
+        <Text style={[STYLES.label, { color: theme.colors.foreground }]}>{label}</Text>
+        {detail ? (
+          <Text style={{ fontSize: 11, color: theme.colors.foregroundMuted }}>{detail}</Text>
+        ) : null}
+      </View>
       {expanded !== undefined ? (
         <Icon name="ChevronRight" size={16} color={theme.colors.foregroundMuted} />
       ) : null}

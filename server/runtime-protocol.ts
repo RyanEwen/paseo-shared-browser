@@ -30,6 +30,9 @@ interface AdminRequestBase extends RuntimeRequestBase {
 }
 
 export type AgentBrowserOperation =
+  | "dom.snapshot"
+  | "dom.action"
+  | "dom.evaluate"
   | "reconnect"
   | "open"
   | "status"
@@ -294,6 +297,9 @@ function requireInteger(value: Record<string, unknown>, key: string): number {
 
 function requireAgentOperation(value: unknown): AgentBrowserOperation {
   if (
+    value === "dom.snapshot" ||
+    value === "dom.action" ||
+    value === "dom.evaluate" ||
     value === "reconnect" ||
     value === "open" ||
     value === "tabs.list" ||

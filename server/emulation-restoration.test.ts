@@ -115,6 +115,26 @@ function assertDeviceRestored(connection: ConnectionFixture, sessionId: string) 
 }
 
 describe("session-owned device emulation restoration", () => {
+  it("releases only the launch page without adopting a survivor or closing its browser connection", async () => {
+    const { runtime, connection, control } = fixture();
+    await runtime.releaseTarget();
+    expect(control.page).toBeNull();
+    expect(control.emulationAppliedPage).toBeNull();
+    expect(control.viewport).toEqual(pixel);
+    expect(control.targetId).toBe("a");
+    expect(connection.isOpen).toBe(true);
+    expect(connection.calls.map((call) => call.method)).toEqual(["Target.detachFromTarget"]);
+    await expect(runtime.targets()).resolves.toHaveLength(2);
+    // Repeated release is harmless and cannot attach to a different page.
+    await runtime.releaseTarget();
+    expect(
+      connection.calls.filter((call) => call.method === "Target.detachFromTarget"),
+    ).toHaveLength(1);
+    expect(
+      connection.calls.some((call) => call.method === "Emulation.setDeviceMetricsOverride"),
+    ).toBe(false);
+  });
+
   it("restores full retained settings before publishing a newly selected target", async () => {
     const { runtime, connection, control } = fixture();
     const publications: (CdpSession | null)[] = [];

@@ -19,7 +19,8 @@ import {
   setCaptureDensityRpc,
   updateBrowserGestureRpc,
 } from "../shared/browser";
-import { readBrowserVideoRpc } from "../shared/browser-video";
+import { browserDisplayDemandRpc } from "../shared/browser-display-demand";
+import { readBrowserVideoRpc, runtimeVideoReadInputSchema } from "../shared/browser-video";
 import { DEFAULT_CAPTURE_QUALITY } from "../shared/capture-settings";
 import { AgentBindingStore } from "./agent-binding-store";
 import { SessionManager } from "./browser-policy";
@@ -460,6 +461,11 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
         );
         break;
       }
+      case "display-demand":
+        result = await this.browserPolicy.reportDisplayDemand(
+          browserDisplayDemandRpc.input.parse(data),
+        );
+        break;
       case "capture.density":
         result = await this.browserPolicy.setCaptureDensity(setCaptureDensityRpc.input.parse(data));
         break;
@@ -720,6 +726,18 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
     if (openBrowser) {
       await this.browserPolicy.reopenBrowser(binding.workspaceId!);
       this.assertAgentBindingCurrent(binding);
+      // Explicit reopen may create a new Chromium runtime whose tab IDs are different.
+      // Preserve a surviving selection, otherwise attach to its new launch page.
+      if (
+        binding.tabId &&
+        !(await this.browserPolicy.listTabs(binding.workspaceId!)).tabs.some(
+          (tab) => tab.id === binding.tabId,
+        )
+      ) {
+        this.assertAgentBindingCurrent(binding);
+        binding.tabId = null;
+        this.saveAgentSelection(binding);
+      }
     }
     return (await this.requestAgentObservation(binding, "status", {})) as unknown as JsonValue;
   }
@@ -733,6 +751,16 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
     const data = asObject(input);
     if (operation === "status" || operation === "capture")
       return (await this.requestAgentObservation(binding, operation, data)) as unknown as JsonValue;
+    if (operation === "dom.snapshot") {
+      const revision = binding.selectionRevision;
+      await this.requestAgentObservation(binding, "status", {});
+      const result = await this.browserPolicy.domSnapshot(await this.ensureAgentViewer(binding));
+      this.assertAgentBindingCurrent(binding);
+      if (binding.selectionRevision !== revision)
+        throw new RuntimeProtocolError("INVALID_REQUEST", "Agent tab changed during snapshot");
+      binding.lastState = result.state;
+      return result as unknown as JsonValue;
+    }
     if (operation === "tabs.list") {
       const listed = await this.browserPolicy.listTabs(binding.workspaceId!);
       return { ...listed, selectedTabId: binding.tabId };
@@ -829,7 +857,9 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
       const selectionRevision = binding.selectionRevision;
       const expected = expectedState(binding);
       let result: { state: BrowserState };
-      if (operation === "navigate") {
+      if (operation === "dom.action" || operation === "dom.evaluate") {
+        result = await this.browserPolicy.domOperation(viewerToken, controlToken, operation, input);
+      } else if (operation === "navigate") {
         result = await this.browserPolicy.navigate(
           parseAgentInput(navigateBrowserRpc.input, {
             viewerToken,
@@ -1640,7 +1670,7 @@ function classifyConcurrentRequest(line: string, token: string): "heartbeat" | "
     const schema =
       request.method === "browser.request"
         ? readBrowserVideoRpc.input
-        : readBrowserVideoRpc.input.omit({ viewerToken: true });
+        : runtimeVideoReadInputSchema;
     return schema.safeParse(request.input).success ? "video" : null;
   } catch {
     return null;

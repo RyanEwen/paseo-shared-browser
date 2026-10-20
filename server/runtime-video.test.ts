@@ -30,10 +30,11 @@ vi.mock("./native-video-capture", () => ({
 
 import { AgentBrowserRuntime } from "./agent-browser-runtime";
 
-function setup() {
+function setup(nativeVideoAllowed?: () => boolean) {
   fixture.captures = [];
   const runtime = new AgentBrowserRuntime({
     nativeVideo: true,
+    ...(nativeVideoAllowed ? { nativeVideoAllowed } : {}),
     binaryPath: "/tmp/owned-bin",
     executablePath: "/tmp/owned-chrome",
     profilePath: "/tmp/owned-profile",
@@ -84,6 +85,39 @@ function setup() {
   return { runtime, internal, page, connection };
 }
 describe("native video runtime fence", () => {
+  it("refuses capture while the host choice is off and discards an in-flight read disabled before publication", async () => {
+    let enabled = false;
+    const { runtime } = setup(() => enabled);
+    expect(await runtime.readVideo({ quality: "high" })).toMatchObject({
+      status: "unsupported",
+      reasonCode: "video-disabled",
+      packets: [],
+    });
+    expect(fixture.captures).toHaveLength(0);
+    enabled = true;
+    await runtime.readVideo({ quality: "high" });
+    const capture = fixture.captures[0]!;
+    const pendingRead = Promise.withResolvers<{
+      status: string;
+      streamId: string;
+      packets: never[];
+    }>();
+    capture.read.mockImplementationOnce(() => pendingRead.promise);
+    const reading = runtime.readVideo({ quality: "high" });
+    await vi.waitFor(() => expect(capture.read).toHaveBeenCalledTimes(2));
+    enabled = false;
+    pendingRead.resolve({ status: "ready", streamId: "stream", packets: [] });
+    expect(await reading).toMatchObject({
+      status: "unsupported",
+      reasonCode: "video-disabled",
+      packets: [],
+    });
+    await runtime.stopVideo();
+    expect(capture.stop).toHaveBeenCalledOnce();
+    enabled = true;
+    expect((await runtime.readVideo({ quality: "high" })).status).toBe("ready");
+    await runtime.stopVideo();
+  });
   it.each(["startup", "source-stopped", "source-reset"] as const)(
     "retires %s failure under continued demand and retries only after cooldown",
     async (failure) => {

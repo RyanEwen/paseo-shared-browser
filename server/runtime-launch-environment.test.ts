@@ -60,6 +60,24 @@ async function fixture(launchEnvironment?: Readonly<Record<string, string>>) {
 }
 
 describe("trusted private display launch environment", () => {
+  it("isolates private Wayland from inherited X11 context without mutating the host", async () => {
+    const before = { display: process.env.DISPLAY, authority: process.env.XAUTHORITY };
+    const f = await fixture({
+      WAYLAND_DISPLAY: "wayland-1",
+      XDG_RUNTIME_DIR: "/tmp/owned-wayland",
+    });
+    await f.native.invoke(["wayland-launch"]);
+    expect(f.launched(["wayland-launch"])).toMatchObject({
+      display: null,
+      authority: null,
+      wayland: "wayland-1",
+    });
+    const call = exec.calls.find((call) => call.args.includes("wayland-launch"))!;
+    expect(call.env.XDG_RUNTIME_DIR).toBe("/tmp/owned-wayland");
+    expect({ display: process.env.DISPLAY, authority: process.env.XAUTHORITY }).toEqual(before);
+    await f.runtime.shutdown();
+  });
+
   it("passes display/auth to every CLI child, copies settings, and keeps host environment unchanged", async () => {
     const before = {
       display: process.env.DISPLAY,

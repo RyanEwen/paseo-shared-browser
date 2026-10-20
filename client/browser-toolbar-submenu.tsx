@@ -7,6 +7,9 @@ import { bindBrowserToolbarMenuWeb } from "./browser-toolbar-menu-web";
 
 export interface BrowserSubmenu {
   title: string;
+  /** Drill-in pages reuse the same flyout; each page needs fresh focus and placement. */
+  pageKey?: string;
+  initialFocusLabel?: string;
   anchorRef: RefObject<View | null>;
   preferredHeight: number;
   children: ReactNode;
@@ -44,7 +47,13 @@ export function BrowserToolbarSubmenu(props: {
     return () => {
       active = false;
     };
-  }, [props.paneSize.width, props.paneSize.height, props.parent, props.submenu.anchorRef]);
+  }, [
+    props.paneSize.width,
+    props.paneSize.height,
+    props.parent,
+    props.submenu.anchorRef,
+    props.submenu.preferredHeight,
+  ]);
   useLayoutEffect(() => {
     if (!placement) return;
     return bindBrowserToolbarMenuWeb(
@@ -55,11 +64,14 @@ export function BrowserToolbarSubmenu(props: {
       undefined,
       {
         nested: true,
+        ...(props.submenu.initialFocusLabel
+          ? { initialFocusLabel: props.submenu.initialFocusLabel }
+          : {}),
         back: () => current.current.submenu.onBack(),
         closeRoot: () => current.current.onClose(),
       },
     );
-  }, [Boolean(placement), props.submenu.anchorRef]);
+  }, [Boolean(placement), props.submenu.anchorRef, props.submenu.pageKey]);
   if (!placement) return null;
   return (
     <View

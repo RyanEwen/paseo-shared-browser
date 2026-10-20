@@ -11,14 +11,11 @@ import {
   VIDEO_MAX_WAIT_MS,
   VIDEO_SOURCE_CLOCK_TOLERANCE_MS,
 } from "../shared/browser-video";
-import {
-  resolveVideoEncoderSettings,
-  VIDEO_ENCODER_IDLE_MS,
-  VIDEO_ENCODER_LIMIT,
-  type VideoEncoderSettings,
-  videoEncoderKey,
-} from "../shared/video-settings";
+import { pyrowaveConfigurationSchema } from "../shared/pyrowave-settings";
+import { resolveVideoCodecSettings, type VideoCodecSettings } from "../shared/video-codec-settings";
+import { VIDEO_ENCODER_IDLE_MS, VIDEO_ENCODER_LIMIT } from "../shared/video-settings";
 import { attachToTarget, type CdpConnection, type CdpSession, CdpUnavailableError } from "./cdp";
+import { createNativePyrowaveCohort, type NativePyrowaveAssets } from "./native-pyrowave-cohort";
 import {
   createNativeVideoBuffer,
   type VideoSourceClock,
@@ -36,6 +33,8 @@ export interface NativeVideoRead {
   reasonCode?: "encoder-capacity" | "video-disabled";
 }
 interface EncoderState {
+  cancellation: AbortController;
+  closeNative?: () => Promise<void>;
   streamId: string;
   buffer: ReturnType<typeof createNativeVideoBuffer>;
   ready: Promise<void>;
@@ -51,6 +50,10 @@ interface Evaluation<T> {
   exceptionDetails?: unknown;
 }
 export interface NativeVideoCaptureOptions {
+  /** Only the exact positively qualified Chromium software-bitmap configuration. */
+  softwareColorCorrection?: boolean;
+  /** Trusted immutable assets only. Omission keeps experimental PyroWave unavailable. */
+  pyrowave?: NativePyrowaveAssets;
   connection: CdpConnection;
   targetId: string;
   width: number;
@@ -189,7 +192,7 @@ export class NativeVideoCapture {
       const loaded = await this.evaluate<boolean>(HELPER_READY_EXPRESSION);
       if (!loaded) throw new Error("Native video helper did not load");
       await this.evaluate(
-        `startCapture(${JSON.stringify(this.options.targetId)},${this.options.width},${this.options.height},${this.generation})`,
+        `startCapture(${JSON.stringify(this.options.targetId)},${this.options.width},${this.options.height},${this.generation},${this.options.softwareColorCorrection === true})`,
       );
     } catch (error) {
       await this.closeHelper();
@@ -230,6 +233,11 @@ export class NativeVideoCapture {
         })
         .catch(() => undefined);
     }
+    this.acceptPacket(raw);
+  };
+  /** Both trusted producers retain source timestamps and pass the same generation,
+   * geometry and source-clock admission. Native completion never renews frame age. */
+  private acceptPacket(raw: Partial<NativeVideoPacket>): void {
     if (
       this.stopped ||
       !this.options.isCurrent() ||
@@ -256,7 +264,7 @@ export class NativeVideoCapture {
     const accepted = encoder.buffer.add(packet.data);
     if (accepted && packet.data.type === "key") encoder.keyRequestedAt = -Infinity;
     this.wake();
-  };
+  }
   private wake(): void {
     for (const wake of this.waiters) wake();
     this.waiters.clear();
@@ -283,17 +291,19 @@ export class NativeVideoCapture {
       if (state.activeReads || this.now() - state.lastRequestedAt <= VIDEO_ENCODER_IDLE_MS)
         continue;
       await this.evaluate(`removeEncoder(${JSON.stringify(key)})`);
+      state.cancellation.abort();
+      await state.closeNative?.();
       if (this.encoders.get(key) === state) this.encoders.delete(key);
       state.buffer.clear();
     }
   }
-  private async ensureEncoder(settings: VideoEncoderSettings): Promise<EncoderState> {
+  private async ensureEncoder(settings: VideoCodecSettings): Promise<EncoderState> {
     this.lastDemandAt = this.now();
     await this.ready;
     this.assertCurrent();
     return this.serializeEncoderChange(async () => {
       this.assertCurrent();
-      const key = videoEncoderKey(settings);
+      const key = settings.key;
       // Touch the requested cohort before pruning; a resuming viewer can reuse
       // its decoder stream if no other admission has already removed that cohort.
       let state = this.encoders.get(key);
@@ -302,6 +312,7 @@ export class NativeVideoCapture {
       if (!state) {
         if (this.encoders.size >= VIDEO_ENCODER_LIMIT) throw new VideoEncoderLimitError();
         state = {
+          cancellation: new AbortController(),
           streamId: randomUUID(),
           buffer: createNativeVideoBuffer(),
           ready: Promise.resolve(),
@@ -312,15 +323,15 @@ export class NativeVideoCapture {
         };
         this.encoders.set(key, state);
         const created = state;
-        state.ready = this.evaluate(
-          `addEncoder(${JSON.stringify(key)},${JSON.stringify(state.streamId)},${settings.bitrate},${settings.fps})`,
-        ).then(() => undefined);
+        state.ready = this.startEncoder(state, settings);
         try {
           await state.ready;
         } catch (error) {
           // A timeout does not cancel helper JavaScript. Fence this exact pending
           // allocation before admitting a replacement, without touching peers.
           await this.evaluate(`removeEncoder(${JSON.stringify(key)})`).catch(() => undefined);
+          created.cancellation.abort();
+          await created.closeNative?.();
           if (this.encoders.get(key) === created) this.encoders.delete(key);
           throw error;
         }
@@ -333,6 +344,60 @@ export class NativeVideoCapture {
       state.activeReads += 1;
       return state;
     });
+  }
+  /** Native assets are never supplied by page or public RPC input. Failure closes
+   * only this cohort and leaves existing H.264/JPEG peers available. */
+  private async startEncoder(state: EncoderState, settings: VideoCodecSettings): Promise<void> {
+    const key = settings.key;
+    if (settings.codec === "webcodecs") {
+      await this.evaluate(
+        `addEncoder(${JSON.stringify(key)},${JSON.stringify(state.streamId)},${settings.bitrate},${settings.fps})`,
+      );
+      return;
+    }
+    const assets = this.options.pyrowave;
+    if (!assets) throw new Error("Native PyroWave assets are unavailable");
+    const configuration = pyrowaveConfigurationSchema.parse({
+      ...settings,
+      width: this.options.width,
+      height: this.options.height,
+    });
+    const cohort = await createNativePyrowaveCohort({
+      ...assets,
+      ...configuration,
+      streamId: state.streamId,
+      signal: state.cancellation.signal,
+      isCurrent: () =>
+        !this.stopped &&
+        !state.cancellation.signal.aborted &&
+        this.options.isCurrent() &&
+        this.encoders.get(key) === state,
+      onFrame: (header, bytes, colorSpace) =>
+        this.acceptPacket({
+          streamId: state.streamId,
+          captureGeneration: header.generation,
+          sequence: header.sequence,
+          timestampUs: header.timestampUs,
+          type: "key",
+          codec: "pyrowave",
+          colorSpace,
+          width: configuration.width,
+          height: configuration.height,
+          dataBase64: bytes.toString("base64"),
+        }),
+      onFailure: () => {
+        state.failure = "Native PyroWave video is unavailable";
+        this.wake();
+      },
+    });
+    state.closeNative = () => cohort.close();
+    try {
+      this.assertCurrent();
+      await this.evaluate(cohort.acquisitionExpression(key));
+    } catch (error) {
+      await cohort.close();
+      throw error;
+    }
   }
   /** Per-cohort recovery never resets the source, peer encoder or sequence.
    * Reserve the request before CDP await so overlapping readers share it. */
@@ -350,6 +415,7 @@ export class NativeVideoCapture {
    * renewal, or screenshot fallback is performed here.
    */
   async read(input: {
+    codec?: "webcodecs" | "pyrowave";
     quality?: NativeVideoQuality;
     bitrate?: number;
     fps?: number;
@@ -361,12 +427,12 @@ export class NativeVideoCapture {
     let ownedState: EncoderState | null = null;
     let sourcePinned = false;
     try {
-      const settings = resolveVideoEncoderSettings(input);
+      const settings = resolveVideoCodecSettings(input);
       // A valid requested read pins source setup itself, before ready/encoder
       // awaits. Slow authenticated acquisition must not idle-expire underneath it.
       this.pendingSourceReads += 1;
       sourcePinned = true;
-      const key = videoEncoderKey(settings);
+      const key = settings.key;
       const state = await this.ensureEncoder(settings);
       ownedState = state;
       const reset =
@@ -467,6 +533,7 @@ export class NativeVideoCapture {
   async stop(): Promise<void> {
     if (this.closing) return this.closing;
     this.stopped = true;
+    for (const state of this.encoders.values()) state.cancellation.abort();
     clearInterval(this.idleTimer);
     this.wake();
     this.closing = (async () => {
@@ -476,6 +543,12 @@ export class NativeVideoCapture {
     return this.closing;
   }
   private async closeHelper(): Promise<void> {
+    await Promise.allSettled(
+      [...this.encoders.values()].map(async (state) => {
+        state.cancellation.abort();
+        await state.closeNative?.();
+      }),
+    );
     const helper = this.helper;
     this.helper = null;
     helper?.off("Runtime.bindingCalled", this.onPacket);

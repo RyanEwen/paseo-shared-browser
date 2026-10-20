@@ -13,17 +13,32 @@ import { useRpc } from "@getpaseo/plugin/client";
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { AppState } from "react-native";
 import type { BrowserState, Viewport } from "../shared/browser";
-import { type BrowserVideoPacket, readBrowserVideoRpc } from "../shared/browser-video";
+import {
+  closeBrowserMediaRpc,
+  openBrowserMediaRpc,
+  pollBrowserMediaRpc,
+} from "../shared/browser-media";
+import {
+  type BrowserVideoMetadata,
+  type BrowserVideoPicture,
+  readBrowserVideoRpc,
+} from "../shared/browser-video";
+
 import { createBrowserVideoDecoder } from "./browser-video-decoder";
 import {
   type BrowserVideoCanvasNode,
   bindBrowserVideoVisibility,
+  createBrowserMediaEnvironment,
   createBrowserVideoEnvironment,
   supportsBrowserVideo,
 } from "./browser-video-surface";
+import { createBrowserVideoTransport } from "./browser-video-transport";
 import { isExpiredBrowserViewerError } from "./browser-viewer-recovery";
 
 interface BrowserVideoOptions {
+  videoCodec?: "webcodecs" | "pyrowave";
+  pyrowaveBitrate?: import("../shared/pyrowave-settings").PyrowaveConfiguration["bitrate"];
+  state?(): BrowserState | null;
   viewerToken: string | null;
   quality: "low" | "medium" | "high";
   bitrate?: import("../shared/video-settings").VideoEncoderSettings["bitrate"];
@@ -32,17 +47,28 @@ interface BrowserVideoOptions {
   active?: boolean;
   epoch(): number;
   viewport(): Viewport | null;
-  isCurrent(packet: BrowserVideoPacket, epoch: number): boolean;
+  isCurrent(packet: BrowserVideoMetadata, epoch: number): boolean;
   /** Display may hold a previous document, never previous viewer/source/geometry. */
-  isDisplayCurrent?(packet: BrowserVideoPacket): boolean;
+  isDisplayCurrent?(packet: BrowserVideoMetadata): boolean;
   acceptState(state: BrowserState): boolean;
-  onPresented(packet: BrowserVideoPacket, epoch: number): void;
+  onPresented(packet: BrowserVideoPicture, epoch: number): void;
 }
 
 /** Admit encoded tab video only after a current frame is painted. Hidden hosts
  * revoke video input synchronously; resuming requires a new decoder/key frame. */
 export function useBrowserVideo(options: BrowserVideoOptions) {
   const read = useRpc(readBrowserVideoRpc);
+  const openMedia = useRpc(openBrowserMediaRpc),
+    pollMedia = useRpc(pollBrowserMediaRpc),
+    closeMedia = useRpc(closeBrowserMediaRpc);
+  const mediaRpcs = useRef({ open: openMedia, poll: pollMedia, close: closeMedia });
+  mediaRpcs.current = { open: openMedia, poll: pollMedia, close: closeMedia };
+  const activeMedia = useRef<ReturnType<typeof createBrowserVideoTransport> | null>(null);
+  const pendingMediaClose = useRef<Promise<void> | null>(null);
+  const [codecFallback, setCodecFallback] = useState<{
+    viewerToken: string | null;
+    reason: string;
+  } | null>(null);
   const readRef = useRef(read);
   readRef.current = read;
   const pendingRead = useRef<Promise<
@@ -53,9 +79,9 @@ export function useBrowserVideo(options: BrowserVideoOptions) {
   const [node, setNode] = useState<BrowserVideoCanvasNode | null>(null);
   const videoGeneration = useRef(0);
   const authorityRevision = useRef(0);
-  const displayedPacket = useRef<BrowserVideoPacket | null>(null);
+  const displayedPacket = useRef<BrowserVideoPicture | null>(null);
   const [presentation, setPresentation] = useState<{
-    packet: BrowserVideoPacket;
+    packet: BrowserVideoPicture;
     epoch: number;
     viewport: Viewport | null;
     generation: number;
@@ -72,18 +98,18 @@ export function useBrowserVideo(options: BrowserVideoOptions) {
     setFallbackRevision(fallbackRef.current);
   };
   /** Source/document/geometry validity: enough to decode and paint a packet. */
-  const sourceCurrent = (packet: BrowserVideoPacket, epoch: number) =>
+  const sourceCurrent = (packet: BrowserVideoMetadata, epoch: number) =>
     latest.current.isCurrent(packet, epoch);
   /** Input eligibility: source validity plus a host receipt. A display-only packet
    * (actionable === false) may be decoded and painted but never admits a press. */
-  const inputCurrent = (packet: BrowserVideoPacket, epoch: number) =>
+  const inputCurrent = (packet: BrowserVideoMetadata, epoch: number) =>
     packet.actionable !== false && sourceCurrent(packet, epoch);
-  const displayCurrent = (packet: BrowserVideoPacket) =>
+  const displayCurrent = (packet: BrowserVideoMetadata) =>
     latest.current.isDisplayCurrent
       ? latest.current.isDisplayCurrent(packet)
       : latest.current.isCurrent(packet, latest.current.epoch());
   const front = presentation?.packet ?? null;
-  const setFront = (value: BrowserVideoPacket | null, epoch = 0) => {
+  const setFront = (value: BrowserVideoPicture | null, epoch = 0) => {
     displayedPacket.current = value;
     if (!value || inputCurrent(value, epoch)) {
       fallbackRef.current = 0;
@@ -101,7 +127,7 @@ export function useBrowserVideo(options: BrowserVideoOptions) {
         : null,
     );
   };
-  const frontRef = useRef<BrowserVideoPacket | null>(null);
+  const frontRef = useRef<BrowserVideoPicture | null>(null);
   const visible = useRef(false);
   const hostActive = useRef(false);
   const [active, setActive] = useState(false);
@@ -116,6 +142,7 @@ export function useBrowserVideo(options: BrowserVideoOptions) {
   }, []);
 
   useLayoutEffect(() => {
+    activeMedia.current?.setEpoch(options.epoch());
     if (
       hostActive.current &&
       presentation &&
@@ -149,6 +176,7 @@ export function useBrowserVideo(options: BrowserVideoOptions) {
     frontRef.current = null;
     setFront(null);
     setError(null);
+    setCodecFallback(null);
     if (!node || !options.viewerToken || !supportsBrowserVideo()) return;
     let runningCleanup: (() => void) | null = null;
     let documentActive = false;
@@ -174,6 +202,7 @@ export function useBrowserVideo(options: BrowserVideoOptions) {
       let sequence = 0;
       let keyRequested = true;
       let wake: (() => void) | null = null;
+      let transport: ReturnType<typeof createBrowserVideoTransport> | null = null;
       const decoder = createBrowserVideoDecoder({
         environment: target.environment,
         isCurrent: (packet, epoch) => !stopped && latest.current.isCurrent(packet, epoch),
@@ -196,12 +225,17 @@ export function useBrowserVideo(options: BrowserVideoOptions) {
             frontRef.current = null;
           }
           setFront(packet, epoch);
+          transport?.presented(packet);
         },
         onNeedKeyFrame() {
           keyRequested = true;
         },
         onError(failure) {
           if (stopped) return;
+          if (transport?.usingMedia) {
+            transport.fallback("PyroWave decoding is unavailable; using standard video");
+            return;
+          }
           stopped = true;
           frontRef.current = null;
           setFront(null);
@@ -209,6 +243,50 @@ export function useBrowserVideo(options: BrowserVideoOptions) {
           wake?.();
         },
       });
+      /** A codec transition cannot inherit decoded frames or their input receipts. */
+      const resetTransportPresentation = () => {
+        decoder.reset();
+        sequence = 0;
+        streamId = null;
+        keyRequested = true;
+        visible.current = false;
+        frontRef.current = null;
+        setFront(null);
+      };
+      const readTransport = createBrowserVideoTransport({
+        viewerToken: options.viewerToken!,
+        quality: options.quality,
+        ...(options.bitrate === undefined ? {} : { bitrate: options.bitrate }),
+        ...(options.fps === undefined ? {} : { fps: options.fps }),
+        ...(options.videoCodec === undefined ? {} : { codec: options.videoCodec }),
+        ...(options.pyrowaveBitrate === undefined
+          ? {}
+          : { pyrowaveBitrate: options.pyrowaveBitrate }),
+        source: () => latest.current.state?.() ?? null,
+        epoch: () => latest.current.epoch(),
+        isSourceCurrent: (packet) => !stopped && sourceCurrent(packet, latest.current.epoch()),
+        isStopped: () => stopped,
+        environment: options.videoCodec === "pyrowave" ? createBrowserMediaEnvironment() : null,
+        readRpc: (input) => readRef.current(input),
+        mediaRpcs: {
+          open: (input) => mediaRpcs.current.open(input),
+          poll: (input) => mediaRpcs.current.poll(input),
+          close: (input) => mediaRpcs.current.close(input),
+        },
+        pendingRead,
+        pendingClose: pendingMediaClose,
+        onMediaResume: () => {
+          resetTransportPresentation();
+          setCodecFallback(null);
+        },
+        onFallback: (reason) => {
+          resetTransportPresentation();
+          setCodecFallback({ viewerToken: options.viewerToken, reason });
+          wake?.();
+        },
+      });
+      transport = readTransport;
+      activeMedia.current = readTransport;
       const watchdog = setInterval(() => {
         if (Date.now() - Math.max(lastPaintedAt, lastQuietReadAt) <= 2500 || !visible.current)
           return;
@@ -235,6 +313,7 @@ export function useBrowserVideo(options: BrowserVideoOptions) {
           };
         });
       refresh.current = () => {
+        readTransport.setEpoch(latest.current.epoch());
         // Refresh cannot bypass backoff or rearm an exhausted reader
         // just because another input finished.
         if (retryWaiting || readExhausted) return;
@@ -243,6 +322,13 @@ export function useBrowserVideo(options: BrowserVideoOptions) {
         wake?.();
       };
       const retryFailedReader = () => {
+        if (options.videoCodec === "pyrowave" && !readTransport.usingMedia) {
+          runningCleanup?.();
+          runningCleanup = null;
+          setCodecFallback(null);
+          synchronize();
+          return;
+        }
         if (stopped) return;
         // Reserved for explicit viewing recovery, such as successful navigation.
         // Expired viewers and decoder failures do not acquire a new read budget.
@@ -296,35 +382,22 @@ export function useBrowserVideo(options: BrowserVideoOptions) {
       const pump = async () => {
         try {
           while (!stopped) {
-            // Quality/viewer replacement waits for the old bounded RPC. The SDK
-            // cannot abort it; overlapping requests would violate server admission.
-            if (pendingRead.current) await pendingRead.current.catch(() => undefined);
-            if (stopped) break;
-            const epoch = latest.current.epoch();
             const requestKeyFrame = keyRequested;
             keyRequested = false;
-            const request = readRef.current({
-              viewerToken: options.viewerToken!,
-              quality: options.quality,
-              ...(options.bitrate === undefined ? {} : { bitrate: options.bitrate }),
-              ...(options.fps === undefined ? {} : { fps: options.fps }),
-              streamId,
-              afterSequence: sequence,
-              waitMs: 250,
-              requestKeyFrame,
-            });
-            pendingRead.current = request;
-            let reply: import("../shared/browser-video").BrowserVideoReadReply;
+            let result: import("./browser-media-session").BrowserMediaRead | null;
             try {
-              reply = await request;
+              result = await readTransport.read({
+                streamId,
+                afterSequence: sequence,
+                requestKeyFrame,
+              });
             } catch (failure) {
-              if (pendingRead.current === request) pendingRead.current = null;
               if (await recoverRead(failure)) continue;
               throw failure;
-            } finally {
-              if (pendingRead.current === request) pendingRead.current = null;
             }
             if (stopped) break;
+            if (!result) continue;
+            const { reply, observationEpoch: epoch } = result;
             if (!latest.current.acceptState(reply.state)) continue;
             // An unchanged tab may produce no native frames. Only a healthy
             // same-stream read with every received packet already painted can
@@ -343,6 +416,13 @@ export function useBrowserVideo(options: BrowserVideoOptions) {
               lastQuietReadAt = Date.now();
             }
             if (reply.status === "unsupported") {
+              if (readTransport.usingMedia) {
+                readTransport.fallback(
+                  reply.reason ?? "PyroWave is unavailable; using standard video",
+                  reply.state,
+                );
+                continue;
+              }
               if (reply.reasonCode === "video-disabled") {
                 // Host policy, not a failure: stop reading, release the decoder and
                 // canvas, and leave presentation to the ordinary image path.
@@ -407,6 +487,8 @@ export function useBrowserVideo(options: BrowserVideoOptions) {
           }
         } finally {
           decoder.close();
+          readTransport.close();
+          if (activeMedia.current === readTransport) activeMedia.current = null;
         }
       };
       void pump();
@@ -419,6 +501,8 @@ export function useBrowserVideo(options: BrowserVideoOptions) {
         visible.current = false;
         wake?.();
         decoder.close();
+        readTransport.close();
+        if (activeMedia.current === readTransport) activeMedia.current = null;
         target.dispose();
         refresh.current = () => {};
         retry.current = () => {};
@@ -459,7 +543,16 @@ export function useBrowserVideo(options: BrowserVideoOptions) {
       runningCleanup?.();
       runningCleanup = null;
     };
-  }, [node, options.viewerToken, options.quality, options.active, options.bitrate, options.fps]);
+  }, [
+    node,
+    options.viewerToken,
+    options.quality,
+    options.active,
+    options.bitrate,
+    options.fps,
+    options.videoCodec,
+    options.pyrowaveBitrate,
+  ]);
 
   return {
     active,
@@ -479,6 +572,8 @@ export function useBrowserVideo(options: BrowserVideoOptions) {
     },
     error,
     errorViewerToken: failure?.viewerToken ?? null,
+    codecFallbackReason:
+      codecFallback?.viewerToken === options.viewerToken ? codecFallback.reason : null,
     refresh: () => refresh.current(),
     /** Explicit viewing retry; ordinary input/image refresh never rearms exhaustion. */
     retry: () => retry.current(),

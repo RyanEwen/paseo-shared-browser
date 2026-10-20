@@ -1,11 +1,13 @@
 /** Execute the shipped extension program so rate admission is not a duplicate policy test. */
 import { createContext, runInContext } from "node:vm";
 import { expect, it } from "vitest";
+import { nativeVideoSynchronousTimers } from "../tests/fixtures/native-video-timers";
 import { NATIVE_VIDEO_EXTENSION_SOURCE } from "./native-video-extension-source";
 
 it("owns bitrate/FPS per encoder, actually rate-limits frames, and closes only the removed cohort", async () => {
   const encoders: Encoder[] = [];
   const constraints: unknown[] = [];
+  let clockNow = 0;
   let deliver: (value: unknown) => void = () => {};
   let context: ReturnType<typeof createContext>;
   class Encoder {
@@ -44,13 +46,22 @@ it("owns bitrate/FPS per encoder, actually rate-limits frames, and closes only t
   const reader = {
     read: () =>
       new Promise((resolve) => {
-        deliver = resolve;
+        deliver = (result) => {
+          const frame = (result as { value?: { timestamp: number } }).value;
+          if (frame) {
+            clockNow = Math.max(clockNow, frame.timestamp / 1000);
+            // Streaming readers renew active cohort demand during this long synthetic run.
+            runInContext("for (const key of encoders.keys()) touchEncoder(key)", context);
+          }
+          resolve(result);
+        };
       }),
     cancel: async () => {
       deliver({ done: true });
     },
   };
   context = createContext({
+    ...nativeVideoSynchronousTimers,
     chrome: {
       debugger: { getTargets: async () => [{ id: "exact", type: "page", tabId: 7 }] },
       tabCapture: { getMediaStreamId: async () => "source" },
@@ -74,7 +85,7 @@ it("owns bitrate/FPS per encoder, actually rate-limits frames, and closes only t
       const packet = JSON.parse(json);
       runInContext(`acknowledge(${JSON.stringify(packet.streamId)},${packet.sequence})`, context);
     },
-    performance: { now: () => 0 },
+    performance: { now: () => clockNow },
     Uint8Array,
     Map,
     Set,
@@ -132,10 +143,52 @@ it("owns bitrate/FPS per encoder, actually rate-limits frames, and closes only t
   await push(1_991_000);
   expect(encoders.map((value) => value.calls)).toEqual([16, 30, 60]);
 
+  // The real native track drops to 1fps when the page stops changing. Those
+  // refreshes must refine the prior image rather than restart every GOP.
+  for (const timestamp of [3_000_000, 4_000_000, 5_000_000]) await push(timestamp);
+  expect(encoders[0]!.encoded.slice(-3).map((frame) => frame.keyFrame)).toEqual([
+    false,
+    false,
+    false,
+  ]);
+  for (const encoder of encoders.slice(1))
+    expect(encoder.encoded.slice(-3).map((frame) => frame.keyFrame)).toEqual([false, false, false]);
+
+  // Exceed every configured GOP while idle, then resume active capture. Idle
+  // alone must not restart settled quality; active periodic keys remain intact.
+  for (let second = 6; second <= 70; second++) await push(second * 1_000_000);
+  for (const encoder of encoders)
+    expect(encoder.encoded.slice(-65).every((frame) => !frame.keyFrame)).toBe(true);
+  // One close pair after idle is not sustained motion.
+  await push(70_080_000);
+  expect(encoders.map((encoder) => encoder.encoded.at(-1)?.keyFrame)).toEqual([
+    false,
+    false,
+    false,
+  ]);
+  await push(71_000_000);
+  for (let sample = 1; sample <= 15; sample++) await push(71_000_000 + sample * 80_000);
+  for (const encoder of encoders)
+    expect(encoder.encoded.slice(-15).filter((frame) => frame.keyFrame)).toHaveLength(1);
+  runInContext('requestKeyFrame("24000000:15")', context);
+  await push(73_300_000);
+  expect(encoders.map((encoder) => encoder.encoded.at(-1)?.keyFrame)).toEqual([true, false, false]);
+
   runInContext('removeEncoder("5000000:30")', context);
   expect(encoders.map((value) => value.closed)).toEqual([false, true, false]);
   await runInContext('addEncoder("2000000:30","new",2000000,30)', context);
   expect(encoders).toHaveLength(4);
+  runInContext('removeEncoder("2000000:30")', context);
+  for (const bitrate of [48_000_000, 96_000_000]) {
+    const key = `${bitrate}:60`;
+    await runInContext(`addEncoder("${key}","high-budget",${bitrate},60)`, context);
+    expect(encoders.at(-1)?.configuration).toMatchObject({ bitrate, framerate: 60 });
+    runInContext(`removeEncoder("${key}")`, context);
+    expect(encoders.at(-1)?.closed).toBe(true);
+  }
+  await expect(
+    runInContext('addEncoder("100000000:60","wrong-codec-budget",100000000,60)', context),
+  ).rejects.toThrow("Unknown video settings");
   await runInContext("stopCapture()", context);
   expect(encoders.every((value) => value.closed)).toBe(true);
 });
@@ -146,6 +199,7 @@ function allocationFixture() {
   const created: { closed: boolean; configure(value: unknown): void }[] = [];
   let deliver: (result: unknown) => void = () => {};
   const context = createContext({
+    ...nativeVideoSynchronousTimers,
     chrome: {
       debugger: { getTargets: async () => [{ id: "exact", type: "page", tabId: 7 }] },
       tabCapture: { getMediaStreamId: async () => "source" },

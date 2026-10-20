@@ -24,6 +24,7 @@
     "client/**/*.tsx",
     "server/**/*.ts",
     "shared/**/*.ts",
-    "tests/**/*.ts"
+    "tests/**/*.ts",
+    "scripts/gpu-capture-prototype/viewer.ts"
   ]
 }

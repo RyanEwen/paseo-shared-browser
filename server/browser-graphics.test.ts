@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentBrowserRuntime } from "./agent-browser-runtime";
 import {
+  assertVulkanHardwareRenderer,
   assertWslHardwareRenderer,
   readBrowserGraphicsMode,
   resolveBrowserGraphics,
@@ -12,6 +13,42 @@ import {
 afterEach(() => vi.unstubAllEnvs());
 
 describe("explicit browser graphics policy", () => {
+  it("uses a private Wayland EGL surface without enabling remote desktop or changing other platforms", () => {
+    const profile = resolveBrowserGraphics("wayland", "linux");
+    expect(profile.mode).toBe("wayland");
+    expect(profile.environment).toEqual({});
+    expect(profile.chromiumArguments).toContain("--ozone-platform=wayland");
+    expect(profile.chromiumArguments).toContain("--use-angle=gl-egl");
+    expect(profile.chromiumArguments).not.toContain("--use-angle=vulkan");
+    expect(() => resolveBrowserGraphics("wayland", "darwin")).toThrow("Linux host");
+    expect(() => resolveBrowserGraphics("wayland", "win32")).toThrow("Linux host");
+  });
+  it("uses the qualified Linux Vulkan profile and refuses a software substitute", () => {
+    const profile = resolveBrowserGraphics("vulkan", "linux");
+    expect(profile.chromiumArguments).toEqual([
+      "--enable-gpu",
+      "--use-angle=vulkan",
+      "--enable-features=Vulkan",
+      "--disable-vulkan-surface",
+      "--enable-unsafe-webgpu",
+    ]);
+    expect(profile.environment).toEqual({});
+    expect(() => resolveBrowserGraphics("vulkan", "win32")).toThrow("Linux host");
+    expect(() => resolveBrowserGraphics("vulkan", "darwin")).toThrow("Linux host");
+    assertVulkanHardwareRenderer(
+      "ANGLE (AMD, Vulkan 1.3.0 (AMD Radeon Graphics (RADV RENOIR)), Mesa)",
+    );
+    for (const renderer of [
+      null,
+      "",
+      "ANGLE (Google, Vulkan SwiftShader)",
+      "Vulkan llvmpipe",
+      "Vulkan lavapipe",
+      "ANGLE (D3D12 GPU)",
+    ]) {
+      expect(() => assertVulkanHardwareRenderer(renderer)).toThrow("did not select a hardware GPU");
+    }
+  });
   it.skipIf(process.platform !== "linux")(
     "loads the persistent host selection and honors explicit overrides",
     async () => {

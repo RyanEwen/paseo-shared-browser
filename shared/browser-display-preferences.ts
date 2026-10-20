@@ -1,14 +1,17 @@
 /**
  * Host-persisted display favorites through Paseo's settings service. These values
- * affect viewing quality and picker convenience, never input ownership, page
- * navigation, emulation or pixel density. Version1 migration retains the bitrate
+ * affect viewing quality, browser startup graphics and picker convenience, never
+ * input ownership, page navigation or emulation. Version1 migration retains the bitrate
  * formerly coupled to JPEG quality.
  * Retired IDs remain parseable; the current catalogue prunes them at the view.
  */
 import { defineSettings } from "@getpaseo/plugin";
 import { z } from "zod";
+import { browserGraphicsPreferenceSchema } from "./browser-graphics";
 import { DEFAULT_CAPTURE_QUALITY } from "./capture-settings";
 import { DEVICE_PRESETS } from "./device-presets";
+import { pyrowaveBitrateSchema } from "./pyrowave-settings";
+import { videoCodecSchema } from "./video-codec-settings";
 import {
   resolveVideoEncoderSettings,
   videoBitrateSchema,
@@ -16,6 +19,10 @@ import {
 } from "./video-settings";
 
 export const browserDisplayPreferencesSchema = z.object({
+  videoCodec: videoCodecSchema.default("webcodecs"),
+  pyrowaveBitrate: pyrowaveBitrateSchema.default(100_000_000),
+  graphicsPreference: browserGraphicsPreferenceSchema.default("host-default"),
+  liveVideoEnabled: z.boolean().default(false),
   captureQuality: z.enum(["low", "medium", "high", "maximum"]).default(DEFAULT_CAPTURE_QUALITY),
   videoBitrate: videoBitrateSchema.default(12_000_000),
   videoFps: videoFrameRateSchema.default(30),
@@ -28,7 +35,7 @@ export type BrowserDisplayPreferences = z.output<typeof browserDisplayPreference
 export const browserDisplayPreferences = defineSettings({
   id: "display-preferences",
   scope: "host",
-  version: 2,
+  version: 5,
   migrate(values, fromVersion) {
     if (fromVersion !== 1 || !values || typeof values !== "object") return values;
     const previous = values as Record<string, unknown>;

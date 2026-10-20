@@ -1,3 +1,4 @@
+import { browserGraphicsStateSchema } from "./browser-graphics";
 import { captureDensitySchema } from "./capture-density";
 
 export { type CaptureDensity, canUseCaptureDensity, captureDensitySchema } from "./capture-density";
@@ -74,6 +75,8 @@ export const browserStateSchema = z.object({
   canGoForward: z.boolean(),
   viewport: viewportSchema,
   captureScale: z.number().min(1).max(2).default(1),
+  videoCaptureEnabled: z.boolean().optional(),
+  graphics: browserGraphicsStateSchema.optional(),
   navigationGeneration: generationSchema,
   viewportGeneration: generationSchema,
   devicePresetId: devicePresetIdSchema.nullable(),
@@ -207,13 +210,15 @@ export const releaseControlRpc = defineRpc({
   output: z.object({ state: browserStateSchema }),
 });
 
-const expectedStateSchema = z.object({
+export const expectedStateSchema = z.object({
   sessionId: opaqueTokenSchema,
   navigationGeneration: generationSchema,
   viewportGeneration: generationSchema,
   runtimeId: runtimeIdSchema.optional(),
   bridgeEpoch: epochSchema.optional(),
 });
+
+export type ExpectedBrowserState = z.infer<typeof expectedStateSchema>;
 
 export const navigateBrowserRpc = defineRpc({
   name: "shared-browser.navigate",

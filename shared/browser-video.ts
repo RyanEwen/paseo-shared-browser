@@ -7,7 +7,13 @@
 import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
 import { browserFrameSchema, browserStateSchema } from "./browser";
-import { videoBitrateSchema, videoFrameRateSchema } from "./video-settings";
+import {
+  resolveVideoCodecSettings,
+  videoCodecSchema,
+  videoRequestBitrateSchema,
+} from "./video-codec-settings";
+import { videoColorSpaceSchema } from "./video-color-space";
+import { videoFrameRateSchema } from "./video-settings";
 import { MAX_VIEWPORT } from "./viewport-limits";
 
 export const VIDEO_MAX_PACKET_BYTES = 2 * 1024 * 1024;
@@ -45,6 +51,7 @@ export const nativeVideoPacketSchema = z.object({
   width: z.number().int().positive().max(MAX_VIEWPORT.width),
   height: z.number().int().positive().max(MAX_VIEWPORT.height),
   descriptionBase64: z.string().max(16_384).optional(),
+  colorSpace: videoColorSpaceSchema.optional(),
   dataBase64: base64PacketSchema,
   capturedAt: z.string().datetime(),
 });
@@ -57,19 +64,44 @@ export const browserVideoPacketSchema = nativeVideoPacketSchema.extend({
   actionable: z.boolean().optional(),
 });
 export type BrowserVideoPacket = z.infer<typeof browserVideoPacketSchema>;
+/** Binary media carries the same authority metadata without base64 video bytes. */
+export const browserVideoMetadataSchema = browserVideoPacketSchema.omit({ dataBase64: true });
+export type BrowserVideoMetadata = z.infer<typeof browserVideoMetadataSchema>;
+export type BrowserBinaryVideoPacket = BrowserVideoMetadata & { data: Uint8Array };
+export type BrowserVideoPicture = BrowserVideoPacket | BrowserBinaryVideoPacket;
 
-export const readBrowserVideoRpc = defineRpc({
-  name: "shared-browser.video.read",
-  input: z.object({
-    viewerToken: opaqueIdSchema,
+/** Shared media admission for authenticated workspace and viewer requests. */
+export const runtimeVideoReadInputSchema = z
+  .object({
+    codec: videoCodecSchema.optional(),
     quality: z.enum(["low", "medium", "high"]).default("high"),
-    bitrate: videoBitrateSchema.optional(),
+    bitrate: videoRequestBitrateSchema.optional(),
     fps: videoFrameRateSchema.optional(),
     streamId: opaqueIdSchema.nullable().default(null),
     afterSequence: sequenceSchema.default(0),
     requestKeyFrame: z.boolean().default(false),
     waitMs: z.number().int().min(0).max(VIDEO_MAX_WAIT_MS).default(250),
-  }),
+  })
+  .superRefine((value, context) => {
+    try {
+      resolveVideoCodecSettings({
+        quality: value.quality,
+        ...(value.codec === undefined ? {} : { codec: value.codec }),
+        ...(value.bitrate === undefined ? {} : { bitrate: value.bitrate }),
+        ...(value.fps === undefined ? {} : { fps: value.fps }),
+      });
+    } catch {
+      context.addIssue({
+        code: "custom",
+        path: ["bitrate"],
+        message: "Video bitrate does not match the requested codec",
+      });
+    }
+  });
+
+export const readBrowserVideoRpc = defineRpc({
+  name: "shared-browser.video.read",
+  input: runtimeVideoReadInputSchema.safeExtend({ viewerToken: opaqueIdSchema }),
   output: z.object({
     state: browserStateSchema,
     status: z.enum(["ready", "waiting", "reset", "unsupported"]),

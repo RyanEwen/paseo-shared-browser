@@ -6,6 +6,7 @@ import { z } from "zod";
 import { browserTabIdSchema } from "../shared/browser";
 import { DEVICE_PRESET_IDS } from "../shared/device-presets";
 import { MAX_VIEWPORT, MIN_VIEWPORT } from "../shared/viewport-limits";
+import { registerDomTools } from "./agent-dom-tools";
 import type { JsonValue } from "./runtime-protocol";
 import { resolveSupervisorPaths } from "./supervisor";
 import { AgentSupervisorClient } from "./supervisor-client";
@@ -335,6 +336,8 @@ async function main(): Promise<void> {
     },
     async ({ presetId }) => textResult(await client.request("device", { presetId })),
   );
+
+  registerDomTools(server, client);
 
   const transport = new StdioServerTransport();
   process.once("exit", () => client.disconnect());

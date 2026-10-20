@@ -1,7 +1,17 @@
 import { describe, expect, it } from "vitest";
-import { browserMenuPlacement, browserSubmenuPlacement } from "./browser-menu-placement";
+import {
+  browserMenuPlacement,
+  browserMenuUsesBackNavigation,
+  browserSubmenuPlacement,
+} from "./browser-menu-placement";
 
 describe("bounded toolbar menus", () => {
+  it("uses Back navigation for a narrow desktop split pane and every native/compact client", () => {
+    expect(browserMenuUsesBackNavigation(600, false, "web")).toBe(true);
+    expect(browserMenuUsesBackNavigation(900, true, "web")).toBe(true);
+    expect(browserMenuUsesBackNavigation(900, false, "ios")).toBe(true);
+    expect(browserMenuUsesBackNavigation(900, false, "web")).toBe(false);
+  });
   it("aligns under a desktop trigger without exceeding the pane", () => {
     expect(
       browserMenuPlacement(

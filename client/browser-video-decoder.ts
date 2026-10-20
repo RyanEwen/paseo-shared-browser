@@ -3,7 +3,9 @@
  * timestamp with its server-issued input authority. The web adapter supplies
  * codecs and drawing; this module has no DOM globals and remains Hermes-safe.
  */
-import type { BrowserVideoPacket } from "../shared/browser-video";
+
+import type { BrowserVideoPicture } from "../shared/browser-video";
+import type { BrowserVideoColorSpace } from "../shared/video-color-space";
 
 export interface DecodedBrowserVideoFrame {
   readonly timestamp: number;
@@ -18,6 +20,7 @@ export interface BrowserVideoCodec {
     codedWidth: number;
     codedHeight: number;
     description?: Uint8Array;
+    colorSpace?: BrowserVideoColorSpace;
     optimizeForLatency: boolean;
   }): void;
   decode(chunk: unknown): void;
@@ -44,25 +47,30 @@ export interface BrowserVideoDecodeEnvironment {
 }
 export interface BrowserVideoDecoderOptions {
   environment: BrowserVideoDecodeEnvironment;
-  isCurrent(packet: BrowserVideoPacket, mutationEpoch: number): boolean;
+  isCurrent(packet: BrowserVideoPicture, mutationEpoch: number): boolean;
   /** Optional exact current source/document/geometry check, independent of a
    * local press epoch. Allows continuous visual decode without granting input. */
-  isSourceCurrent?(packet: BrowserVideoPacket): boolean;
+  isSourceCurrent?(packet: BrowserVideoPicture): boolean;
   /** Carries the original read epoch; caller separately admits input authority. */
-  onPresented(packet: BrowserVideoPacket, mutationEpoch: number): void;
+  onPresented(packet: BrowserVideoPicture, mutationEpoch: number): void;
   onNeedKeyFrame(): void;
   onError(error: unknown): void;
 }
 
 const MAX_PENDING_FRAMES = 64;
 const MAX_DECODE_QUEUE = 4;
-const MAX_BUFFERED_BASE64_CHARACTERS = 8 * 1024 * 1024;
+const MAX_BUFFERED_PAYLOAD_BYTES = 8 * 1024 * 1024;
+
+/** Count retained binary bytes or ASCII base64 characters conservatively against one bound. */
+function pictureBytes(packet: BrowserVideoPicture): number {
+  return "data" in packet ? packet.data.byteLength : packet.dataBase64.length;
+}
 
 /** Decode a bounded continuous source chain. A caller opting into source-only
  * visuals must keep the original epoch when separately admitting input. */
 export function createBrowserVideoDecoder(options: BrowserVideoDecoderOptions) {
   const { environment } = options;
-  const canPresent = (packet: BrowserVideoPacket, epoch: number) =>
+  const canPresent = (packet: BrowserVideoPicture, epoch: number) =>
     options.isSourceCurrent ? options.isSourceCurrent(packet) : options.isCurrent(packet, epoch);
   let closed = false;
   let codec: BrowserVideoCodec | null = null;
@@ -72,11 +80,14 @@ export function createBrowserVideoDecoder(options: BrowserVideoDecoderOptions) {
   let lastPresentedTimestamp = -1;
   let scheduled: (() => void) | null = null;
   let painting = false;
-  let paint: { frame: DecodedBrowserVideoFrame; packet: BrowserVideoPacket; epoch: number } | null =
-    null;
-  const pending = new Map<number, { packet: BrowserVideoPacket; epoch: number }>();
-  const queued: { packet: BrowserVideoPacket; epoch: number }[] = [];
-  let bufferedCharacters = 0;
+  let paint: {
+    frame: DecodedBrowserVideoFrame;
+    packet: BrowserVideoPicture;
+    epoch: number;
+  } | null = null;
+  const pending = new Map<number, { packet: BrowserVideoPicture; epoch: number }>();
+  const queued: { packet: BrowserVideoPicture; epoch: number }[] = [];
+  let bufferedPayloadBytes = 0;
   let draining = false;
 
   const reset = () => {
@@ -87,7 +98,7 @@ export function createBrowserVideoDecoder(options: BrowserVideoDecoderOptions) {
     paint = null;
     pending.clear();
     queued.length = 0;
-    bufferedCharacters = 0;
+    bufferedPayloadBytes = 0;
     try {
       codec?.close();
     } catch {
@@ -121,7 +132,7 @@ export function createBrowserVideoDecoder(options: BrowserVideoDecoderOptions) {
         }
         pending.set(entry.packet.timestampUs, entry);
         let chunk: unknown;
-        if (environment.createEncodedChunk) {
+        if (environment.createEncodedChunk && "dataBase64" in entry.packet) {
           chunk = environment.createEncodedChunk({
             type: entry.packet.type,
             timestamp: entry.packet.timestampUs,
@@ -131,7 +142,10 @@ export function createBrowserVideoDecoder(options: BrowserVideoDecoderOptions) {
           chunk = environment.createChunk({
             type: entry.packet.type,
             timestamp: entry.packet.timestampUs,
-            data: environment.decodeBase64(entry.packet.dataBase64),
+            data:
+              "data" in entry.packet
+                ? entry.packet.data
+                : environment.decodeBase64(entry.packet.dataBase64),
           });
         }
         codec.decode(chunk);
@@ -150,7 +164,7 @@ export function createBrowserVideoDecoder(options: BrowserVideoDecoderOptions) {
     }
     const entry = pending.get(frame.timestamp);
     pending.delete(frame.timestamp);
-    if (entry) bufferedCharacters -= entry.packet.dataBase64.length;
+    if (entry) bufferedPayloadBytes -= pictureBytes(entry.packet);
     drain();
     if (
       closed ||
@@ -237,7 +251,7 @@ export function createBrowserVideoDecoder(options: BrowserVideoDecoderOptions) {
 
   return {
     /** Returns false when a new keyframe is needed; never feeds a decoder an unknown delta chain. */
-    receive(packet: BrowserVideoPacket, mutationEpoch: number): boolean {
+    receive(packet: BrowserVideoPicture, mutationEpoch: number): boolean {
       if (closed || !canPresent(packet, mutationEpoch)) return false;
       const identity = JSON.stringify([
         packet.streamId,
@@ -245,6 +259,7 @@ export function createBrowserVideoDecoder(options: BrowserVideoDecoderOptions) {
         packet.codec,
         packet.width,
         packet.height,
+        packet.colorSpace,
         packet.frame.sessionId,
         packet.frame.runtimeId,
         packet.frame.captureEpoch,
@@ -253,14 +268,21 @@ export function createBrowserVideoDecoder(options: BrowserVideoDecoderOptions) {
       ]);
       if (streamKey !== identity) reset();
       if (codec && packet.sequence <= sequence) return true;
+      const independentPicture = packet.codec === "pyrowave" && packet.type === "key";
+      // PyroWave pictures have no inter-frame dependency. Discard only work that
+      // has not entered the codec; closing the codec would destroy its GPU device.
+      if (codec && independentPicture) {
+        for (const entry of queued) bufferedPayloadBytes -= pictureBytes(entry.packet);
+        queued.length = 0;
+      }
       // A complete new key can replace unsubmitted old pictures under decode
       // pressure. Preserve the visible canvas and original receipt/epoch checks;
       // a delta can never perform this catch-up because it needs its old chain.
       if (codec && packet.type === "key" && queued.length > 0) reset();
       if (
-        (codec && packet.sequence !== sequence + 1) ||
+        (codec && !independentPicture && packet.sequence !== sequence + 1) ||
         pending.size + queued.length >= MAX_PENDING_FRAMES ||
-        bufferedCharacters + packet.dataBase64.length > MAX_BUFFERED_BASE64_CHARACTERS
+        bufferedPayloadBytes + pictureBytes(packet) > MAX_BUFFERED_PAYLOAD_BYTES
       ) {
         reset();
       }
@@ -284,6 +306,7 @@ export function createBrowserVideoDecoder(options: BrowserVideoDecoderOptions) {
             codec: packet.codec,
             codedWidth: packet.width,
             codedHeight: packet.height,
+            ...(packet.colorSpace ? { colorSpace: packet.colorSpace } : {}),
             ...(packet.descriptionBase64
               ? { description: environment.decodeBase64(packet.descriptionBase64) }
               : {}),
@@ -292,7 +315,7 @@ export function createBrowserVideoDecoder(options: BrowserVideoDecoderOptions) {
           streamKey = identity;
         }
         sequence = packet.sequence;
-        bufferedCharacters += packet.dataBase64.length;
+        bufferedPayloadBytes += pictureBytes(packet);
         queued.push({ packet, epoch: mutationEpoch });
         drain();
         return codec !== null;

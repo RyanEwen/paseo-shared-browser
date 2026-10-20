@@ -385,7 +385,12 @@ describe("runtime-owned live input", () => {
       dispatchKey: vi.fn(),
       insertText: vi.fn(),
     };
-    const owned = { runtimeId: "owned", runtime } as unknown as Parameters<typeof owner.request>[0];
+    const owned = {
+      runtimeId: "owned",
+      runtime,
+      rootTargetId: "root",
+      tabs: new Map(),
+    } as unknown as Parameters<typeof owner.request>[0];
     await owner.request(owned, "input.begin", {
       gestureId: "gesture",
       expectedInputGeneration: "0:0",
@@ -645,7 +650,12 @@ it("refuses invalid mouse masks before publication or held-button bookkeeping", 
 it("runtime-owner validates physical modifiers and preserves omitted legacy arguments", async () => {
   const owner = await createRuntimeOwner();
   const runtime = { mouseDown: vi.fn(), mouseMove: vi.fn(), mouseUp: vi.fn(), wheel: vi.fn() };
-  const owned = { runtimeId: "owned", runtime } as unknown as Parameters<typeof owner.request>[0];
+  const owned = {
+    runtimeId: "owned",
+    runtime,
+    rootTargetId: "root",
+    tabs: new Map(),
+  } as unknown as Parameters<typeof owner.request>[0];
   const point = {
     x: 10,
     y: 20,
@@ -718,7 +728,12 @@ it("runtime-owner validates and forwards encoder controls without changing legac
   const runtime = {
     readVideo: vi.fn(async (_input: unknown) => ({ status: "waiting", packets: [] })),
   };
-  const owned = { runtimeId: "owned", runtime } as unknown as Parameters<typeof owner.request>[0];
+  const owned = {
+    runtimeId: "owned",
+    runtime,
+    rootTargetId: "root",
+    tabs: new Map(),
+  } as unknown as Parameters<typeof owner.request>[0];
   await owner.request(owned, "video.read", { bitrate: 24_000_000, fps: 60 });
   expect(runtime.readVideo).toHaveBeenLastCalledWith(
     expect.objectContaining({ bitrate: 24_000_000, fps: 60 }),

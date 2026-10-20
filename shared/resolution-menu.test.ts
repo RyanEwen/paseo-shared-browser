@@ -95,6 +95,10 @@ describe("resolution choices and host preferences", () => {
   it("defaults host favorites and quality but allows retired IDs to remain readable", () => {
     expect(browserDisplayPreferences.scope).toBe("host");
     expect(browserDisplayPreferencesSchema.parse({})).toEqual({
+      videoCodec: "webcodecs",
+      pyrowaveBitrate: 100_000_000,
+      graphicsPreference: "host-default",
+      liveVideoEnabled: false,
       favoritePresetIds: [],
       captureQuality: "medium",
       videoBitrate: 12_000_000,

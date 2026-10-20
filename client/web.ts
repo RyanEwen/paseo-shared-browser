@@ -7,6 +7,12 @@
 import { Platform } from "react-native";
 import type { BrowserCursor } from "../shared/browser";
 import type { createBrowserCanvasInput } from "./browser-canvas-input";
+import type {
+  BrowserMediaClientEnvironment,
+  BrowserMediaClientPeer,
+} from "./browser-media-session";
+import { createBrowserPyrowaveCodec } from "./browser-pyrowave-codec";
+import type { BrowserVideoCodec } from "./browser-video-decoder";
 
 type CanvasInput = ReturnType<typeof createBrowserCanvasInput>;
 interface Rect {
@@ -284,6 +290,31 @@ declare const EncodedVideoChunk: {
   new (input: { type: "key" | "delta"; timestamp: number; data: Uint8Array }): unknown;
 };
 declare function atob(data: string): string;
+declare const navigator: { gpu?: unknown };
+declare const isSecureContext: boolean;
+declare const RTCPeerConnection: { new (options: { iceServers: [] }): BrowserMediaClientPeer };
+
+/** Optional LAN playback is web-only and needs a secure WebGPU-capable client. */
+export function supportsBrowserMedia(): boolean {
+  if (
+    Platform.OS !== "web" ||
+    typeof RTCPeerConnection === "undefined" ||
+    typeof navigator === "undefined" ||
+    !navigator.gpu ||
+    typeof isSecureContext === "undefined" ||
+    !isSecureContext
+  )
+    return false;
+  return true;
+}
+/** Construct a peer only when the caller explicitly starts the optional LAN reader. */
+export function createBrowserMediaEnvironment(): BrowserMediaClientEnvironment | null {
+  if (!supportsBrowserMedia()) return null;
+  return {
+    createPeer: () => new RTCPeerConnection({ iceServers: [] }),
+    now: () => performance.now(),
+  };
+}
 
 interface VideoCanvasElement {
   width: number;
@@ -345,9 +376,33 @@ export function createBrowserVideoEnvironment(node: BrowserVideoCanvasNode) {
   node.appendChild(canvas);
   const environment: import("./browser-video-decoder").BrowserVideoDecodeEnvironment = {
     createDecoder(callbacks) {
-      const decoder = new VideoDecoder(callbacks);
-      decoder.addEventListener("dequeue", callbacks.dequeue);
-      return decoder;
+      let decoder: BrowserVideoCodec | null = null;
+      let closed = false;
+      return {
+        get decodeQueueSize() {
+          return decoder?.decodeQueueSize ?? 0;
+        },
+        configure(config) {
+          if (closed || decoder) throw new Error("Browser video decoder changed");
+          if (config.codec === "pyrowave") {
+            decoder = createBrowserPyrowaveCodec(callbacks);
+          } else {
+            const native = new VideoDecoder(callbacks);
+            native.addEventListener("dequeue", callbacks.dequeue);
+            decoder = native;
+          }
+          decoder.configure(config);
+        },
+        decode(chunk) {
+          if (closed || !decoder) throw new Error("Browser video decoder is unavailable");
+          decoder.decode(chunk);
+        },
+        close() {
+          closed = true;
+          decoder?.close();
+          decoder = null;
+        },
+      } satisfies BrowserVideoCodec;
     },
     createChunk: (input) => new EncodedVideoChunk(input),
     decodeBase64(data) {

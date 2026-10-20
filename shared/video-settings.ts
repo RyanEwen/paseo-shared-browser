@@ -1,12 +1,18 @@
 /** Bounded viewer encoder profiles. Settings affect encoded output only, never
  * page layout, pixel density, control ownership or another viewer's encoder. */
 import { z } from "zod";
-export const VIDEO_BITRATES = [2_000_000, 5_000_000, 12_000_000, 24_000_000] as const;
+export const VIDEO_BITRATES = [
+  2_000_000, 5_000_000, 12_000_000, 24_000_000, 48_000_000, 96_000_000,
+] as const;
 export const VIDEO_FRAME_RATES = [15, 30, 60] as const;
 export const DEFAULT_VIDEO_BITRATE = 12_000_000;
 export const DEFAULT_VIDEO_FPS = 30;
 export const VIDEO_ENCODER_LIMIT = 3;
 export const VIDEO_ENCODER_IDLE_MS = 2_000;
+/** Display a configured bits-per-second value using the menu's Mbps convention. */
+export function formatVideoBitrate(value: number): string {
+  return `${value / 1_000_000} Mbps`;
+}
 export const videoBitrateSchema = z.union(VIDEO_BITRATES.map((value) => z.literal(value)));
 export const videoFrameRateSchema = z.union(VIDEO_FRAME_RATES.map((value) => z.literal(value)));
 export const videoEncoderSettingsSchema = z.object({

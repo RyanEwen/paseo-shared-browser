@@ -4,7 +4,6 @@ import { chmod, mkdir, readFile, rm } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
 import { promisify } from "node:util";
 import { canUseCaptureDensity, captureDensitySchema } from "../shared/capture-density";
-
 import { captureDimensions, DEFAULT_JPEG_QUALITY } from "../shared/capture-settings";
 import { MAX_VIEWPORT } from "../shared/viewport-limits";
 import {
@@ -18,6 +17,7 @@ import {
   listPageTargets,
 } from "./cdp";
 import { readJpegFrameDimensions } from "./jpeg-frame";
+import { needsSoftwareCaptureColorCorrection } from "./video-capture-color-policy";
 
 export { readJpegFrameDimensions as jpegDimensions } from "./jpeg-frame";
 
@@ -28,19 +28,23 @@ import {
   browserGestureKeySchema,
   MAX_HELD_BROWSER_KEYS,
 } from "../shared/browser";
-import { resolveVideoEncoderSettings } from "../shared/video-settings";
+import { resolveVideoCodecSettings } from "../shared/video-codec-settings";
+import { AgentDomRuntime } from "./agent-dom-runtime";
 import { browserCursorExpression } from "./browser-cursor";
 import { GESTURE_IDLE_MS, GESTURE_LIFETIME_MS } from "./browser-gesture";
 import {
+  assertVulkanHardwareRenderer,
   assertWslHardwareRenderer,
   type BrowserGraphicsConfiguration,
   type BrowserGraphicsMode,
+  isHardwareRenderer,
   resolveBrowserGraphics,
 } from "./browser-graphics";
 import { CAPTURE_MAX_AGE_MS, createCaptureTransportPolicy } from "./capture-transport-policy";
 import { formatRuntimeInputGeneration } from "./input-generation";
 import { createJpegCaptureDemand } from "./jpeg-capture-demand";
 import { heldKeyModifiers, nativeKeyEvent } from "./keyboard-input";
+import type { NativePyrowaveAssets } from "./native-pyrowave-cohort";
 import {
   NativeVideoCapture,
   type NativeVideoQuality,
@@ -104,6 +108,11 @@ export interface RuntimeIdentity {
   protocolVersion: string;
   processId: number | null;
   targetId: string;
+  graphics?: {
+    mode: BrowserGraphicsMode;
+    renderer: string | null;
+    hardware: boolean | null;
+  };
 }
 
 export interface RuntimeHealth {
@@ -145,6 +154,8 @@ export interface DeviceEmulation extends BrowserViewport {
 export type MouseButton = "left" | "middle" | "right";
 
 export interface AgentBrowserRuntimeOptions {
+  /** Trusted immutable native assets, absent until optional codec qualification. */
+  pyrowave?: NativePyrowaveAssets;
   /** Host-persisted mode; omission uses the explicit graphics environment override or default. */
   graphicsMode?: BrowserGraphicsMode;
   binaryPath: string;
@@ -156,8 +167,10 @@ export interface AgentBrowserRuntimeOptions {
   headed?: boolean;
   /** Trusted per-instance private X11 context, only DISPLAY/XAUTHORITY; never mutates host environment. */
   launchEnvironment?: Readonly<Record<string, string>>;
-  /** Trusted daemon-side opt-in. Only then is the capture extension materialized and loaded. */
+  /** Prepare the capture helper. The current host choice separately authorizes capture. */
   nativeVideo?: boolean;
+  /** Current host choice, checked before and after asynchronous video acquisition. */
+  nativeVideoAllowed?: () => boolean;
   timeoutMs?: number;
   /** Bound for the session daemon to exit after close or SIGKILL. */
   daemonExitWaitMs?: number;
@@ -223,21 +236,39 @@ function runtimeEnvironment(
     const keys = Object.keys(launchEnvironment);
     const display = launchEnvironment.DISPLAY;
     const authority = launchEnvironment.XAUTHORITY;
-    if (
+    const wayland = launchEnvironment.WAYLAND_DISPLAY;
+    const directory = launchEnvironment.XDG_RUNTIME_DIR;
+    const privateWayland =
+      keys.length === 2 &&
+      keys.every((key) => key === "WAYLAND_DISPLAY" || key === "XDG_RUNTIME_DIR") &&
+      typeof wayland === "string" &&
+      /^wayland-[a-z0-9-]{1,32}$/.test(wayland) &&
+      typeof directory === "string" &&
+      isAbsolute(directory) &&
+      [...directory].every((character) => character.charCodeAt(0) >= 32);
+    const privateX11 = !(
       keys.length !== 2 ||
       keys.some((key) => key !== "DISPLAY" && key !== "XAUTHORITY") ||
       typeof display !== "string" ||
       !/^:[0-9]{1,5}(?:\.[0-9]{1,2})?$/.test(display) ||
       typeof authority !== "string" ||
       !isAbsolute(authority)
-    ) {
+    );
+    if (!privateWayland && !privateX11) {
       // Do not include display/authentication values in errors or child arguments.
       throw new AgentBrowserIncompatibleError("Private browser display environment is invalid");
     }
-    environment.DISPLAY = display;
-    environment.XAUTHORITY = authority;
-    // A private X11 display must not inherit an unrelated host Wayland session.
-    delete environment.WAYLAND_DISPLAY;
+    if (privateWayland) {
+      environment.WAYLAND_DISPLAY = wayland;
+      environment.XDG_RUNTIME_DIR = directory;
+      delete environment.DISPLAY;
+      delete environment.XAUTHORITY;
+    } else {
+      environment.DISPLAY = display;
+      environment.XAUTHORITY = authority;
+      // A private X11 display must not inherit an unrelated host Wayland session.
+      delete environment.WAYLAND_DISPLAY;
+    }
   }
   environment[RUNTIME_OWNER_VARIABLE] = ownerNonce;
   environment.AGENT_BROWSER_SOCKET_DIR = ipcDirectory;
@@ -327,6 +358,9 @@ export class AgentBrowserRuntime {
   /** A daemon was launched for this session, so absence of evidence is not proof of exit. */
   private daemonLaunched = false;
   private readonly nativeVideo: boolean;
+  private readonly pyrowave: NativePyrowaveAssets | undefined;
+  private readonly nativeVideoAllowed: () => boolean;
+  private readonly privateDisplay: boolean;
   private video: NativeVideoCapture | null = null;
   private videoRetirement: Promise<void> | null = null;
   private ownsBrowser = true;
@@ -335,6 +369,7 @@ export class AgentBrowserRuntime {
   private videoTransitionEpoch = 0;
 
   constructor(options: AgentBrowserRuntimeOptions) {
+    this.pyrowave = options.pyrowave;
     this.binaryPath = requireAbsolute(options.binaryPath, "agent-browser binary path");
     this.executablePath = requireAbsolute(options.executablePath, "Chromium executable path");
     this.profilePath = requireAbsolute(options.profilePath, "profile path");
@@ -353,6 +388,8 @@ export class AgentBrowserRuntime {
     };
     this.initialUrl = options.initialUrl ?? "about:blank";
     this.nativeVideo = options.nativeVideo === true;
+    this.nativeVideoAllowed = options.nativeVideoAllowed ?? (() => this.nativeVideo);
+    this.privateDisplay = options.launchEnvironment !== undefined;
   }
 
   async launch(): Promise<void> {
@@ -368,8 +405,8 @@ export class AgentBrowserRuntime {
     this.assertRuntimeOpen();
     await this.assertVersion();
     this.assertRuntimeOpen();
-    // Image-only sessions never materialize, load or allowlist the capture
-    // extension, so its tabCapture/debugger permissions do not exist in them.
+    // Preparing the helper does not create a capture page, stream or encoder.
+    // readVideo checks the current host choice before acquiring any of them.
     const videoExtension = this.nativeVideo
       ? await prepareNativeVideoExtension(this.ipcDirectory)
       : null;
@@ -378,6 +415,22 @@ export class AgentBrowserRuntime {
     const chromiumArguments = [
       ...this.graphics.chromiumArguments,
       existingArguments,
+      // agent-browser suppresses headless flags whenever an extension is present.
+      // This helper has no content scripts and works in modern headless Chrome;
+      // preserve the selected display mode while keeping capture ready but idle.
+      videoExtension && !this.headed ? "--headless=new" : undefined,
+      // Tab capture copies the native compositor surface. Page emulation's DPR
+      // alone can leave it rasterized at 1x, then enlarged to a nominal 2x stream.
+      // Prepare the surface for our maximum capture density; each tab still
+      // independently controls its CSS size, emulated DPR and 1x/2x output.
+      videoExtension && this.graphics.mode !== "wayland"
+        ? "--force-device-scale-factor=2"
+        : undefined,
+      // Retain the image-only headless path's software WebGL fallback, including
+      // on a private display. WSL hardware mode retains its renderer requirement.
+      (!this.headed || this.privateDisplay) && this.graphics.mode === "default"
+        ? "--enable-unsafe-swiftshader"
+        : undefined,
       // agent-browser creates the launch page itself. Chromium's default
       // startup window otherwise leaves an additional chrome://newtab page.
       "--no-startup-window",
@@ -411,12 +464,51 @@ export class AgentBrowserRuntime {
     await this.captureDaemon();
     this.assertRuntimeOpen();
     await this.connectCdp(targetId);
-    if (this.graphics.mode === "wsl-d3d12") {
+    await this.observeGraphics();
+  }
+
+  private graphicsObservation: RuntimeIdentity["graphics"];
+  private softwareCaptureColorCorrection = false;
+
+  /** Observe startup graphics once per controller; no page access or focus change. */
+  private async observeGraphics(): Promise<NonNullable<RuntimeIdentity["graphics"]>> {
+    if (this.graphicsObservation) return this.graphicsObservation;
+    let renderer: string | null = null;
+    try {
       const info = await this.requireConnection().send<{
-        gpu: { auxAttributes?: { glRenderer?: string } };
+        gpu?: {
+          auxAttributes?: { glRenderer?: string };
+          featureStatus?: { gpu_compositing?: string };
+        };
       }>("SystemInfo.getInfo");
-      assertWslHardwareRenderer(info.gpu.auxAttributes?.glRenderer);
+      const value = info.gpu?.auxAttributes?.glRenderer;
+      if (typeof value === "string") renderer = value.slice(0, 512);
+      if (this.graphics.mode === "vulkan" && !this.headed) {
+        const version = await this.requireConnection()
+          .send<{ product?: string }>("Browser.getVersion")
+          .catch(() => ({ product: "" }));
+        this.softwareCaptureColorCorrection = needsSoftwareCaptureColorCorrection({
+          platform: process.platform,
+          graphicsMode: this.graphics.mode,
+          headless: !this.headed,
+          product: version?.product ?? "",
+          gpuCompositing: info.gpu?.featureStatus?.gpu_compositing,
+        });
+      }
+    } catch (error) {
+      if (this.graphics.mode !== "default") throw error;
     }
+    if (this.graphics.mode === "wsl-d3d12") assertWslHardwareRenderer(renderer);
+    if (this.graphics.mode === "vulkan") assertVulkanHardwareRenderer(renderer);
+    if (this.graphics.mode === "wayland" && !isHardwareRenderer(renderer)) {
+      throw new Error("Wayland GPU graphics did not select a hardware GPU");
+    }
+    this.graphicsObservation = {
+      mode: this.graphics.mode,
+      renderer,
+      hardware: renderer === null ? null : isHardwareRenderer(renderer),
+    };
+    return this.graphicsObservation;
   }
 
   /** Attach an independent page controller to an existing browser session. */
@@ -444,6 +536,33 @@ export class AgentBrowserRuntime {
       { mutation: true },
     );
     if (!result.success) throw new CdpUnavailableError("Browser tab could not be closed");
+  }
+
+  /**
+   * Retire this page controller while retaining its browser connection and process ownership.
+   * Closing the launch tab must not attach a second controller to a surviving page: that
+   * would restore this tab's device settings over the survivor's independent settings.
+   * The retired target identity stays pinned, so later page access cannot adopt another tab.
+   */
+  async releaseTarget(): Promise<void> {
+    this.assertRuntimeOpen();
+    await this.withVideoTransition(async () => {
+      const page = this.page;
+      if (!page) return;
+      if (this.liveInput) await this.endLiveInput(this.liveInput.id);
+      await this.releaseHeldInput(page);
+      if (this.screencastActive) {
+        await page.send("Page.stopScreencast", {}, { mutation: true });
+      }
+      this.screencastActive = false;
+      this.attachmentGeneration += 1;
+      this.page = null;
+      this.emulationAppliedPage = null;
+      // Retain this page's intent in case close fails and the same target still exists.
+      // requirePage remains pinned to that target; it cannot apply this to a survivor.
+      this.invalidateScreencastFrame();
+      await page.detach();
+    });
   }
 
   async reconnect(): Promise<void> {
@@ -485,6 +604,46 @@ export class AgentBrowserRuntime {
     }
   }
 
+  private readonly agentDom = new AgentDomRuntime();
+
+  async domRequest(operation: string, input: import("./runtime-protocol").JsonValue) {
+    const data = input as Record<string, import("./runtime-protocol").JsonValue>;
+    const page = await this.requirePage();
+    const generation = formatRuntimeInputGeneration(
+      this.attachmentGeneration,
+      this.documentGeneration,
+    );
+    const assertCurrent = () => {
+      this.assertRuntimeOpen();
+      if (
+        page !== this.page ||
+        generation !==
+          formatRuntimeInputGeneration(this.attachmentGeneration, this.documentGeneration) ||
+        data.expectedInputGeneration !== generation
+      )
+        throw new CdpUnavailableError("DOM document or attachment changed; take a fresh snapshot");
+      if (
+        operation !== "dom.snapshot" &&
+        (!this.liveInput ||
+          this.liveInput.id !== data.gestureId ||
+          this.liveInput.page !== page ||
+          Date.now() >= this.liveInput.idleUntil ||
+          Date.now() >= this.liveInput.expiresAt)
+      )
+        throw new CdpUnavailableError("DOM action input channel expired");
+    };
+    assertCurrent();
+    if (operation === "dom.snapshot")
+      return this.agentDom.snapshot(page, generation, assertCurrent);
+    try {
+      return operation === "dom.action"
+        ? await this.agentDom.action(page, generation, input, assertCurrent)
+        : await this.agentDom.evaluate(page, generation, input, assertCurrent);
+    } finally {
+      if (operation === "dom.action") this.invalidateScreencastFrame();
+    }
+  }
+
   async identity(): Promise<RuntimeIdentity> {
     const connection = this.requireConnection();
     const version = await connection.send<VersionResult>("Browser.getVersion");
@@ -498,6 +657,7 @@ export class AgentBrowserRuntime {
       protocolVersion: version.protocolVersion,
       processId,
       targetId: page.targetId,
+      graphics: await this.observeGraphics(),
     };
   }
 
@@ -886,6 +1046,7 @@ export class AgentBrowserRuntime {
 
   /** Long-poll outside the input queue. The caller must fence returned inputGeneration before publication. */
   async readVideo(input: {
+    codec?: "webcodecs" | "pyrowave";
     quality: NativeVideoQuality;
     bitrate?: number;
     fps?: number;
@@ -894,15 +1055,18 @@ export class AgentBrowserRuntime {
     waitMs?: number;
     requestKeyFrame?: boolean;
   }): Promise<NativeVideoRead & { inputGeneration: string }> {
-    if (!this.nativeVideo) {
+    if (!this.nativeVideo || !this.nativeVideoAllowed()) {
+      if (this.video) this.retireVideoForRead();
       return {
         ...this.videoReset(),
         status: "unsupported",
         reasonCode: "video-disabled",
-        reason: "Encoded video is not enabled on this host",
+        reason: this.nativeVideo
+          ? "Live video is off"
+          : "Live video is unavailable in this browser; screenshots remain available",
       };
     }
-    const settings = resolveVideoEncoderSettings(input);
+    const settings = resolveVideoCodecSettings(input);
     const transitionEpoch = this.videoTransitionEpoch;
     if (!this.videoMayStart(transitionEpoch)) return this.videoReset();
 
@@ -936,11 +1100,14 @@ export class AgentBrowserRuntime {
     if (!this.video) {
       const pixels = captureDimensions(viewport, viewport.captureScale ?? 1);
       this.video = new NativeVideoCapture({
+        ...(this.pyrowave ? { pyrowave: this.pyrowave } : {}),
         connection,
         targetId: page.targetId,
+        softwareColorCorrection: this.softwareCaptureColorCorrection,
         width: pixels.width,
         height: pixels.height,
         isCurrent: () =>
+          this.nativeVideoAllowed() &&
           this.videoMayStart(transitionEpoch) &&
           connection === this.connection &&
           page === this.page &&
@@ -951,7 +1118,16 @@ export class AgentBrowserRuntime {
     }
     const video = this.video;
     const documentGeneration = this.documentGeneration;
-    const result = await video.read({ ...input, ...settings });
+    const result = await video.read({ ...input, bitrate: settings.bitrate, fps: settings.fps });
+    if (!this.nativeVideoAllowed()) {
+      this.retireVideoForRead();
+      return {
+        ...this.videoReset(),
+        status: "unsupported",
+        reasonCode: "video-disabled",
+        reason: "Live video is off",
+      };
+    }
     if (
       !this.videoMayStart(transitionEpoch) ||
       video.idleExpired ||

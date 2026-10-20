@@ -4,7 +4,17 @@
  * Binding acknowledgements limit outstanding packets; a dropped output forces a
  * new keyframe before another delta can be forwarded.
  */
-export const NATIVE_VIDEO_EXTENSION_SOURCE = `
+
+import { VIDEO_BITRATES, VIDEO_FRAME_RATES } from "../shared/video-settings";
+import { NATIVE_PYROWAVE_EXTENSION_SOURCE } from "./native-pyrowave-extension-source";
+import { NATIVE_VIDEO_COLOR_SOURCE } from "./native-video-color-source";
+import { NATIVE_VIDEO_ENCODER_SOURCE } from "./native-video-encoder-source";
+import { NATIVE_VIDEO_FRAME_SOURCE } from "./native-video-frame-source";
+
+export const NATIVE_VIDEO_EXTENSION_SOURCE = `${NATIVE_VIDEO_COLOR_SOURCE}
+${NATIVE_PYROWAVE_EXTENSION_SOURCE}
+${NATIVE_VIDEO_ENCODER_SOURCE}
+${NATIVE_VIDEO_FRAME_SOURCE}
 let capture = null;
 const encoders = new Map();
 const pendingEncoders = new Map();
@@ -23,8 +33,10 @@ async function stopCapture() {
   const previous = capture;
   capture = null;
   pendingEncoders.clear();
+  stopRawEncoders();
   if (!previous) return;
   previous.stopped = true;
+  clearNativeFrame(previous);
   for (const encoder of encoders.values()) {
     try {
       encoder.encoder.close();
@@ -49,7 +61,7 @@ function frameForViewport(frame, width, height) {
   return new VideoFrame(frame, { displayWidth: width, displayHeight: height });
 }
 /** Start one exact tab at physical pixel dimensions; generation fences previously queued frames. */
-async function startCapture(targetId, width, height, generation) {
+async function startCapture(targetId, width, height, generation, softwareColorCorrection = false) {
   await stopCapture();
   let stream;
   try {
@@ -83,6 +95,9 @@ async function startCapture(targetId, width, height, generation) {
       generation,
       minimumTimestampUs: -Infinity,
       stopped: false,
+      latestFrame: null,
+      frameTimer: null,
+      frameWakeAt: 0,
       loop: null,
     };
     capture = current;
@@ -95,10 +110,16 @@ async function startCapture(targetId, width, height, generation) {
               nativeVideoPacket(JSON.stringify({ error: "Native video capture stopped" }));
             break;
           }
+          const generation = current.generation;
+          const receivedAt = performance.now();
           let encodingFrame = null;
+          let transferredSourceFrame = false;
           try {
             if (capture !== current || current.stopped) break;
             if (frame.timestamp < current.minimumTimestampUs) continue;
+            // New raw input supersedes any retained older picture, including
+            // while software colour correction awaits its bounded plane copy.
+            clearNativeFrame(current);
             encodingFrame = frameForViewport(frame, width, height);
             if (!encodingFrame) {
               // Only native YUV even-alignment is correctable. Keep unexpected
@@ -111,60 +132,36 @@ async function startCapture(targetId, width, height, generation) {
               );
               break;
             }
-            for (const state of encoders.values()) {
-              if (state.failed || performance.now() - state.lastRequestedAt > 2000) continue;
-              if (state.pending.size >= 2 || state.encoder.encodeQueueSize >= 2) {
-                // This source frame was never encoded, so skipping it does not
-                // lose a codec dependency. Keep already queued output usable.
-                // The output callback below still forces recovery if it must
-                // discard an actual encoded chunk.
-                continue;
-              }
-              // Source timestamps are integer microseconds. Allow one microsecond
-              // of rounding so genuine 30fps timestamps do not become 15fps.
-              const minimumIntervalUs = 1000000 / state.configuration.framerate;
-              // Recovery uses the next fresh frame even inside the ordinary FPS interval.
-              // Producer/encoder backlog checks above still apply to forced keys.
-              if (
-                !state.forceKey &&
-                frame.timestamp - state.lastEncodedTimestampUs < minimumIntervalUs - 1
-              )
-                continue;
-              state.lastEncodedTimestampUs = frame.timestamp;
-              state.frameGenerations.set(frame.timestamp, current.generation);
-              while (state.frameGenerations.size > 4)
-                state.frameGenerations.delete(state.frameGenerations.keys().next().value);
-              const keyFrame =
-                state.forceKey || frame.timestamp - state.lastKeyTimestamp >= 1000000;
-              try {
-                state.encoder.encode(encodingFrame, { keyFrame });
-              } catch {
-                // A synchronous codec rejection belongs to this cohort, just
-                // like its asynchronous error callback. Healthy peers keep the track.
-                state.failed = true;
-                try {
-                  state.encoder.close();
-                } catch {}
-                state.frameGenerations.clear();
-                nativeVideoPacket(
-                  JSON.stringify({
-                    error: "Native video encoder stopped",
-                    streamId: state.streamId,
-                  }),
-                );
-                continue;
-              }
-              if (keyFrame) state.lastKeyTimestamp = frame.timestamp;
-              state.forceKey = false;
+            // Raw capture owns a clone and its sole plane copy. It can preserve
+            // corrected colour metadata without WebCodecs' reconstruction copy.
+            encodeRawFrame(current, encodingFrame, softwareColorCorrection);
+            if (encoders.size === 0) continue;
+            const corrected = await correctSoftwareCaptureColor(encodingFrame, softwareColorCorrection);
+            if (corrected !== encodingFrame) {
+              if (encodingFrame !== frame) encodingFrame.close();
+              encodingFrame = corrected;
             }
+            // A source can retire during the bounded plane copy. Never publish
+            // its late frame to either codec after cancellation or document reset.
+            if (capture !== current || current.stopped || current.generation !== generation ||
+                frame.timestamp < current.minimumTimestampUs) continue;
+            transferredSourceFrame = encodingFrame === frame;
+            offerNativeFrame(current, encodingFrame, generation, receivedAt);
+            encodingFrame = null;
+
           } finally {
             if (encodingFrame && encodingFrame !== frame) encodingFrame.close();
-            frame.close();
+            if (!transferredSourceFrame) frame.close();
           }
         }
       } catch {
         if (capture === current)
           nativeVideoPacket(JSON.stringify({ error: "Native video capture stopped" }));
+      } finally {
+        // Reader completion, failure and geometry rejection all revoke retained
+        // pixels synchronously. Do not await stopCapture here: it awaits this loop.
+        current.stopped = true;
+        clearNativeFrame(current);
       }
     })();
     return { width, height, settings: track.getSettings() };
@@ -176,11 +173,11 @@ async function startCapture(targetId, width, height, generation) {
 /** Allocate a cohort selected by its stable quality/configuration key. Bitrate is bits per second,
  * fps is the requested frame ceiling. Reserve capacity before asynchronous codec probes. */
 async function addEncoder(quality, streamId, bitrate, fps) {
-  if (!capture) throw new Error("Native capture is not running");
+  if (!capture || capture.stopped) throw new Error("Native capture is not running");
   const bitrates = { low: 2000000, medium: 5000000, high: 12000000 };
   bitrate ??= bitrates[quality];
   fps ??= 30;
-  if (![2000000, 5000000, 12000000, 24000000].includes(bitrate) || ![15, 30, 60].includes(fps))
+  if (!${JSON.stringify(VIDEO_BITRATES)}.includes(bitrate) || !${JSON.stringify(VIDEO_FRAME_RATES)}.includes(fps))
     throw new Error("Unknown video settings");
   const existing = encoders.get(quality);
   if (existing) {
@@ -199,7 +196,7 @@ async function addEncoder(quality, streamId, bitrate, fps) {
       throw new Error("Encoder allocation identity changed");
     return pending.promise;
   }
-  if (encoders.size + pendingEncoders.size >= 3) throw new Error("Native encoder limit reached");
+  if (encoders.size + pendingEncoders.size + rawEncoders.size >= 3) throw new Error("Native encoder limit reached");
   // Reserve before any codec probe. A timed-out CDP request can continue in this
   // page, so host-side serialization alone cannot enforce the encoder ceiling.
   const source = capture;
@@ -238,63 +235,21 @@ async function addEncoder(quality, streamId, bitrate, fps) {
         sequence: 0,
         pending: new Set(),
         forceKey: true,
-        lastKeyTimestamp: -Infinity,
+        framesSinceKey: 0,
+        activeFrames: 0,
         lastEncodedTimestampUs: -Infinity,
+        nextEncodeAt: -Infinity,
+        deferredPacing: false,
         lastRequestedAt: performance.now(),
         needsKey: true,
         configuration,
         frameGenerations: new Map(),
         failed: false,
         encoder: null,
+        encoderIncarnation: null,
+        stallRecoveries: 0,
       };
-      state.encoder = new VideoEncoder({
-        output: (chunk, metadata) => {
-          if (!capture || encoders.get(quality) !== state || state.failed) return;
-          const generation = state.frameGenerations.get(chunk.timestamp);
-          state.frameGenerations.delete(chunk.timestamp);
-          if (chunk.byteLength > 2097152) {
-            state.failed = true;
-            try {
-              state.encoder.close();
-            } catch {}
-            nativeVideoPacket(
-              JSON.stringify({ error: "Native video quality exceeds its packet bound", streamId }),
-            );
-            return;
-          }
-          if (generation !== capture.generation || state.pending.size >= 2) {
-            state.forceKey = true;
-            state.needsKey = true;
-            return;
-          }
-          if (state.needsKey && chunk.type !== "key") return;
-          if (chunk.type === "key") state.needsKey = false;
-          const bytes = new Uint8Array(chunk.byteLength);
-          chunk.copyTo(bytes);
-          const sequence = ++state.sequence;
-          state.pending.add(sequence);
-          const description = metadata.decoderConfig && metadata.decoderConfig.description;
-          nativeVideoPacket(
-            JSON.stringify({
-              streamId,
-              captureGeneration: generation,
-              sequence,
-              timestampUs: chunk.timestamp,
-              type: chunk.type,
-              codec: state.codec,
-              width: capture.width,
-              height: capture.height,
-              ...(description ? { descriptionBase64: bytes64(new Uint8Array(description)) } : {}),
-              dataBase64: bytes64(bytes),
-            }),
-          );
-        },
-        error: () => {
-          state.failed = true;
-          nativeVideoPacket(JSON.stringify({ error: "Native video encoder stopped", streamId }));
-        },
-      });
-      state.encoder.configure(configuration);
+      replaceNativeEncoder(quality, state);
       assertAllocation();
       pendingEncoders.delete(quality);
       encoders.set(quality, state);
@@ -312,24 +267,29 @@ async function addEncoder(quality, streamId, bitrate, fps) {
 }
 /** Cancel an uncertain allocation and release only the selected cohort. */
 function removeEncoder(quality) {
+  removeRawEncoder(quality);
   // Cancel uncertain pending allocation before its async support probe returns.
   pendingEncoders.delete(quality);
   const state = encoders.get(quality);
   if (!state) return;
   encoders.delete(quality);
+  state.encoderIncarnation = null;
   try {
     state.encoder.close();
   } catch {}
   state.pending.clear();
   state.frameGenerations.clear();
+  wakeNativeFrame();
 }
 /** Renew viewing demand without allocating or resetting a codec. */
 function touchEncoder(quality) {
+  touchRawEncoder(quality);
   const state = encoders.get(quality);
   if (state) state.lastRequestedAt = performance.now();
 }
 /** Request the next eligible independent picture while preserving healthy in-flight deltas. */
 function requestKeyFrame(quality) {
+  touchRawEncoder(quality, true);
   const state = encoders.get(quality);
   if (state) {
     state.lastRequestedAt = performance.now();
@@ -337,28 +297,33 @@ function requestKeyFrame(quality) {
     // can keep consuming an intact in-flight chain until that key is encoded.
     // Preserve any existing needsKey from actual output loss or source reset.
     state.forceKey = true;
+    wakeNativeFrame();
   }
 }
 /** Release producer pressure for this exact stream/sequence, including refused stale packets. */
 function acknowledge(streamId, sequence) {
   for (const state of encoders.values())
     if (state.streamId === streamId) state.pending.delete(sequence);
+  wakeNativeFrame();
 }
 /** Fence pre-transition output using source-clock microseconds without replacing the track. */
 function resetCapture(generation, minimumTimestampUs) {
   if (!capture) return;
   if (generation < capture.generation) return;
+  clearNativeFrame(capture);
   capture.generation = generation;
   capture.minimumTimestampUs = minimumTimestampUs;
   for (const state of encoders.values()) {
     if (state.failed) continue;
     state.forceKey = true;
     state.needsKey = true;
-    state.frameGenerations.clear();
     state.pending.clear();
-    // reset cancels outstanding pre-navigation encoding, preserving the track.
-    state.encoder.reset();
-    state.encoder.configure(state.configuration);
+    state.framesSinceKey = 0;
+    state.activeFrames = 0;
+    // A route/action boundary retires receipts, not the physical capture source.
+    // Keep the codec warm and retain unmatched native work in the two-slot bound.
+    // Its original generation rejects old output; the next fresh submission is
+    // an independent key. Silent drops retain the existing deadline recovery.
   }
 }
 `;

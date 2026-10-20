@@ -1,8 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { browserGestureKeySchema, MAX_BROWSER_TABS } from "../shared/browser";
-import { videoBitrateSchema, videoFrameRateSchema } from "../shared/video-settings";
+import type { BrowserGraphicsPreference } from "../shared/browser-graphics";
+import { videoCodecSchema, videoRequestBitrateSchema } from "../shared/video-codec-settings";
+import { videoFrameRateSchema } from "../shared/video-settings";
 import {
   AgentBrowserRuntime,
   type AgentBrowserRuntimeOptions,
@@ -11,38 +14,49 @@ import {
 } from "./agent-browser-runtime";
 import { readBrowserGraphicsMode } from "./browser-graphics";
 import { CdpUnknownOutcomeError } from "./cdp";
+import type { NativePyrowaveAssets } from "./native-pyrowave-cohort";
+import { createPrivateWaylandDisplay } from "./private-wayland-display";
+import { readBrowserGraphicsPreference } from "./runtime-graphics-settings";
+import { readRuntimeMediaAssets } from "./runtime-media-assets";
 import { resolveBrowserRuntimeRoot } from "./runtime-path";
 import type { JsonValue } from "./runtime-protocol";
+import { readLiveVideoEnabled } from "./runtime-video-settings";
 import type { RuntimeOwner } from "./supervisor";
 import {
   createPrivateVirtualDisplay,
   PrivateDisplayError,
   type PrivateVirtualDisplay,
 } from "./virtual-display";
+import { readRuntimeWaylandAssets } from "./wayland-assets";
 
 const DEFAULT_BROWSER_URL = "https://example.com/";
 
 interface OwnedRuntime {
   runtimeId: string;
   runtime: AgentBrowserRuntime;
-  rootTargetId: string;
+  /** Null after the launch page closes; the launcher then owns only the browser process. */
+  rootTargetId: string | null;
   runtimeOptions: AgentBrowserRuntimeOptions;
   tabs: Map<string, Promise<AgentBrowserRuntime>>;
   tabOrder: string[];
   display: PrivateVirtualDisplay | null;
   /** Bounded, secret-free reason an opted-in private display is not in use. */
   displayNotice: string | null;
+  graphicsPreference: BrowserGraphicsPreference;
 }
 interface RuntimeOwnerOptions {
+  /** Trusted embedded prototype assets; no public request can supply native executable paths. */
+  pyrowave?: NativePyrowaveAssets;
   initialUrl?: string;
   headed?: boolean;
   /**
-   * Trusted opt-in for a private Linux Xvfb display. When omitted, each runtime creation reads
-   * PASEO_SHARED_BROWSER_XVFB from this process's environment and enables it only for "1".
-   * Explicit false overrides the environment.
+   * Trusted opt-in for private desktop hover. Video can remain prepared in headless mode;
+   * changing the saved video choice never changes this display mode.
    */
   virtualDisplay?: boolean;
-  /** Encoded video is opt-in; defaults to PASEO_SHARED_BROWSER_VIDEO=1 in the daemon environment. */
+  /** Trusted embedded/test override for a privately supplied Xvfb executable. */
+  virtualDisplayExecutablePath?: string;
+  /** Test/embedded capability and policy override; production keeps capture ready but idle. */
   nativeVideo?: boolean;
 }
 
@@ -105,6 +119,9 @@ export async function createRuntimeOwner(
   options: RuntimeOwnerOptions = {},
 ): Promise<RuntimeOwner<OwnedRuntime>> {
   const home = paseoHome();
+  const mediaAssets = options.pyrowave ? null : await readRuntimeMediaAssets(home);
+  const pyrowave = options.pyrowave ?? mediaAssets?.pyrowave;
+  const liveVideoEnabled = () => options.nativeVideo ?? readLiveVideoEnabled(home);
   const root = join(home, "plugin-data", "shared-browser");
   const runtimeRoot = resolveBrowserRuntimeRoot(home);
   const ipcDirectory =
@@ -128,14 +145,27 @@ export async function createRuntimeOwner(
   return {
     async create(workspaceId) {
       const hash = createHash("sha256").update(workspaceId).digest("hex");
+      const graphicsPreference = readBrowserGraphicsPreference(home);
+      const graphicsMode =
+        graphicsPreference === "host-default" ? readBrowserGraphicsMode(home) : graphicsPreference;
+      const videoReady = options.nativeVideo ?? true;
       // Explicit headed mode uses the caller's real display. An opted-in hidden Linux mode
       // gets a private virtual mouse so native pointer media survive emulation.
       let display: PrivateVirtualDisplay | null = null;
       let displayNotice: string | null = null;
       const wantsDisplay = options.virtualDisplay ?? process.env.PASEO_SHARED_BROWSER_XVFB === "1";
-      if (!options.headed && wantsDisplay) {
+      if (graphicsMode === "wayland") {
+        const assets = await readRuntimeWaylandAssets(home);
+        if (!assets)
+          throw new PrivateDisplayError("Wayland GPU assets are not prepared on this host");
+        display = await createPrivateWaylandDisplay(assets);
+      } else if (!options.headed && wantsDisplay) {
         try {
-          display = await createPrivateVirtualDisplay();
+          const privateExecutable = join(runtimeRoot, "xvfb", "usr", "bin", "Xvfb");
+          const executablePath =
+            options.virtualDisplayExecutablePath ??
+            (existsSync(privateExecutable) ? privateExecutable : undefined);
+          display = await createPrivateVirtualDisplay(executablePath ? { executablePath } : {});
           if (!display) displayNotice = "Private display unavailable: Xvfb was not found.";
         } catch (error) {
           // The helper has finished cleanup and no Chromium was constructed yet.
@@ -151,7 +181,7 @@ export async function createRuntimeOwner(
       let runtime: AgentBrowserRuntime | null = null;
       try {
         const runtimeOptions: AgentBrowserRuntimeOptions = {
-          graphicsMode: readBrowserGraphicsMode(home),
+          graphicsMode,
           binaryPath,
           executablePath,
           profilePath: join(root, "profiles", hash),
@@ -159,7 +189,9 @@ export async function createRuntimeOwner(
           session: `ws-${hash.slice(0, 16)}`,
           initialUrl: options.initialUrl ?? DEFAULT_BROWSER_URL,
           headed: display ? true : (options.headed ?? false),
-          nativeVideo: options.nativeVideo ?? process.env.PASEO_SHARED_BROWSER_VIDEO === "1",
+          nativeVideo: videoReady,
+          nativeVideoAllowed: liveVideoEnabled,
+          ...(pyrowave ? { pyrowave } : {}),
           ...(display ? { launchEnvironment: display.launchEnvironment } : {}),
         };
         runtime = new AgentBrowserRuntime(runtimeOptions);
@@ -175,6 +207,7 @@ export async function createRuntimeOwner(
           tabOrder: [identity.targetId],
           display,
           displayNotice,
+          graphicsPreference,
         };
       } catch (error) {
         let cleanupFailure: unknown = null;
@@ -226,9 +259,7 @@ export async function createRuntimeOwner(
         const controller = owned.tabs.get(targetId);
         if (controller) await (await controller).shutdown();
         if (owned.rootTargetId === targetId) {
-          const successor = targets.find((target) => target.targetId !== targetId)!;
-          await owned.runtime.selectTarget(successor.targetId, false);
-          owned.rootTargetId = successor.targetId;
+          await owned.runtime.releaseTarget();
         }
         await owned.runtime.closeTarget(targetId);
         // Target.closeTarget can acknowledge before Chromium drops the page from
@@ -244,22 +275,43 @@ export async function createRuntimeOwner(
         }
         owned.tabs.delete(targetId);
         if (!gone) throw new CdpUnknownOutcomeError("Browser tab close could not be confirmed");
+        if (owned.rootTargetId === targetId) owned.rootTargetId = null;
         owned.tabOrder = owned.tabOrder.filter((id) => id !== targetId);
         return null;
       }
-      const targetId = typeof data.targetId === "string" ? data.targetId : null;
+      const targetId =
+        typeof data.targetId === "string"
+          ? data.targetId
+          : (owned.rootTargetId ?? (await orderedTargets(owned))[0]?.targetId);
+      if (!targetId) throw new Error("Browser has no available page");
       // Keep the launch page on its original CDP session. A second session on
       // the same target can reset emulation and interrupt its video source.
       const runtime =
-        targetId && (targetId !== owned.rootTargetId || owned.tabs.has(targetId))
+        targetId !== owned.rootTargetId || owned.tabs.has(targetId)
           ? await tabRuntime(owned, targetId)
           : owned.runtime;
       const gestureId = typeof data.gestureId === "string" ? data.gestureId : undefined;
       switch (operation) {
+        case "dom.snapshot":
+        case "dom.action":
+        case "dom.evaluate":
+          return (await runtime.domRequest(operation, input)) as unknown as JsonValue;
         case "identity": {
           const identity = await runtime.identity();
           return {
             ...identity,
+            videoCaptureEnabled: owned.runtimeOptions.nativeVideo === true,
+            ...(identity.graphics
+              ? {
+                  graphics: {
+                    ...identity.graphics,
+                    preference: owned.graphicsPreference,
+                    platform: ["linux", "darwin", "win32"].includes(process.platform)
+                      ? process.platform
+                      : "other",
+                  },
+                }
+              : {}),
             ...(owned.displayNotice ? { displayNotice: owned.displayNotice } : {}),
           } as unknown as JsonValue;
         }
@@ -294,12 +346,13 @@ export async function createRuntimeOwner(
           return null;
         case "video.read":
           return (await runtime.readVideo({
+            ...(data.codec === undefined ? {} : { codec: videoCodecSchema.parse(data.codec) }),
             quality: data.quality === "low" || data.quality === "medium" ? data.quality : "high",
             streamId: typeof data.streamId === "string" ? data.streamId : null,
             requestKeyFrame: data.requestKeyFrame === true,
             ...(data.bitrate === undefined
               ? {}
-              : { bitrate: videoBitrateSchema.parse(data.bitrate) }),
+              : { bitrate: videoRequestBitrateSchema.parse(data.bitrate) }),
             ...(data.fps === undefined ? {} : { fps: videoFrameRateSchema.parse(data.fps) }),
             afterSequence: Number(data.afterSequence ?? 0),
             waitMs: Number(data.waitMs ?? 250),

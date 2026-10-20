@@ -76,6 +76,74 @@ function fixture(hierarchy?: Parameters<typeof bindBrowserToolbarMenuWeb>[5]) {
 }
 
 describe("local toolbar menu keyboard and dismissal", () => {
+  it("Right Arrow activates the focused branch and respects its disabled state", () => {
+    const fallback = vi.fn();
+    const f = fixture({ openSubmenu: fallback });
+    const click = vi.fn();
+    Object.assign(f.items[0]!, {
+      click,
+      getAttribute: (name: string) => (name === "aria-expanded" ? "false" : null),
+    });
+    const event = f.event("ArrowRight", f.items[0]);
+    f.listeners.get("keydown")!(event);
+    expect(click).toHaveBeenCalledOnce();
+    expect(fallback).not.toHaveBeenCalled();
+    Object.assign(f.items[0]!, {
+      getAttribute: (name: string) => (name === "aria-disabled" ? "true" : "false"),
+    });
+    f.listeners.get("keydown")!(event);
+    expect(click).toHaveBeenCalledOnce();
+    f.dispose();
+  });
+
+  it("Back can restore the branch that opened a deeper page", () => {
+    const f = fixture();
+    f.dispose();
+    const target = f.items[2]!;
+    Object.assign(target, {
+      getAttribute: (name: string) => (name === "aria-label" ? "Video bitrate" : null),
+    });
+    const dispose = bindBrowserToolbarMenuWeb(
+      f.menu,
+      f.triggerButton,
+      f.close,
+      () => false,
+      undefined,
+      { initialFocusLabel: "Video bitrate" },
+    );
+    expect(f.doc.activeElement).toBe(target);
+    dispose();
+  });
+
+  it("custom-size fields keep caret keys and internal Tab navigation, then exit the menu", () => {
+    const back = vi.fn();
+    const f = fixture({ back });
+    const width = f.items[0]!;
+    const height = f.items[2]!;
+    const form = { querySelectorAll: () => [width, height] };
+    for (const field of [width, height]) {
+      Object.assign(field, {
+        closest: (selector: string) => (selector === '[role="group"]' ? form : f.menu),
+      });
+    }
+    for (const key of ["ArrowLeft", "ArrowRight", "Home", "End", "ArrowUp", "ArrowDown"]) {
+      const event = f.event(key, width);
+      f.listeners.get("keydown")!(event);
+      expect(event.preventDefault).not.toHaveBeenCalled();
+    }
+    expect(back).not.toHaveBeenCalled();
+    f.listeners.get("keydown")!(f.event("Tab", width));
+    expect(f.doc.activeElement).toBe(height);
+    expect(f.close).not.toHaveBeenCalled();
+    f.listeners.get("keydown")!({ ...f.event("Tab", height), shiftKey: true });
+    expect(f.doc.activeElement).toBe(width);
+    f.listeners.get("keydown")!(f.event("Tab", height));
+    expect(f.close).toHaveBeenCalledOnce();
+    f.listeners.get("keydown")!(f.event("Escape", width));
+    expect(back).toHaveBeenCalledOnce();
+    f.dispose();
+  });
+
   it("Tab and Shift+Tab exit through the surrounding host controls", () => {
     for (const backwards of [false, true]) {
       const f = fixture();

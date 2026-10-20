@@ -1,6 +1,6 @@
 /** Source, document and geometry validity of a viewer frame, shared by the panel and its tests. */
 import type { BrowserState } from "../shared/browser";
-import type { BrowserFrameAuthority, BrowserVideoPacket } from "../shared/browser-video";
+import type { BrowserFrameAuthority, BrowserVideoMetadata } from "../shared/browser-video";
 
 export function isFrameCurrent(frame: BrowserFrameAuthority, state: BrowserState): boolean {
   return (
@@ -30,7 +30,7 @@ export interface VideoSourceContext {
  */
 export function isVideoSourceCurrent(
   context: VideoSourceContext,
-  packet: BrowserVideoPacket,
+  packet: BrowserVideoMetadata,
   epoch: number,
 ): boolean {
   return (

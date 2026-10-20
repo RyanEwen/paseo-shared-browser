@@ -471,3 +471,34 @@ it("serializes native paints while keeping only the newest waiting frame", async
   expect(f.closed).toEqual([2000, 1000, 3000]);
   f.decoder.close();
 });
+
+it("keeps an independent PyroWave decoder across gaps and coalesces only unsubmitted pictures", () => {
+  const f = fixture();
+  const pyro = (sequence: number, generation = 1) => ({
+    ...packet(sequence, "key", generation),
+    codec: "pyrowave",
+  });
+  try {
+    f.decoder.receive(pyro(1), 1);
+    f.pressure(4);
+    f.decoder.receive(pyro(3), 1);
+    f.decoder.receive(pyro(7), 1);
+    expect(f.codecs()).toBe(1);
+    expect(f.decoded).toHaveLength(1);
+    f.pressure(0);
+    f.drain();
+    expect(f.decoded).toHaveLength(2);
+    f.output(7000);
+    f.output(1000);
+    f.paint();
+    expect(f.presented).toEqual([7]);
+    expect(f.keys()).toBe(0);
+    f.decoder.receive(pyro(8, 2), 1);
+    expect(f.codecs()).toBe(2);
+    f.output(7000, 0);
+    f.paint();
+    expect(f.presented).toEqual([7]);
+  } finally {
+    f.decoder.close();
+  }
+});

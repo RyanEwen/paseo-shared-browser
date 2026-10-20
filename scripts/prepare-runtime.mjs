@@ -2,20 +2,15 @@ import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { access, chmod, cp, lstat, mkdir, readdir, rm, symlink, writeFile } from "node:fs/promises";
-import { createRequire } from "node:module";
 import { arch, homedir, platform, userInfo } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { build } from "esbuild";
+import { resolveDependencyRoot } from "./dependency-root.mjs";
+import { stageMediaRuntime } from "./media-runtime.mjs";
 import { replaceRuntime } from "./replace-runtime.mjs";
-
-const require = createRequire(import.meta.url);
-
-function resolveDependencyRoot(packageName) {
-  const packageJsonPath = require.resolve(`${packageName}/package.json`);
-  return dirname(packageJsonPath);
-}
+import { stageWaylandRuntime } from "./wayland-runtime.mjs";
 
 const execFileAsync = promisify(execFile);
 const expectedVersion = "0.38.2";
@@ -74,6 +69,7 @@ async function bundleRuntimeEntries() {
     entryPoints: {
       supervisor: supervisorEntry,
       "shared-browser-mcp": mcpEntry,
+      "browser-media-worker": join(projectRoot, "server/browser-media-worker-entry.ts"),
     },
     outdir: stagingRoot,
     outExtension: { ".js": ".cjs" },
@@ -237,7 +233,33 @@ if (binaryOverride)
   );
 await validateAgentBrowser(await requireExecutable(runtimeEntry, "Packaged agent-browser entry"));
 const chromiumEntry = await installChromium();
+// A host may provision this optional dependency privately without system-package
+// changes. Keep its executable and license files with the immutable runtime.
+if (hostPlatform === "linux") {
+  const privateDisplayRoot = join(pluginDataRoot, "native-display");
+  if (
+    await access(join(privateDisplayRoot, "usr", "bin", "Xvfb"), constants.X_OK).then(
+      () => true,
+      () => false,
+    )
+  ) {
+    await cp(privateDisplayRoot, join(stagingRoot, "xvfb"), { recursive: true });
+  }
+}
 await bundleRuntimeEntries();
+await stageWaylandRuntime({ pluginDataRoot, stagingRoot, platform: hostPlatform, arch: hostArch });
+const mediaReady = await stageMediaRuntime({
+  projectRoot,
+  pluginDataRoot,
+  stagingRoot,
+  platform: hostPlatform,
+  arch: hostArch,
+});
+console.log(
+  mediaReady
+    ? "Qualified optional PyroWave LAN assets staged"
+    : "Compatible video ready; optional PyroWave native assets are unavailable",
+);
 
 await writeFile(
   join(stagingRoot, "package.json"),

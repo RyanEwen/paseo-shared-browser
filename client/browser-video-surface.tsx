@@ -7,6 +7,8 @@ import type { BrowserVideoCodec, BrowserVideoDecodeEnvironment } from "./browser
 import { type EncodedVideoHandle, getEncodedVideoComponent } from "./browser-video-host";
 import * as Web from "./web";
 
+export { createBrowserMediaEnvironment, supportsBrowserMedia } from "./web";
+
 interface NativeNode {
   native: true;
   handle: EncodedVideoHandle;

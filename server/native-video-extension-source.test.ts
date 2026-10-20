@@ -1,7 +1,102 @@
 /** Exercise the actual trusted helper program's producer bounds without a fake duplicate policy. */
 import { createContext, runInContext } from "node:vm";
 import { expect, it, vi } from "vitest";
+import { nativeVideoSynchronousTimers } from "../tests/fixtures/native-video-timers";
 import { NATIVE_VIDEO_EXTENSION_SOURCE } from "./native-video-extension-source";
+
+it("bounds codec-active frames even when encodeQueueSize is zero and retains their generation until output", async () => {
+  let deliver: (result: unknown) => void = () => {};
+  const packets: { sequence: number; captureGeneration: number; timestampUs: number }[] = [];
+  const submitted: number[] = [];
+  let output: (chunk: unknown, metadata: unknown) => void = () => {};
+  const reader = {
+    read: () =>
+      new Promise((resolve) => {
+        deliver = resolve;
+      }),
+    cancel: async () => {
+      deliver({ done: true });
+    },
+  };
+  class SlowEncoder {
+    // Native encodes leave the JS queue immediately but complete later.
+    encodeQueueSize = 0;
+    static async isConfigSupported() {
+      return { supported: true };
+    }
+    constructor(callbacks: { output: typeof output }) {
+      output = callbacks.output;
+    }
+    configure() {}
+    close() {}
+    reset() {}
+    encode(frame: { timestamp: number }) {
+      submitted.push(frame.timestamp);
+    }
+  }
+  const context = createContext({
+    ...nativeVideoSynchronousTimers,
+    chrome: {
+      debugger: { getTargets: async () => [{ id: "exact", type: "page", tabId: 7 }] },
+      tabCapture: { getMediaStreamId: async () => "exact-stream" },
+    },
+    navigator: {
+      mediaDevices: {
+        getUserMedia: async () => ({
+          getVideoTracks: () => [{ getSettings: () => ({ width: 1280, height: 800 }) }],
+          getTracks: () => [{ stop() {} }],
+        }),
+      },
+    },
+    MediaStreamTrackProcessor: class {
+      readable = { getReader: () => reader };
+    },
+    VideoEncoder: SlowEncoder,
+    nativeVideoPacket: (json: string) => packets.push(JSON.parse(json)),
+    performance: { now: () => 100 },
+    btoa: (text: string) => Buffer.from(text, "binary").toString("base64"),
+  });
+  runInContext(NATIVE_VIDEO_EXTENSION_SOURCE, context);
+  await runInContext('startCapture("exact",1280,800,1)', context);
+  await runInContext('addEncoder("high","owned-stream")', context);
+  const frame = async (timestamp: number) => {
+    deliver({
+      value: { timestamp, displayWidth: 1280, displayHeight: 800, close() {} },
+      done: false,
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  };
+  const complete = (timestamp: number) =>
+    output(
+      {
+        timestamp,
+        type: "key",
+        byteLength: 10,
+        copyTo: (bytes: Uint8Array) => bytes.fill(1),
+      },
+      {},
+    );
+  try {
+    for (let i = 0; i < 12; i++) await frame(100000 + i * 40000);
+    expect(submitted).toEqual([100000, 140000]);
+    complete(100000);
+    expect(packets).toMatchObject([{ captureGeneration: 1, timestampUs: 100000 }]);
+    await frame(600000);
+    expect(submitted).toHaveLength(2); // One encode plus one unacknowledged output occupies both slots.
+    runInContext('acknowledge("owned-stream",1)', context);
+    await frame(640000);
+    expect(submitted).toEqual([100000, 140000, 640000]);
+    await runInContext("resetCapture(2,700000)", context);
+    complete(140000);
+    complete(640000);
+    expect(packets).toHaveLength(1); // Late outputs remain fenced after document replacement.
+    await frame(800000);
+    complete(800000);
+    expect(packets.at(-1)).toMatchObject({ captureGeneration: 2, timestampUs: 800000 });
+  } finally {
+    await runInContext("stopCapture()", context);
+  }
+});
 
 it("oversize closes only that encoder, and repeated source frames cannot restart expensive keys", async () => {
   const packets: { error?: string; streamId?: string }[] = [];
@@ -58,6 +153,7 @@ it("oversize closes only that encoder, and repeated source frames cannot restart
     }
   }
   const context = createContext({
+    ...nativeVideoSynchronousTimers,
     chrome: {
       debugger: { getTargets: async () => [{ id: "exact", type: "page", tabId: 7 }] },
       tabCapture: { getMediaStreamId: async () => "exact-stream" },
@@ -166,6 +262,7 @@ it.each([
   (width, height, nativeWidth, nativeHeight) => {
     const frames: unknown[] = [];
     const context = createContext({
+      ...nativeVideoSynchronousTimers,
       VideoFrame: class {
         constructor(
           readonly source: unknown,

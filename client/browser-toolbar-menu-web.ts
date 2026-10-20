@@ -7,6 +7,7 @@ interface FocusNode {
   getAttribute(name: string): string | null;
   getClientRects?(): ArrayLike<unknown>;
   closest?(selector: string): unknown;
+  click?(): void;
 }
 interface MenuNode extends FocusNode {
   querySelectorAll(selector: string): ArrayLike<FocusNode>;
@@ -32,7 +33,13 @@ export function bindBrowserToolbarMenuWeb(
   close: () => void,
   restoreFocus: () => boolean,
   overlay?: unknown,
-  hierarchy?: { openSubmenu?(): void; back?(): void; closeRoot?(): void; nested?: boolean },
+  hierarchy?: {
+    openSubmenu?(): void;
+    back?(): void;
+    closeRoot?(): void;
+    nested?: boolean;
+    initialFocusLabel?: string;
+  },
 ): () => void {
   if (Platform.OS !== "web" || !node || typeof node !== "object" || !("ownerDocument" in node)) {
     return () => {};
@@ -40,13 +47,21 @@ export function bindBrowserToolbarMenuWeb(
   const menu = node as MenuNode;
   const anchor = trigger as MenuNode | null;
   const enabledItems = () =>
-    Array.from(menu.querySelectorAll('[role="menuitem"]')).filter(
+    Array.from(
+      menu.querySelectorAll(
+        '[role="menuitem"], [role="group"] input, [role="group"] [role="button"]',
+      ),
+    ).filter(
       (item) =>
         item.getAttribute("aria-disabled") !== "true" &&
         item.getAttribute("disabled") === null &&
         (!item.closest || item.closest('[role="menu"]') === menu),
     );
-  enabledItems()[0]?.focus();
+  const initialItems = enabledItems();
+  (
+    initialItems.find((item) => item.getAttribute("aria-label") === hierarchy?.initialFocusLabel) ??
+    initialItems[0]
+  )?.focus();
   let focusOwned = menu.contains(menu.ownerDocument.activeElement);
   let returnTarget: FocusNode | null = null;
   const focusin = (event: MenuEvent) => {
@@ -56,6 +71,25 @@ export function bindBrowserToolbarMenuWeb(
   const keydown = (event: MenuEvent) => {
     if (!menu.contains(event.target)) return;
     const target = event.target as FocusNode;
+    // A small form inside a menu keeps normal field navigation. Consume internal
+    // Tab steps here so the root does not dismiss a nested custom-size form.
+    const form = target.closest?.('[role="group"]') as MenuNode | undefined;
+    if (event.key === "Tab" && form?.querySelectorAll) {
+      const fields = Array.from(
+        form.querySelectorAll('input, [role="textbox"], button, [role="button"]'),
+      ).filter(
+        (item) =>
+          item.getAttribute("disabled") === null && item.getAttribute("aria-disabled") !== "true",
+      );
+      const index = fields.indexOf(target);
+      const next = fields[index + (event.shiftKey ? -1 : 1)];
+      if (index >= 0 && next) {
+        event.preventDefault();
+        event.stopPropagation();
+        next.focus();
+        return;
+      }
+    }
     // Only the root owns Tab exit. Its host-order calculation excludes the
     // entire popup, and its cleanup performs the one final focus restoration.
     if (event.key === "Tab" && hierarchy?.nested) return;
@@ -63,14 +97,16 @@ export function bindBrowserToolbarMenuWeb(
     if (
       event.key === "ArrowRight" &&
       target.getAttribute("aria-expanded") !== null &&
-      hierarchy?.openSubmenu
+      (target.click || hierarchy?.openSubmenu)
     ) {
       event.preventDefault();
       event.stopPropagation();
-      hierarchy.openSubmenu();
+      if (target.getAttribute("aria-disabled") === "true") return;
+      if (target.click) target.click();
+      else hierarchy?.openSubmenu?.();
       return;
     }
-    if ((event.key === "ArrowLeft" || event.key === "Escape") && hierarchy?.back) {
+    if (((event.key === "ArrowLeft" && !form) || event.key === "Escape") && hierarchy?.back) {
       event.preventDefault();
       event.stopPropagation();
       hierarchy.back();
@@ -107,6 +143,8 @@ export function bindBrowserToolbarMenuWeb(
       return;
     }
     if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key ?? "")) return;
+    // Text inputs own caret movement and numeric arrow keys.
+    if (form) return;
     event.preventDefault();
     event.stopPropagation();
     const items = enabledItems();

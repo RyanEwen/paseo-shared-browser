@@ -28,6 +28,7 @@ async function fixture(lingerSnapshots: number | null) {
       return id;
     }),
     selectTarget: vi.fn(async () => {}),
+    releaseTarget: vi.fn(async () => {}),
   };
   const owned = {
     runtimeId: "review-runtime",
@@ -94,4 +95,42 @@ it("preserves the existing last-tab refusal", async () => {
     "last browser tab",
   );
   expect(f.native.closeTarget).not.toHaveBeenCalled();
+});
+
+it("retires the launch-page controller without selecting or reconfiguring its survivor", async () => {
+  const f = await fixture(0);
+  f.owned.rootTargetId = "closing";
+  const survivor = {
+    identity: vi.fn(async () => ({ targetId: "root", width: 1280, height: 800 })),
+    shutdown: vi.fn(async () => {}),
+  };
+  f.owned.tabs.set("root", Promise.resolve(survivor) as never);
+  await f.owner.request(f.owned, "tabs.close", { targetId: "closing" });
+  expect(f.native.releaseTarget).toHaveBeenCalledTimes(1);
+  expect(f.native.selectTarget).not.toHaveBeenCalled();
+  expect(survivor.shutdown).not.toHaveBeenCalled();
+  expect(f.owned.rootTargetId).toBeNull();
+  // Untargeted compatibility requests and explicit viewer requests reuse the same controller.
+  for (const input of [null, { targetId: "root" }]) {
+    await expect(f.owner.request(f.owned, "identity", input)).resolves.toMatchObject({
+      targetId: "root",
+      width: 1280,
+      height: 800,
+    });
+  }
+  expect(survivor.identity).toHaveBeenCalledTimes(2);
+});
+
+it("keeps an unconfirmed launch-page close pinned to its original target", async () => {
+  const f = await fixture(null);
+  f.owned.rootTargetId = "closing";
+  const outcome = f.owner
+    .request(f.owned, "tabs.close", { targetId: "closing" })
+    .catch((error) => String(error));
+  await vi.runAllTimersAsync();
+  expect(await outcome).toContain("Browser tab close could not be confirmed");
+  expect(f.owned.rootTargetId).toBe("closing");
+  expect(f.native.releaseTarget).toHaveBeenCalledTimes(1);
+  expect(f.native.closeTarget).toHaveBeenCalledTimes(1);
+  expect(f.native.selectTarget).not.toHaveBeenCalled();
 });

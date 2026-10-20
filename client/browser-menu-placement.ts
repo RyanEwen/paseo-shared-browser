@@ -6,6 +6,16 @@ export interface MenuRect {
   height: number;
 }
 
+/** A narrow split pane needs Back navigation even when its host window is desktop-sized. */
+export function browserMenuUsesBackNavigation(
+  paneWidth: number,
+  compact: boolean,
+  platform: string,
+): boolean {
+  // Leave room for the root, flyout, margins, and adjacent toolbar buttons.
+  return compact || platform !== "web" || paneWidth < 640;
+}
+
 /** Anchor to the trigger's right edge and prefer below, with bounded internal scrolling. */
 export function browserMenuPlacement(
   pane: { width: number; height: number },

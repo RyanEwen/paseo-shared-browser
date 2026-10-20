@@ -2,6 +2,12 @@ import { randomBytes } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import type { RpcInput, RpcOutput } from "@getpaseo/plugin";
 import {
+  DOM_SNAPSHOT_TTL_MS,
+  domActionInputSchema,
+  domEvaluateInputSchema,
+  domSnapshotSchema,
+} from "../shared/agent-dom";
+import {
   type applyDevicePresetRpc,
   type BrowserFrame,
   type BrowserGestureEvent,
@@ -30,6 +36,8 @@ import {
   type updateBrowserGestureRpc,
   type Viewport,
 } from "../shared/browser";
+import type { browserDisplayDemandRpc } from "../shared/browser-display-demand";
+import { browserGraphicsStateSchema } from "../shared/browser-graphics";
 import {
   type BrowserFrameAuthority,
   type BrowserVideoReadInput,
@@ -58,6 +66,7 @@ import { runtimeVideoPacketSchema } from "./native-video-packet";
 import { NAVIGATION_METADATA_TIMEOUT_MS } from "./navigation-budget";
 import { type JsonValue, RuntimeProtocolError } from "./runtime-protocol";
 import { createViewerCaptureLifetime, type ViewerCaptureLifetime } from "./viewer-capture-lifetime";
+import { createViewerDisplayDemand, type ViewerDisplayDemand } from "./viewer-display-demand";
 export type WorkspaceValidator = (workspaceId: string) => Promise<void | boolean>;
 type CaptureReply = Omit<RpcOutput<typeof captureBrowserRpc>, "state"> & {
   state: BrowserState;
@@ -132,6 +141,7 @@ interface FrameObservation {
   observedAtMonotonicMs?: number;
 }
 interface BrowserSession {
+  displayDemand?: ViewerDisplayDemand;
   key: string;
   workspaceId: string;
   tabId: string | null;
@@ -141,6 +151,8 @@ interface BrowserSession {
   bridgeEpoch: number;
   viewport: Viewport;
   captureScale: number;
+  videoCaptureEnabled?: boolean;
+  graphics?: import("../shared/browser-graphics").BrowserGraphicsState;
   navigationGeneration: number;
   viewportGeneration: number;
   devicePresetId: DevicePresetId | null;
@@ -159,6 +171,10 @@ interface BrowserSession {
     }
   >;
   recentFrames: Map<string, FrameObservation>;
+  domSnapshots: Map<
+    string,
+    { snapshotId: string; state: BrowserState; inputGeneration: string; expiresAt: number }
+  >;
   lastUrl: string;
   lastTitle: string;
   canGoBack: boolean;
@@ -338,6 +354,7 @@ export class SessionManager {
       if (candidate.workspaceId !== lost.workspaceId) continue;
       candidate.archived = true;
       candidate.videoLifetime?.cancel();
+      candidate.displayDemand?.dispose();
       await this.cancelGesture(candidate);
       for (const token of candidate.viewers.keys()) this.viewerSessions.delete(token);
       candidate.viewers.clear();
@@ -381,7 +398,9 @@ export class SessionManager {
     if (!session) return { detached: false };
     return this.serialize(session, async () => {
       this.pruneExpired(session);
+      session.domSnapshots.delete(viewerToken);
       const detached = session.viewers.delete(viewerToken);
+      session.displayDemand?.remove(viewerToken);
       this.viewerSessions.delete(viewerToken);
       if (session.controller?.viewerToken === viewerToken) {
         await this.cancelGesture(session);
@@ -478,6 +497,7 @@ export class SessionManager {
       await this.request(session, "tabs.close", { targetId: input.tabId });
       session.archived = true;
       session.videoLifetime?.cancel();
+      session.displayDemand?.dispose();
       for (const [token, expiresAt] of this.closedViewerTabs) {
         if (expiresAt <= this.now()) this.closedViewerTabs.delete(token);
       }
@@ -506,6 +526,7 @@ export class SessionManager {
       );
       for (const candidate of workspaceSessions) {
         candidate.videoLifetime?.cancel();
+        candidate.displayDemand?.dispose();
         await this.cancelGesture(candidate);
         candidate.archived = true;
         for (const token of candidate.viewers.keys()) {
@@ -562,6 +583,7 @@ export class SessionManager {
       if (session.workspaceId !== workspaceId) continue;
       session.archived = true;
       session.videoLifetime?.cancel();
+      session.displayDemand?.dispose();
       await this.cancelGesture(session);
       for (const token of session.viewers.keys()) this.viewerSessions.delete(token);
       session.viewers.clear();
@@ -644,23 +666,85 @@ export class SessionManager {
     });
   }
 
+  /** Register view-only physical image demand. The viewer token binds its tab;
+   * complete source fences reject late reports without acquiring browser control. */
+  async reportDisplayDemand(
+    input: RpcInput<typeof browserDisplayDemandRpc>,
+  ): Promise<RpcOutput<typeof browserDisplayDemandRpc>> {
+    const session = this.requireViewer(input.viewerToken);
+    return this.serialize(session, async () => {
+      if (this.requireViewer(input.viewerToken) !== session || session.archived)
+        throw new Error("Browser viewer changed");
+      const expected = input.expected;
+      const accepted =
+        expected.sessionId === session.sessionId &&
+        expected.runtimeId === session.runtimeId &&
+        expected.bridgeEpoch === session.bridgeEpoch &&
+        expected.navigationGeneration === session.navigationGeneration &&
+        expected.viewportGeneration === session.viewportGeneration &&
+        !session.runtimeLost;
+      if (accepted) {
+        this.heartbeatViewer(session, input.viewerToken);
+        this.displayDemandFor(session).report(input.viewerToken, input.display);
+      }
+      return { state: this.projectState(session, input.viewerToken), accepted };
+    });
+  }
+
+  /** Lazy demand ownership leaves legacy/agent-only sessions at their explicit density. */
+  private displayDemandFor(session: BrowserSession): ViewerDisplayDemand {
+    session.displayDemand ??= createViewerDisplayDemand({
+      now: this.now,
+      viewport: () => session.viewport,
+      density: () => session.captureScale,
+      current: () =>
+        this.sessions.get(session.key) === session && !session.archived && !session.runtimeLost,
+      viewerCurrent: (token) => (session.viewers.get(token)?.expiresAt ?? 0) > this.now(),
+      apply: (density) =>
+        this.serialize(session, async () => {
+          if (this.sessions.get(session.key) !== session || session.archived || session.runtimeLost)
+            return true;
+          this.pruneExpired(session);
+          if (session.gesture || session.displayDemand?.target() !== density) return false;
+          if (!canUseCaptureDensity(session.viewport, density)) return true;
+          await this.applySourceDensity(session, density);
+          if (session.notice === "Browser image scaling could not update.") session.notice = null;
+          return true;
+        }),
+      failed: () => {
+        session.notice ??= "Browser image scaling could not update.";
+      },
+    });
+    return session.displayDemand;
+  }
+
+  /** Serialized source-only transition; callers own gesture admission and control policy. */
+  private async applySourceDensity(session: BrowserSession, density: 1 | 2): Promise<void> {
+    if (session.captureScale === density) return;
+    const preset = DEVICE_PRESETS.find(({ id }) => id === session.devicePresetId);
+    await this.request(session, "capture.density", {
+      density,
+      deviceScaleFactor: preset?.deviceScaleFactor ?? 1,
+    });
+    session.captureScale = density;
+    session.viewportGeneration += 1;
+    this.invalidateFrames(session);
+  }
+
   /** Change physical density without navigating, switching input mode, or resizing CSS layout. */
   async setCaptureDensity(input: DensityInput): Promise<{ state: BrowserState }> {
     const session = this.requireViewer(input.viewerToken);
     return this.serialize(session, async () => {
       this.requireMutationAccess(session, input);
+      const automaticDensity = session.displayDemand?.target();
+      if (automaticDensity != null && automaticDensity !== input.density)
+        throw new Error("Image detail follows the active viewers' displays");
       if (!canUseCaptureDensity(session.viewport, input.density))
         throw new RangeError("Capture density exceeds the supported image bounds");
       if (session.captureScale !== input.density) {
         await this.cancelGesture(session);
-        const preset = DEVICE_PRESETS.find(({ id }) => id === session.devicePresetId);
-        await this.request(session, "capture.density", {
-          density: input.density,
-          deviceScaleFactor: preset?.deviceScaleFactor ?? 1,
-        });
-        session.captureScale = input.density;
-        session.viewportGeneration += 1;
-        this.invalidateFrames(session);
+        await this.applySourceDensity(session, input.density);
+        session.displayDemand?.refresh();
       }
       this.renewController(session, input.viewerToken);
       return { state: await this.snapshotState(session, input.viewerToken) };
@@ -695,6 +779,7 @@ export class SessionManager {
     try {
       const raw = asRecord(
         await this.request(session, "video.read", {
+          ...(input.codec === undefined ? {} : { codec: input.codec }),
           quality: input.quality,
           ...(input.bitrate === undefined ? {} : { bitrate: input.bitrate }),
           ...(input.fps === undefined ? {} : { fps: input.fps }),
@@ -892,7 +977,12 @@ export class SessionManager {
       await this.cancelGesture(session);
       assertViewport(input.viewport);
       const preserveEmulation = input.preserveEmulation === true;
-      const captureScale = input.captureDensity ?? (preserveEmulation ? session.captureScale : 1);
+      // Resolve automatic detail against the proposed CSS viewport before validating
+      // physical bounds. A previous 2x source must not prevent a larger layout.
+      const captureScale =
+        session.displayDemand?.targetFor(input.viewport) ??
+        input.captureDensity ??
+        (preserveEmulation ? session.captureScale : 1);
       if (
         input.viewport.width * captureScale > MAX_VIEWPORT.width ||
         input.viewport.height * captureScale > MAX_VIEWPORT.height
@@ -920,6 +1010,7 @@ export class SessionManager {
           platform: preset?.platform ?? "",
         });
         session.viewport = { ...input.viewport };
+        session.displayDemand?.refresh();
         session.captureScale = captureScale;
         if (!preserveEmulation) {
           session.devicePresetId = null;
@@ -943,7 +1034,9 @@ export class SessionManager {
       // Resolve the display under the session lock. A mode toggle must neither
       // replay remembered dimensions nor change the capture's pixel resolution.
       const viewport = input.preserveDisplay ? session.viewport : preset.viewport;
-      const captureScale = input.preserveDisplay ? session.captureScale : preset.captureScale;
+      const captureScale =
+        session.displayDemand?.targetFor(viewport) ??
+        (input.preserveDisplay ? session.captureScale : preset.captureScale);
       await this.request(session, "emulate", {
         width: viewport.width,
         height: viewport.height,
@@ -955,6 +1048,7 @@ export class SessionManager {
         platform: preset.platform,
       });
       session.viewport = { ...viewport };
+      session.displayDemand?.refresh();
       session.devicePresetId = preset.id;
       session.captureScale = captureScale;
       session.userAgent = preset.userAgent;
@@ -964,6 +1058,91 @@ export class SessionManager {
       this.invalidateFrames(session);
       this.renewController(session, input.viewerToken);
       return { state: await this.snapshotState(session, input.viewerToken) };
+    });
+  }
+
+  /** Agent-only semantic observations are independent of screenshot receipt consumption. */
+  async domSnapshot(viewerToken: string) {
+    const session = this.requireViewer(viewerToken);
+    return this.serialize(session, async () => {
+      if (this.policyForViewer(session, viewerToken).kind !== "agent")
+        throw new Error("Agent viewer required");
+      this.heartbeatViewer(session, viewerToken);
+      await this.refreshPageMetadata(session);
+      const generation = session.inputGeneration;
+      if (!generation) throw new Error("Browser document identity is unavailable");
+      const expiresAt = this.now() + DOM_SNAPSHOT_TTL_MS;
+      const snapshot = domSnapshotSchema.parse(
+        await this.request(session, "dom.snapshot", { expectedInputGeneration: generation }),
+      );
+      await this.refreshPageMetadata(session);
+      if (generation !== session.inputGeneration || expiresAt <= this.now())
+        throw new Error("Browser changed during DOM snapshot");
+      const state = this.projectState(session, viewerToken);
+      session.domSnapshots.set(viewerToken, {
+        snapshotId: snapshot.snapshotId,
+        state,
+        inputGeneration: generation,
+        expiresAt,
+      });
+      return { state, ...snapshot, expiresAt: new Date(expiresAt).toISOString() };
+    });
+  }
+
+  /** Both element mutation and pure inspection require a current controller and document receipt. */
+  async domOperation(
+    viewerToken: string,
+    controlToken: string,
+    operation: "dom.action" | "dom.evaluate",
+    input: JsonValue,
+  ) {
+    const data =
+      operation === "dom.action"
+        ? domActionInputSchema.parse(input)
+        : domEvaluateInputSchema.parse(input);
+    const session = this.requireViewer(viewerToken);
+    return this.serialize(session, async () => {
+      if (this.policyForViewer(session, viewerToken).kind !== "agent")
+        throw new Error("Agent viewer required");
+      const receipt = session.domSnapshots.get(viewerToken);
+      if (!receipt || receipt.snapshotId !== data.snapshotId || receipt.expiresAt <= this.now())
+        throw new Error("DOM snapshot is stale; take a fresh snapshot in the selected tab");
+      const access = { viewerToken, controlToken, expected: receipt.state };
+      this.requireMutationAccess(session, access);
+      await this.refreshPageMetadata(session);
+      this.requireMutationAccess(session, access);
+      if (receipt.inputGeneration !== session.inputGeneration)
+        throw new Error("DOM document was replaced");
+      await this.cancelGesture(session);
+      const gestureId = this.issueUniqueToken();
+      let result: JsonValue = null;
+      try {
+        await runWithInputCleanup(
+          async () => {
+            await this.request(session, "input.begin", {
+              gestureId,
+              expectedInputGeneration: receipt.inputGeneration,
+            });
+            this.requireMutationAccess(session, access);
+            result = await this.request(session, operation, {
+              ...data,
+              gestureId,
+              expectedInputGeneration: receipt.inputGeneration,
+            });
+          },
+          () => this.request(session, "input.end", { gestureId }),
+        );
+      } catch (error) {
+        if (operation === "dom.action") session.domSnapshots.delete(viewerToken);
+        throw error;
+      } finally {
+        if (operation === "dom.action") {
+          this.invalidateFrames(session);
+          await this.request(session, "video.invalidate", null).catch(() => undefined);
+        }
+      }
+      this.renewController(session, viewerToken);
+      return { state: await this.snapshotState(session, viewerToken), result };
     });
   }
 
@@ -1331,6 +1510,7 @@ export class SessionManager {
     this.lifecycleGeneration += 1;
     for (const session of this.sessions.values()) {
       session.videoLifetime?.cancel();
+      session.displayDemand?.dispose();
       void this.cancelGesture(session);
     }
     this.sessions.clear();
@@ -1443,11 +1623,18 @@ export class SessionManager {
         devicePresetId: null,
         userAgent,
         defaultUserAgent: userAgent,
+        ...(typeof identity.videoCaptureEnabled === "boolean"
+          ? { videoCaptureEnabled: identity.videoCaptureEnabled }
+          : {}),
+        ...(browserGraphicsStateSchema.safeParse(identity.graphics).success
+          ? { graphics: browserGraphicsStateSchema.parse(identity.graphics) }
+          : {}),
         viewers: new Map(),
         controller: null,
         mutationTail: Promise.resolve(),
         frameCache: new Map(),
         recentFrames: new Map(),
+        domSnapshots: new Map(),
         frameRevision: 0,
         videoNotBefore: null,
         videoInputNotBefore: null,
@@ -1567,7 +1754,9 @@ export class SessionManager {
     const now = this.now();
     for (const [token, viewer] of session.viewers)
       if (viewer.expiresAt <= now) {
+        session.domSnapshots.delete(token);
         session.viewers.delete(token);
+        session.displayDemand?.remove(token);
         this.viewerSessions.delete(token);
       }
     if (
@@ -2066,6 +2255,10 @@ export class SessionManager {
       canGoForward: session.canGoForward,
       viewport: { ...session.viewport },
       captureScale: session.captureScale,
+      ...(session.videoCaptureEnabled === undefined
+        ? {}
+        : { videoCaptureEnabled: session.videoCaptureEnabled }),
+      ...(session.graphics ? { graphics: session.graphics } : {}),
       navigationGeneration: session.navigationGeneration,
       viewportGeneration: session.viewportGeneration,
       devicePresetId: session.devicePresetId,

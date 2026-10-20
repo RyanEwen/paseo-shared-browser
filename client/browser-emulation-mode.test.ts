@@ -59,14 +59,14 @@ describe("device defaults for shared emulation", () => {
       }),
     ).toBeNull();
   });
-  it("checks exact viewport and capture density in resolution selection", () => {
+  it("keeps the selected CSS preset checked when automatic capture detail changes", () => {
     const base = {
       devicePresetId: "pixel-7-sharp" as const,
       viewport: { width: 412, height: 839 },
       captureScale: 2,
     };
     expect(matchingResolutionPresetId(base)).toBe("pixel-7-sharp");
-    expect(matchingResolutionPresetId({ ...base, captureScale: 1 })).toBeNull();
+    expect(matchingResolutionPresetId({ ...base, captureScale: 1 })).toBe("pixel-7-sharp");
     expect(
       matchingResolutionPresetId({ ...base, viewport: { width: 1920, height: 1200 } }),
     ).toBeNull();

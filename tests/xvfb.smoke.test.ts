@@ -73,6 +73,8 @@ async function harness(env: Record<string, string | undefined>, virtualDisplay?:
   const supervisor = new RuntimeSupervisor({
     owner: await createRuntimeOwner({
       initialUrl: `http://127.0.0.1:${address.port}/`,
+      // Isolate the retained image-only embedding opt-in from prepared video.
+      nativeVideo: false,
       ...(virtualDisplay === undefined ? {} : { virtualDisplay }),
     }),
   });

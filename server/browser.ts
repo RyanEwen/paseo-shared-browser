@@ -26,6 +26,7 @@ import type {
   setCaptureDensityRpc,
   updateBrowserGestureRpc,
 } from "../shared/browser";
+import type { browserDisplayDemandRpc } from "../shared/browser-display-demand";
 import type { BrowserVideoReadInput, BrowserVideoReadReply } from "../shared/browser-video";
 import { createBrowserOperationDiagnostics } from "./browser-operation-diagnostics";
 import { resolveBrowserRuntimeRoot } from "./runtime-path";
@@ -140,6 +141,9 @@ class RemoteBrowserManager {
   readVideo(input: BrowserVideoReadInput): Promise<BrowserVideoReadReply> {
     return this.requestBrowser<BrowserVideoReadReply>("video.read", input as unknown as JsonValue);
   }
+  status(viewerToken: string): Promise<{ state: import("../shared/browser").BrowserState }> {
+    return this.requestBrowser("status", { viewerToken });
+  }
 
   acquireControl(viewerToken: string, takeover: boolean): Promise<AcquireControlOutput> {
     return this.requestBrowser<AcquireControlOutput>("acquire-control", {
@@ -161,6 +165,12 @@ class RemoteBrowserManager {
 
   resize(input: ResizeInput): Promise<ResizeOutput> {
     return this.requestBrowser<ResizeOutput>("viewport", input as unknown as JsonValue);
+  }
+
+  reportDisplayDemand(
+    input: RpcInput<typeof browserDisplayDemandRpc>,
+  ): Promise<RpcOutput<typeof browserDisplayDemandRpc>> {
+    return this.requestBrowser("display-demand", input as unknown as JsonValue);
   }
 
   setCaptureDensity(input: DensityInput): Promise<DensityOutput> {
@@ -390,6 +400,13 @@ export async function handleResizeBrowser(input: ResizeInput): Promise<ResizeOut
   return (await getProductionManager()).resize(input);
 }
 
+/** Forward physical display needs through the authenticated supervisor policy. */
+export async function handleReportDisplayDemand(
+  input: RpcInput<typeof browserDisplayDemandRpc>,
+): Promise<RpcOutput<typeof browserDisplayDemandRpc>> {
+  return (await getProductionManager()).reportDisplayDemand(input);
+}
+
 export async function handleSetCaptureDensity(input: DensityInput): Promise<DensityOutput> {
   return (await getProductionManager()).setCaptureDensity(input);
 }
@@ -433,4 +450,11 @@ export async function handleReadBrowserVideo(
   input: BrowserVideoReadInput,
 ): Promise<BrowserVideoReadReply> {
   return (await getProductionManager()).readVideo(input);
+}
+
+/** Renew an existing viewer and reconcile source metadata without creating or replacing a browser. */
+export async function handleReadBrowserState(
+  viewerToken: string,
+): Promise<{ state: import("../shared/browser").BrowserState }> {
+  return (await getProductionManager()).status(viewerToken);
 }
