@@ -9,8 +9,10 @@ import type { BrowserFrame, BrowserState } from "../shared/browser";
 import {
   applyDevicePresetRpc,
   beginBrowserGestureRpc,
+  browserTabCloseScopeSchema,
   captureBrowserRpc,
   closeBrowserRpc,
+  closeBrowserTabRpc,
   endBrowserGestureRpc,
   MAX_BROWSER_PAGE_TARGETS,
   navigateBrowserRpc,
@@ -165,6 +167,8 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
         archiveWorkspace: (workspaceId) => this.archiveWorkspaceLocal(workspaceId).then(() => {}),
         closeWorkspace: (workspaceId, runtimeId) =>
           this.closeWorkspaceLocal(workspaceId, runtimeId),
+        closeLastTab: (workspaceId, runtimeId, tabId, onClosing) =>
+          this.closeWorkspaceLocal(workspaceId, runtimeId, { tabId, onClosing }),
         disconnect: () => {},
       },
       now: this.now,
@@ -411,11 +415,38 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
   }
 
   /** Stop the exact runtime confirmed by the viewer while keeping the workspace reusable. */
-  private closeWorkspaceLocal(workspaceId: string, runtimeId: string): Promise<void> {
+  private closeWorkspaceLocal(
+    workspaceId: string,
+    runtimeId: string,
+    finalTab?: { tabId: string; onClosing(): void },
+  ): Promise<void> {
+    const agent = this.agentRequestContext.getStore();
     return this.runWorkspaceOperation(workspaceId, async () => {
       const entry = this.workspaces.get(workspaceId);
       if (!entry || entry.runtime.runtimeId !== runtimeId)
         throw new RuntimeProtocolError("RUNTIME_FAILURE", "Browser runtime was replaced");
+      if (finalTab) {
+        // This check and stop share the same tail as tab creation/removal.
+        // Count every real page target, including transient print previews.
+        const targets = await this.owner.request(entry.runtime, "tabs.list", null);
+        const sole = Array.isArray(targets) && targets.length === 1 ? targets[0] : null;
+        if (
+          !sole ||
+          typeof sole !== "object" ||
+          Array.isArray(sole) ||
+          sole.targetId !== finalTab.tabId
+        )
+          throw new RuntimeProtocolError(
+            "INVALID_REQUEST",
+            "Browser tabs changed; refresh the tab list and confirm closing again",
+          );
+      }
+      if (agent) {
+        this.assertAgentBindingCurrent(agent.binding);
+        if (agent.binding.selectionRevision !== agent.selectionRevision)
+          throw new RuntimeProtocolError("AUTHENTICATION_FAILED", "Agent tab selection changed");
+      }
+      finalTab?.onClosing();
       this.invalidateAgentObservations(workspaceId);
       this.revokeAgentControl(workspaceId);
       await this.owner.stop(entry.runtime);
@@ -528,11 +559,7 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
         result = await this.browserPolicy.createTab(requireText(data, "viewerToken"));
         break;
       case "tabs.close":
-        result = await this.browserPolicy.closeTab({
-          viewerToken: requireText(data, "viewerToken"),
-          controlToken: requireText(data, "controlToken"),
-          tabId: requireText(data, "tabId"),
-        });
+        result = await this.browserPolicy.closeTab(closeBrowserTabRpc.input.parse(data));
         break;
       case "close":
         result = await this.browserPolicy.closeBrowser(closeBrowserRpc.input.parse(data));
@@ -802,12 +829,23 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
       if (!viewerToken || !controlToken || !tabId) {
         throw new RuntimeProtocolError("AUTHENTICATION_FAILED", "Agent does not control a tab");
       }
-      await this.browserPolicy.closeTab({ viewerToken, controlToken, tabId });
+      const current = binding.lastState;
+      if (!current?.runtimeId)
+        throw new RuntimeProtocolError("INVALID_REQUEST", "Observe the selected browser tab first");
+      const result = await this.browserPolicy.closeTab({
+        viewerToken,
+        controlToken,
+        tabId,
+        sessionId: current.sessionId,
+        runtimeId: current.runtimeId,
+        scope: browserTabCloseScopeSchema.parse(data.scope ?? "tab"),
+      });
       binding.viewerToken = null;
       binding.tabId = null;
       binding.controlToken = null;
       binding.lastState = null;
       binding.lastFrame = null;
+      if (result.browserClosed) return result;
       const { tabs } = await this.browserPolicy.listTabs(binding.workspaceId!);
       const next = tabs[0];
       if (!next) throw new RuntimeProtocolError("RUNTIME_FAILURE", "Browser has no remaining tab");

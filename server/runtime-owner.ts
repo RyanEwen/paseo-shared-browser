@@ -269,10 +269,23 @@ export async function createRuntimeOwner(
           throw new Error("Browser tab is no longer available");
         }
         if (targets.length <= 1) {
-          throw new Error("The last browser tab cannot be closed");
+          throw new Error("The last browser tab requires confirmation to close the shared browser");
+        }
+        // A preview is tab-modal UI and can disappear with its source. Without
+        // an authoritative source relationship, require preview cancellation
+        // before removing the sole content page under a tab-only confirmation.
+        const preview = isPrintPreviewUrl(target.url);
+        if (
+          !preview &&
+          targets.every(
+            (candidate) => candidate.targetId === targetId || isPrintPreviewUrl(candidate.url),
+          )
+        ) {
+          throw new Error(
+            "Close Print preview first, then confirm closing the final tab and browser",
+          );
         }
         const controller = owned.tabs.get(targetId);
-        const preview = isPrintPreviewUrl(target.url);
         let previewController: AgentBrowserRuntime | undefined;
         let closeError: unknown;
         if (preview) {

@@ -307,13 +307,19 @@ it.each(["human", "agent"] as const)(
         }
       } else {
         await agent("release-control");
-        const closer = await human<{ controlToken: string }>("acquire-control", {
-          viewerToken: previewViewer.viewerToken,
-        });
+        const closer = await human<{ controlToken: string; state: BrowserState }>(
+          "acquire-control",
+          {
+            viewerToken: previewViewer.viewerToken,
+          },
+        );
         await human("tabs.close", {
           viewerToken: previewViewer.viewerToken,
           controlToken: closer.controlToken,
           tabId: preview!.id,
+          sessionId: closer.state.sessionId,
+          runtimeId: closer.state.runtimeId!,
+          scope: "tab",
         });
       }
       await vi.waitFor(

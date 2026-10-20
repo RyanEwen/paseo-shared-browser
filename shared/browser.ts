@@ -141,14 +141,21 @@ export const createBrowserTabRpc = defineRpc({
   output: z.object({ tabId: browserTabIdSchema }),
 });
 
+/** Confirmation distinguishes removing one page from stopping its final workspace browser. */
+export const browserTabCloseScopeSchema = z.enum(["tab", "last-tab"]);
+export type BrowserTabCloseScope = z.infer<typeof browserTabCloseScopeSchema>;
+
 export const closeBrowserTabRpc = defineRpc({
   name: "shared-browser.tabs.close",
   input: z.object({
     viewerToken: opaqueTokenSchema,
     controlToken: opaqueTokenSchema,
     tabId: browserTabIdSchema,
+    sessionId: opaqueTokenSchema,
+    runtimeId: runtimeIdSchema,
+    scope: browserTabCloseScopeSchema.default("tab"),
   }),
-  output: z.object({ closed: z.literal(true) }),
+  output: z.object({ closed: z.literal(true), browserClosed: z.boolean() }),
 });
 
 export const detachBrowserRpc = defineRpc({

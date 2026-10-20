@@ -22,6 +22,7 @@ import {
   canUseCaptureDensity,
   type captureBrowserRpc,
   type closeBrowserRpc,
+  type closeBrowserTabRpc,
   DEFAULT_VIEWPORT,
   DEVICE_PRESETS,
   type DevicePresetId,
@@ -79,6 +80,7 @@ type CaptureReply = Omit<RpcOutput<typeof captureBrowserRpc>, "state"> & {
 };
 type DensityInput = RpcInput<typeof setCaptureDensityRpc>;
 type CloseInput = RpcInput<typeof closeBrowserRpc>;
+type CloseTabInput = RpcInput<typeof closeBrowserTabRpc>;
 type NavigateInput = RpcInput<typeof navigateBrowserRpc>;
 type PrintInput = RpcInput<typeof printBrowserRpc>;
 type ResizeInput = RpcInput<typeof resizeBrowserRpc>;
@@ -111,6 +113,13 @@ export interface BrowserRuntimeClient {
   requestWorkspace(workspaceId: string, operation: string, input: JsonValue): Promise<JsonValue>;
   archiveWorkspace(workspaceId: string): Promise<void>;
   closeWorkspace(workspaceId: string, runtimeId: string): Promise<void>;
+  /** Check the exact sole target and call onClosing synchronously within the workspace queue before stopping. */
+  closeLastTab?(
+    workspaceId: string,
+    runtimeId: string,
+    tabId: string,
+    onClosing: () => void,
+  ): Promise<void>;
   disconnect(): void;
 }
 
@@ -493,16 +502,21 @@ export class SessionManager {
     return { tabId };
   }
 
-  /** Close only the page controlled by this viewer, leaving other pages and viewers alive. */
-  async closeTab(input: {
-    viewerToken: string;
-    controlToken: string;
-    tabId: string;
-  }): Promise<{ closed: true }> {
+  /** Close the confirmed page, or the whole workspace only with explicit final-tab authority. */
+  async closeTab(input: CloseTabInput): Promise<{ closed: true; browserClosed: boolean }> {
     const session = this.requireViewer(input.viewerToken);
+    if (input.scope === "last-tab") {
+      await this.closeBrowser(input, input.tabId);
+      return { closed: true, browserClosed: true };
+    }
     return this.serialize(session, async () => {
       this.requireController(session, input.viewerToken, input.controlToken);
-      if (session.tabId !== input.tabId) throw new Error("Browser tab selection is stale");
+      if (
+        session.tabId !== input.tabId ||
+        session.sessionId !== input.sessionId ||
+        session.runtimeId !== input.runtimeId
+      )
+        throw new Error("Browser tab selection is stale");
       await this.cancelGesture(session);
       await this.request(session, "tabs.close", { targetId: input.tabId });
       session.archived = true;
@@ -518,38 +532,64 @@ export class SessionManager {
       session.viewers.clear();
       session.controller = null;
       this.sessions.delete(session.key);
-      return { closed: true };
+      return { closed: true, browserClosed: false };
     });
   }
 
   /** Stop one runtime and invalidate every viewer without archiving its workspace or profile. */
-  async closeBrowser(input: CloseInput): Promise<{ closed: true }> {
+  async closeBrowser(input: CloseInput, onlyTabId?: string): Promise<{ closed: true }> {
     const session = this.requireViewer(input.viewerToken);
     const closing = this.serialize(session, async () => {
       this.requireController(session, input.viewerToken, input.controlToken);
       if (session.sessionId !== input.sessionId || session.runtimeId !== input.runtimeId)
         throw new Error("Browser session is stale");
+      if (onlyTabId && session.tabId !== onlyTabId)
+        throw new Error("Browser tab selection is stale");
+      if (onlyTabId && !this.client.closeLastTab)
+        throw new Error("Final-tab browser close is unavailable in this runtime");
 
-      this.deliberatelyClosed.add(session.workspaceId);
       const workspaceSessions = [...this.sessions.values()].filter(
         (candidate) => candidate.workspaceId === session.workspaceId,
       );
-      for (const candidate of workspaceSessions) {
-        candidate.videoLifetime?.cancel();
-        candidate.displayDemand?.dispose();
-        await this.cancelGesture(candidate);
-        candidate.archived = true;
-        for (const token of candidate.viewers.keys()) {
-          this.viewerSessions.delete(token);
-          this.closedViewerWorkspaces.set(token, session.workspaceId);
+      // Cleanup can enqueue native releases, so finish it before entering the
+      // supervisor's atomic check/stop. A refused guard keeps all viewers usable.
+      for (const candidate of workspaceSessions) await this.cancelGesture(candidate);
+      let closingStarted = false;
+      const onClosing = () => {
+        // The guard may have waited behind queued work or a CDP target read.
+        // Expired/revoked authority must refuse before any viewer is invalidated.
+        if (this.requireViewer(input.viewerToken) !== session || session.archived)
+          throw new Error("Browser session is stale");
+        this.requireController(session, input.viewerToken, input.controlToken);
+        closingStarted = true;
+        this.deliberatelyClosed.add(session.workspaceId);
+        for (const candidate of workspaceSessions) {
+          candidate.videoLifetime?.cancel();
+          candidate.displayDemand?.dispose();
+          candidate.archived = true;
+          for (const token of candidate.viewers.keys()) {
+            this.viewerSessions.delete(token);
+            this.closedViewerWorkspaces.set(token, session.workspaceId);
+          }
+          candidate.viewers.clear();
+          candidate.controller = null;
         }
-        candidate.viewers.clear();
-        candidate.controller = null;
-      }
+      };
       try {
-        await this.client.closeWorkspace(session.workspaceId, session.runtimeId);
+        if (onlyTabId) {
+          await this.client.closeLastTab!(
+            session.workspaceId,
+            session.runtimeId,
+            onlyTabId,
+            onClosing,
+          );
+        } else {
+          onClosing();
+          await this.client.closeWorkspace(session.workspaceId, session.runtimeId);
+        }
       } finally {
-        for (const candidate of workspaceSessions) this.sessions.delete(candidate.key);
+        if (closingStarted)
+          for (const candidate of workspaceSessions) this.sessions.delete(candidate.key);
       }
     });
     this.sessionClosures.set(session.workspaceId, closing);

@@ -54,8 +54,8 @@ export interface BrowserToolbarMenuProps {
   paneRef: RefObject<View | null>;
   anchorRef: RefObject<View | null>;
   paneSize: { width: number; height: number };
-  /** Estimated body height; overflow remains scrollable instead of growing outside the pane. */
-  preferredHeight: number;
+  /** Initial estimate only. Measured content determines height, bounded by the pane. */
+  preferredHeight?: number;
   onClose(): void;
   shouldRestoreFocus(): boolean;
   children: ReactNode;
@@ -68,6 +68,14 @@ export function BrowserToolbarMenu(props: BrowserToolbarMenuProps) {
   const compact = browserMenuUsesBackNavigation(props.paneSize.width, props.compact, Platform.OS);
   const previousSubmenu = useRef<BrowserSubmenu | undefined>(undefined);
   const [placement, setPlacement] = useState<MenuRect | null>(null);
+  const [contentSize, setContentSize] = useState<{ page: string; height: number } | null>(null);
+  const [headerHeight, setHeaderHeight] = useState(0);
+  const page = compact && props.submenu ? (props.submenu.pageKey ?? props.submenu.title) : "root";
+  const bodyHeight = contentSize?.page === page ? contentSize.height : null;
+  const visibleHeaderHeight = compact && props.submenu ? headerHeight : 0;
+  const estimatedHeight = props.preferredHeight ?? props.paneSize.height;
+  const desiredHeight =
+    bodyHeight === null ? estimatedHeight : bodyHeight + visibleHeaderHeight + 2;
   const menuRef = useRef<View | null>(null);
   const overlayRef = useRef<View | null>(null);
   const current = useRef(props);
@@ -82,7 +90,7 @@ export function BrowserToolbarMenu(props: BrowserToolbarMenuProps) {
           browserMenuPlacement(
             props.paneSize,
             { x: x - paneX, y: y - paneY, width, height },
-            compact && props.submenu ? props.submenu.preferredHeight + 52 : props.preferredHeight,
+            desiredHeight,
           ),
         );
       });
@@ -95,10 +103,15 @@ export function BrowserToolbarMenu(props: BrowserToolbarMenuProps) {
     props.anchorRef,
     props.paneSize.width,
     props.paneSize.height,
-    props.preferredHeight,
+    desiredHeight,
     compact,
     props.submenu?.preferredHeight,
   ]);
+  const overflowing =
+    placement !== null &&
+    bodyHeight !== null &&
+    bodyHeight + visibleHeaderHeight + 2 > placement.height + 1;
+  const scrollHintHeight = overflowing ? 22 : 0;
 
   useEffect(() => {
     if (!placement) return;
@@ -167,7 +180,10 @@ export function BrowserToolbarMenu(props: BrowserToolbarMenuProps) {
           ]}
         >
           {compact && props.submenu ? (
-            <View style={{ flexShrink: 0 }}>
+            <View
+              style={{ flexShrink: 0 }}
+              onLayout={(event) => setHeaderHeight(event.nativeEvent.layout.height)}
+            >
               <BrowserMenuItem
                 theme={props.theme}
                 compact
@@ -180,16 +196,34 @@ export function BrowserToolbarMenu(props: BrowserToolbarMenuProps) {
           ) : null}
           <ScrollView
             style={{
-              maxHeight: placement.height - 2,
+              maxHeight: Math.max(1, placement.height - visibleHeaderHeight - scrollHintHeight - 2),
               flexShrink: 1,
               borderRadius: 8,
-              overflow: "hidden",
             }}
+            onContentSizeChange={(_width, height) => {
+              setContentSize((previous) =>
+                previous?.page === page && previous.height === height ? previous : { page, height },
+              );
+            }}
+            showsVerticalScrollIndicator
             keyboardShouldPersistTaps="handled"
             contentContainerStyle={STYLES.content}
           >
             {compact && props.submenu ? props.submenu.children : props.children}
           </ScrollView>
+          {overflowing ? (
+            <Text
+              style={{
+                height: scrollHintHeight,
+                flexShrink: 0,
+                fontSize: 11,
+                textAlign: "center",
+                color: props.theme.colors.foregroundMuted,
+              }}
+            >
+              Scroll for more actions
+            </Text>
+          ) : null}
           {!compact && props.submenu ? (
             <BrowserToolbarSubmenu
               theme={props.theme}

@@ -101,6 +101,24 @@ it("preserves the existing last-tab refusal", async () => {
   expect(f.native.closeTarget).not.toHaveBeenCalled();
 });
 
+it("preserves source and preview when a tab-only close would remove the sole content page", async () => {
+  const f = await fixture(null);
+  const targets = f.native.targets.getMockImplementation()!;
+  f.native.targets.mockImplementation(async () =>
+    (await targets()).map((target) => ({
+      ...target,
+      url: target.targetId === "closing" ? "chrome://print/" : target.url,
+    })),
+  );
+  await expect(f.owner.request(f.owned, "tabs.close", { targetId: "root" })).rejects.toThrow(
+    "Close Print preview first, then confirm closing the final tab and browser",
+  );
+  expect(f.native.closeTarget).not.toHaveBeenCalled();
+  expect(f.native.releaseTarget).not.toHaveBeenCalled();
+  expect(f.state.ids).toEqual(["root", "closing"]);
+  expect(f.owned.rootTargetId).toBe("root");
+});
+
 it("retires the launch-page controller without selecting or reconfiguring its survivor", async () => {
   const f = await fixture(0);
   f.owned.rootTargetId = "closing";

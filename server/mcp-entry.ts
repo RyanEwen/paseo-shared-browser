@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { browserTabIdSchema } from "../shared/browser";
+import { browserTabCloseScopeSchema, browserTabIdSchema } from "../shared/browser";
 import { DEVICE_PRESET_IDS } from "../shared/device-presets";
 import { MAX_VIEWPORT, MIN_VIEWPORT } from "../shared/viewport-limits";
 import { registerDomTools } from "./agent-dom-tools";
@@ -232,15 +232,15 @@ async function main(): Promise<void> {
     "shared_browser_tab_close",
     {
       description:
-        "Close this agent's selected and controlled tab for every viewer. Other tabs remain open.",
-      inputSchema: z.object({}),
+        "Close this agent's selected and controlled tab for every viewer. Use scope 'tab' when other tabs remain. To close the final tab and stop this workspace's browser for every viewer and agent, explicitly use scope 'last-tab'. Saved site data is retained; unsaved changes are lost. A changed tab list refuses the close, without replay. A stopped browser stays closed until explicitly reopened.",
+      inputSchema: z.object({ scope: browserTabCloseScopeSchema.default("tab") }),
       annotations: {
         readOnlyHint: false,
         destructiveHint: true,
         idempotentHint: false,
       },
     },
-    async () => textResult(await client.request("tabs.close", {})),
+    async ({ scope }) => textResult(await client.request("tabs.close", { scope })),
   );
 
   server.registerTool(

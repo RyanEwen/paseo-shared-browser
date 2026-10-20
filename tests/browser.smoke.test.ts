@@ -448,6 +448,9 @@ it("shares and persists a production agent-browser runtime across supervisor cli
       viewerToken: restored.viewerToken,
       controlToken: restoredControl.controlToken,
       tabId: restored.state.tabId!,
+      sessionId: restored.state.sessionId,
+      runtimeId: restored.state.runtimeId!,
+      scope: "tab",
     });
     await expect(manager.status(restored.viewerToken)).rejects.toThrow("Browser tab is closed");
     expect((await manager.status(extraViewer.viewerToken)).state.url).toBe(`${origin}/read-cookie`);

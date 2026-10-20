@@ -184,6 +184,9 @@ it("closes one tab without ending another tab or the shared profile runtime", as
     viewerToken: second.viewerToken,
     controlToken: control.controlToken,
     tabId: created.tabId,
+    sessionId: second.state.sessionId,
+    runtimeId: second.state.runtimeId!,
+    scope: "tab",
   });
   await expect(manager.status(second.viewerToken)).rejects.toThrow("Browser tab is closed");
   expect((await manager.status(first.viewerToken)).state.tabId).toBe("page-one");
