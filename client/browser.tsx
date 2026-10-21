@@ -71,7 +71,7 @@ import {
   controlRequestBasis,
   isControlRequestCurrent,
 } from "./browser-control-request";
-import { BrowserDialogBody } from "./browser-dialog-body";
+import { BrowserDialogBody, BrowserDialogPrimaryButton } from "./browser-dialog-body";
 import { physicalBrowserDisplaySize } from "./browser-display-demand";
 import { BrowserDisplayMenu } from "./browser-display-menu";
 import { type EmulationSelection, matchingResolutionPresetId } from "./browser-emulation-mode";
@@ -2014,7 +2014,8 @@ export function SharedBrowserPanel({
                   disabled={tabMutationPending}
                   onPress={() => setTabCloseConfirmation(null)}
                 />
-                <ControlButton
+                <BrowserDialogPrimaryButton
+                  open={tabCloseConfirmation !== null}
                   styles={styles}
                   theme={theme}
                   label={closeTabLabel}
@@ -2061,7 +2062,8 @@ export function SharedBrowserPanel({
                     setRestartForGraphics(false);
                   }}
                 />
-                <ControlButton
+                <BrowserDialogPrimaryButton
+                  open={closeConfirmationOpen}
                   styles={styles}
                   theme={theme}
                   label={

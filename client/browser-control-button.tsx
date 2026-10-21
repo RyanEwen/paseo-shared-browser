@@ -1,6 +1,6 @@
 import type { PluginWorkspacePanelProps } from "@getpaseo/plugin/client";
 import { Icon } from "@getpaseo/plugin/client/react-native";
-import { useCallback, useState } from "react";
+import { type Ref, useCallback, useState } from "react";
 import { Pressable, Text, type TextStyle, type ViewStyle } from "react-native";
 
 import { setBrowserControlTooltip } from "./browser-control-tooltip-web";
@@ -24,7 +24,8 @@ export interface ControlButtonStyles {
   buttonTextSelected: TextStyle;
 }
 
-interface ControlButtonProps {
+export interface ControlButtonProps {
+  ref?: Ref<unknown>;
   styles: ControlButtonStyles;
   theme: Theme;
   label: string;
@@ -43,6 +44,7 @@ interface ControlButtonProps {
 
 /** Render the shared control geometry and theme states for browser actions. */
 export function ControlButton({
+  ref,
   styles,
   theme,
   label,
@@ -61,13 +63,17 @@ export function ControlButton({
   const [focused, setFocused] = useState(false);
   const [hovered, setHovered] = useState(false);
   const highlighted = selected || primary;
-  const tooltipRef = useCallback(
-    (node: unknown) => setBrowserControlTooltip(node, accessibilityLabel ?? label),
-    [accessibilityLabel, label],
+  const buttonRef = useCallback(
+    (node: unknown) => {
+      if (iconOnly) setBrowserControlTooltip(node, accessibilityLabel ?? label);
+      if (typeof ref === "function") return ref(node);
+      if (ref) ref.current = node;
+    },
+    [ref, iconOnly, accessibilityLabel, label],
   );
   return (
     <Pressable
-      ref={iconOnly ? tooltipRef : undefined}
+      ref={buttonRef}
       accessibilityRole="button"
       accessibilityLabel={accessibilityLabel ?? label}
       accessibilityState={{ disabled, selected }}

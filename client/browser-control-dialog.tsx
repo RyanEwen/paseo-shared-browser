@@ -4,7 +4,7 @@ import { Icon, Modal } from "@getpaseo/plugin/client/react-native";
 import type { BrowserState } from "../shared/browser";
 import { ControlButton } from "./browser-chrome";
 import type { ControlRequest } from "./browser-control-request";
-import { BrowserDialogBody } from "./browser-dialog-body";
+import { BrowserDialogBody, BrowserDialogPrimaryButton } from "./browser-dialog-body";
 import type { createStyles } from "./browser-panel-styles";
 
 /** Explicitly name a displaced controller while preserving the original action. */
@@ -49,7 +49,8 @@ export function BrowserControlDialog({
                 disabled={pending}
                 onPress={onCancel}
               />
-              <ControlButton
+              <BrowserDialogPrimaryButton
+                open={request !== null}
                 styles={styles}
                 theme={theme}
                 label={takeover ? "Take over" : "Take control"}
