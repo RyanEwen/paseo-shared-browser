@@ -21,6 +21,7 @@ function controllerSummary(tab: BrowserTab, selectedState: BrowserState | null):
 /** Show compact per-tab presence while keeping control actions on the selected tab only. */
 export function BrowserTabs({
   styles,
+  bottom = false,
   theme,
   tabs,
   selectedId,
@@ -35,6 +36,7 @@ export function BrowserTabs({
   onClose,
 }: {
   styles: ReturnType<typeof createStyles>;
+  bottom?: boolean;
   theme: PluginWorkspacePanelProps["theme"];
   tabs: BrowserTab[];
   selectedId: string | null;
@@ -49,7 +51,7 @@ export function BrowserTabs({
   onClose(): void;
 }) {
   return (
-    <View style={styles.tabBar}>
+    <View style={[styles.tabBar, bottom ? styles.tabBarBottom : null]}>
       <ScrollView
         horizontal
         showsHorizontalScrollIndicator={false}

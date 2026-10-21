@@ -123,6 +123,102 @@ function fixture(
 }
 
 describe("bounded browser input queue", () => {
+  it("discards obsolete admission and queued old-page input without retrying on the destination", async () => {
+    const f = fixture();
+    const next: BrowserState = {
+      ...state,
+      status: "ready",
+      controller: "self",
+      ...authority.expected,
+      navigationGeneration: 2,
+    };
+    const begin = vi.fn(f.transport.begin);
+    f.transport.begin = begin;
+    f.projectState(() => {
+      f.changeAuthority({
+        ...authority,
+        expected: { ...authority.expected, navigationGeneration: 2 },
+        target: { ...authority.target, navigationGeneration: 2, frameId: "destination" },
+      });
+    });
+    f.queue.enqueue(move(20));
+    f.queue.enqueue({ kind: "down", point: point(20), button: "left", clickCount: 1 });
+    f.queue.enqueue({ kind: "up", point: point(20), button: "left", clickCount: 1 });
+    f.queue.enqueue({ kind: "text", text: "never type on the destination" });
+    f.queue.finish();
+    f.beginGate.resolve({ state: next, admission: "obsolete-navigation" });
+    await flush();
+    expect(begin).toHaveBeenCalledTimes(1);
+    expect(f.sent).toEqual([]);
+    expect(f.ended).toEqual([]);
+    expect(f.errors).toEqual([]);
+    expect(f.acknowledgements).toEqual([]);
+    expect(f.navigationCompleted).toEqual([true]);
+    expect(f.states).toEqual([next]);
+    expect(f.finishes()).toBe(1);
+    expect(f.cursors.at(-1)).toBeNull();
+  });
+
+  it.each([
+    { navigationGeneration: 1 },
+    { status: "error" },
+    { controller: "other" },
+    { sessionId: "other-session" },
+    { runtimeId: "other-runtime" },
+    { bridgeEpoch: 2 },
+    { viewportGeneration: 2 },
+  ])("rejects malformed obsolete admission state %j without publishing input", async (change) => {
+    const f = fixture();
+    f.queue.enqueue(move(20));
+    f.beginGate.resolve({
+      admission: "obsolete-navigation",
+      state: {
+        ...state,
+        status: "ready",
+        controller: "self",
+        ...authority.expected,
+        navigationGeneration: 2,
+        ...change,
+      } as BrowserState,
+    });
+    await flush();
+    expect(f.sent).toEqual([]);
+    expect(f.errors).toHaveLength(1);
+    expect(f.navigationCompleted).toEqual([]);
+    expect(f.states).toEqual([]);
+    expect(f.finishes()).toBe(0);
+  });
+
+  it("ignores obsolete admission after control changed and preserves transport failures as errors", async () => {
+    const f = fixture();
+    f.queue.enqueue(move(20));
+    f.changeAuthority({ ...authority, controlToken: "replacement" });
+    f.beginGate.resolve({
+      admission: "obsolete-navigation",
+      state: {
+        ...state,
+        status: "ready",
+        controller: "self",
+        ...authority.expected,
+        navigationGeneration: 2,
+      },
+    });
+    await flush();
+    expect(f.sent).toEqual([]);
+    expect(f.errors).toEqual([]);
+    expect(f.states).toEqual([]);
+    expect(f.finishes()).toBe(0);
+
+    const failed = fixture();
+    failed.queue.enqueue(move(20));
+    const unknown = new Error("Input admission outcome is unknown");
+    failed.beginGate.reject(unknown);
+    await flush();
+    expect(failed.sent).toEqual([]);
+    expect(failed.errors).toEqual([unknown]);
+    expect(failed.navigationCompleted).toEqual([]);
+  });
+
   it("never sends orphan moves after a canvas touch starts without decoded-frame authority", async () => {
     const f = fixture(undefined, true);
     const input = createBrowserCanvasInput({

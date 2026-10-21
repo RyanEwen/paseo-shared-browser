@@ -42,6 +42,12 @@ export function createStyles(theme: Theme, compact: boolean) {
       borderBottomColor: theme.colors.border,
       backgroundColor: theme.colors.surface1,
     },
+    tabBarBottom: {
+      flexShrink: 0,
+      borderBottomWidth: 0,
+      borderTopWidth: 1,
+      borderTopColor: theme.colors.border,
+    },
     tabList: {
       flex: 1,
       minWidth: 0,
@@ -240,6 +246,10 @@ export function createStyles(theme: Theme, compact: boolean) {
       borderRadius: compact ? DIMENSION.screenRadius : 0,
       overflow: "hidden",
       backgroundColor: theme.colors.surface1,
+    },
+    // Leave room for bottom tabs when the host resizes for a software keyboard.
+    canvasShellFlexible: {
+      minHeight: 0,
     },
     canvas: {
       flex: 1,

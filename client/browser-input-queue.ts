@@ -50,7 +50,7 @@ interface QueueOptions {
   onCursor(cursor: BrowserCursor | null): void;
   onError(error: unknown): void;
   onFinish(): void;
-  /** Reset local held contacts after an acknowledged navigation, without cancelling this queue again. */
+  /** Reset local holds after navigation completion or obsolete admission, without cancelling this queue again. */
   onNavigationComplete?(): void;
   /**
    * Called after the host acknowledges a non-hover event. Receipts decoded from
@@ -176,6 +176,18 @@ export function createBrowserInputQueue(options: QueueOptions) {
     return control && decoded && sameAuthority(decoded, control) ? decoded : null;
   };
 
+  /** Retire old-document work before new state revokes its decoded frame. Never replay it. */
+  const retireForNavigation = (state: BrowserState) => {
+    epoch += 1;
+    commands = [];
+    invalidatedFrameId = null;
+    channel = null;
+    options.onCursor(null);
+    options.onNavigationComplete?.();
+    options.onState(state);
+    options.onFinish();
+  };
+
   const drain = async () => {
     if (running) return;
     running = true;
@@ -285,6 +297,17 @@ export function createBrowserInputQueue(options: QueueOptions) {
               const sentAuthority = current;
               const startedAt = performance.now();
               const result = await options.transport.begin({ ...sentAuthority, pointerKind });
+              if ("admission" in result && result.admission === "obsolete-navigation") {
+                if (currentEpoch !== epoch || !sameAuthority(sentAuthority, currentControl()))
+                  break;
+                if (!isAcknowledgedNavigation(sentAuthority, result.state)) {
+                  throw new Error("Browser obsolete navigation identity changed.");
+                }
+                // No channel or input was published. Drop every queued physical
+                // edge instead of admitting that old-page action on its destination.
+                retireForNavigation(result.state);
+                break;
+              }
               if (!("admission" in result)) {
                 owned = {
                   authority: sentAuthority,
@@ -411,15 +434,8 @@ export function createBrowserInputQueue(options: QueueOptions) {
           // Native publication and cleanup are already acknowledged. Discard
           // queued releases/typing from the old document before projecting the
           // new state, which intentionally invalidates the old decoded frame.
-          epoch += 1;
-          commands = [];
-          invalidatedFrameId = null;
-          channel = null;
           owned = null;
-          options.onCursor(null);
-          options.onNavigationComplete?.();
-          options.onState(result.state);
-          options.onFinish();
+          retireForNavigation(result.state);
           break;
         }
         options.onState(result.state);

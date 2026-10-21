@@ -1083,7 +1083,7 @@ export class SessionManager {
           captureScale,
           mobile: preset?.isMobile ?? false,
           touch: preset?.hasTouch ?? false,
-          userAgent: preserveEmulation ? session.userAgent : session.defaultUserAgent,
+          userAgent: preset?.userAgent ?? "",
           platform: preset?.platform ?? "",
         });
         session.viewport = { ...input.viewport };
@@ -1121,14 +1121,14 @@ export class SessionManager {
         captureScale,
         mobile: preset.isMobile,
         touch: preset.hasTouch,
-        userAgent: preset.userAgent,
-        platform: preset.platform,
+        userAgent: preset.userAgent ?? "",
+        platform: preset.platform ?? "",
       });
       session.viewport = { ...viewport };
       session.displayDemand?.refresh();
       session.devicePresetId = preset.id;
       session.captureScale = captureScale;
-      session.userAgent = preset.userAgent;
+      session.userAgent = preset.userAgent ?? session.defaultUserAgent;
       session.viewportGeneration += 1;
       // Emulation invalidates input geometry even when display dimensions stay
       // fixed. UA-sniffing sites can use Reload; never discard a draft automatically.
@@ -1262,16 +1262,18 @@ export class SessionManager {
   async beginGesture(input: BeginGestureInput) {
     const session = this.requireViewer(input.viewerToken);
     return this.serialize(session, async () => {
-      this.requireMutationAccess(session, input);
+      this.obsoleteGestureAdmission(session, input, false);
       await this.refreshPageMetadata(session);
       session.error = null;
-      this.requireMutationAccess(session, input);
+      const refreshed = this.obsoleteGestureAdmission(session, input, true);
+      if (refreshed) return refreshed;
       if (!this.isRecentFrame(session, input.viewerToken, input.target)) {
         // A pre-input capture can decode after scroll revoked its token. Report
         // known non-publication, not an uncertain runtime failure. The client
         // may obtain another decoded frame before admitting its still-unsent input.
         const state = await this.snapshotState(session, input.viewerToken);
-        this.requireMutationAccess(session, input);
+        const reconciled = this.obsoleteGestureAdmission(session, input, true);
+        if (reconciled) return reconciled;
         if (state.status !== "ready")
           throw new Error(state.error ?? "Browser runtime is unavailable");
         return { state, admission: "stale-frame" as const };
@@ -1306,6 +1308,41 @@ export class SessionManager {
         throw error;
       }
     });
+  }
+
+  /**
+   * Refuse old-document admission without an operation failure or native publication.
+   * Only an older navigation is ordinary obsolescence: all other authority fences,
+   * future generations, malformed frame context and unavailable state remain errors.
+   * Call only before input.begin; this never describes a possibly published mutation.
+   * metadataFresh is true only after this admission's ordinary metadata read;
+   * cached ready state must not conceal a runtime failure after earlier navigation.
+   */
+  private obsoleteGestureAdmission(
+    session: BrowserSession,
+    input: BeginGestureInput,
+    metadataFresh: boolean,
+  ) {
+    this.requireMutationAccess(session, {
+      ...input,
+      expected: { ...input.expected, navigationGeneration: session.navigationGeneration },
+    });
+    if (input.expected.navigationGeneration >= session.navigationGeneration) {
+      this.requireMutationAccess(session, input);
+      return null;
+    }
+    if (
+      input.target.navigationGeneration !== input.expected.navigationGeneration ||
+      input.target.viewportGeneration !== input.expected.viewportGeneration
+    ) {
+      throw new Error("Browser frame context does not match its expected state");
+    }
+    if (!metadataFresh) return null;
+    const state = this.projectState(session, input.viewerToken);
+    if (state.status !== "ready") {
+      throw new Error(state.error ?? "Browser runtime is unavailable");
+    }
+    return { state, admission: "obsolete-navigation" as const };
   }
 
   /**
@@ -1683,7 +1720,8 @@ export class SessionManager {
         deviceScaleFactor: 1,
         mobile: false,
         touch: false,
-        userAgent,
+        // Reapplying even the native UA string would suppress Chromium's client hints.
+        userAgent: "",
         platform: "",
         ...(tabId ? { targetId: tabId } : {}),
       });

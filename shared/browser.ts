@@ -531,6 +531,8 @@ export const beginBrowserGestureRpc = defineRpc({
     }),
     // This receipt exists only before input.begin, so no physical action or channel is replayed.
     z.object({ state: browserStateSchema, admission: z.literal("stale-frame") }),
+    // Navigation retired the displayed document before admission. Discard its input, never retry it.
+    z.object({ state: browserStateSchema, admission: z.literal("obsolete-navigation") }),
   ]),
 });
 /**

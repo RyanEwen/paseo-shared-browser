@@ -129,8 +129,8 @@ export function useBrowserCanvasInput(options: CanvasOptions) {
         if (alive.current) current.current.onInputAcknowledged?.();
       },
       onNavigationComplete: () => {
-        // Server already closed the acknowledged channel. Quarantine local
-        // holds before state projection; never replay their old-page release.
+        // Server closed the acknowledged channel or refused obsolete admission.
+        // Quarantine local holds before projecting state; never replay old-page input.
         inputModel.current?.reset();
         keyboard.current?.reset();
         nativeRelay.current?.reset();

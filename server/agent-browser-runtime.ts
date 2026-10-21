@@ -97,6 +97,7 @@ export interface BrowserViewport {
   captureScale?: number;
   mobile: boolean;
   touch: boolean;
+  /** Explicit device identity; empty or omitted restores native UA, platform and client hints. */
   userAgent?: string;
   platform?: string;
 }
@@ -1033,13 +1034,13 @@ export class AgentBrowserRuntime {
     // input idle bound), so every press there failed. Target-scoped focus emulation makes only
     // this page report visible/focused: no tab is raised and no viewer's selection changes.
     await page.send("Emulation.setFocusEmulationEnabled", { enabled: true }, { mutation: true });
-    if (device.userAgent) {
-      await page.send(
-        "Emulation.setUserAgentOverride",
-        { userAgent: device.userAgent, platform: device.platform ?? "" },
-        { mutation: true },
-      );
-    }
+    // An empty override restores Chromium's real identity after device emulation.
+    // Sending its native UA as a nonempty override would still remove client hints.
+    await page.send(
+      "Emulation.setUserAgentOverride",
+      { userAgent: device.userAgent ?? "", platform: device.platform ?? "" },
+      { mutation: true },
+    );
   }
 
   /** No frame/input may use a session whose emulated viewport has not been restored. */

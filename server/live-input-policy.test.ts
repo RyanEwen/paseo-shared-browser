@@ -6,6 +6,7 @@ import {
 } from "../shared/browser";
 import { JPEG_QUALITY } from "../shared/capture-settings";
 import { type BrowserRuntimeClient, SessionManager } from "./browser-policy";
+import { CdpUnknownOutcomeError } from "./cdp";
 
 /** Exercise the real policy with a deterministic owned runtime; no browser or services are started. */
 async function fixture(
@@ -453,7 +454,100 @@ describe("owned ordered live input", () => {
     state.manager.disconnect();
   });
 
-  it("does not return stale admission if its final metadata read fails or discovers replacement navigation", async () => {
+  it.each(["native navigation", "same-URL document", "already reconciled"])(
+    "retires obsolete admission before input.begin after %s",
+    async (change) => {
+      const state = await fixture();
+      try {
+        if (change === "same-URL document") state.reloadSameUrl();
+        else state.changeUrl("https://destination.invalid/");
+        if (change === "already reconciled") await state.manager.capture(state.context.viewerToken);
+        const before = state.calls.length;
+        const reply = await state.manager.beginGesture({
+          ...state.context,
+          target: state.target,
+          pointerKind: "mouse",
+        });
+        expect(reply).toMatchObject({
+          admission: "obsolete-navigation",
+          state: { status: "ready", controller: "self", navigationGeneration: 1 },
+        });
+        expect(reply).not.toHaveProperty("gestureId");
+        expect(state.calls.slice(before).every((call) => call.operation === "state")).toBe(true);
+      } finally {
+        state.manager.disconnect();
+      }
+    },
+  );
+
+  it.each(["viewer", "control", "session", "runtime", "bridge", "viewport", "future", "frame"])(
+    "retains the %s fence when navigation is obsolete",
+    async (field) => {
+      const state = await fixture();
+      try {
+        state.changeUrl("https://destination.invalid/");
+        const current = await state.manager.capture(state.context.viewerToken);
+        const input = {
+          ...state.context,
+          expected: { ...state.context.expected },
+          target: { ...state.target },
+          pointerKind: "mouse" as const,
+        };
+        if (field === "viewer") input.viewerToken = "wrong-viewer";
+        if (field === "control") input.controlToken = "wrong-control";
+        if (field === "session") input.expected.sessionId = "wrong-session";
+        if (field === "runtime") input.expected.runtimeId = "wrong-runtime";
+        if (field === "bridge") input.expected.bridgeEpoch += 1;
+        if (field === "viewport") input.expected.viewportGeneration += 1;
+        if (field === "future")
+          input.expected.navigationGeneration = current.state.navigationGeneration + 1;
+        if (field === "frame") input.target.navigationGeneration += 1;
+        const before = state.calls.length;
+        await expect(state.manager.beginGesture(input)).rejects.toThrow();
+        expect(state.calls.slice(before)).toEqual([]);
+      } finally {
+        state.manager.disconnect();
+      }
+    },
+  );
+
+  it("does not quiet runtime failure behind an already-reconciled navigation", async () => {
+    const state = await fixture();
+    try {
+      state.changeUrl("https://destination.invalid/");
+      await state.manager.capture(state.context.viewerToken);
+      state.intercept(async (operation) => {
+        if (operation === "state") throw new Error("Runtime unavailable after navigation");
+      });
+      const before = state.calls.length;
+      await expect(
+        state.manager.beginGesture({
+          ...state.context,
+          target: state.target,
+          pointerKind: "mouse",
+        }),
+      ).rejects.toThrow("Runtime unavailable after navigation");
+      expect(state.calls.slice(before).map((call) => call.operation)).toEqual(["state"]);
+    } finally {
+      state.manager.disconnect();
+    }
+  });
+
+  it("preserves unknown input.begin outcomes instead of reporting obsolete admission or retrying", async () => {
+    const state = await fixture();
+    try {
+      const unknown = new CdpUnknownOutcomeError("Input channel outcome is unknown");
+      state.intercept(async (operation) => {
+        if (operation === "input.begin") throw unknown;
+      });
+      await expect(state.begin()).rejects.toBe(unknown);
+      expect(state.calls.filter((call) => call.operation === "input.begin")).toHaveLength(1);
+    } finally {
+      state.manager.disconnect();
+    }
+  });
+
+  it("preserves failed final metadata reads and retires navigation without admitting input", async () => {
     for (const failure of ["runtime", "navigation"] as const) {
       const state = await fixture();
       try {
@@ -466,13 +560,14 @@ describe("owned ordered live input", () => {
           state.changeUrl("https://replacement.invalid/");
         });
         const before = state.calls.length;
-        await expect(
-          state.manager.beginGesture({
-            ...state.context,
-            target: { ...state.target, frameId: "z".repeat(32) },
-            pointerKind: "mouse",
-          }),
-        ).rejects.toThrow(failure === "runtime" ? "Runtime read unavailable" : "navigation");
+        const admission = state.manager.beginGesture({
+          ...state.context,
+          target: { ...state.target, frameId: "z".repeat(32) },
+          pointerKind: "mouse",
+        });
+        if (failure === "runtime")
+          await expect(admission).rejects.toThrow("Runtime read unavailable");
+        else await expect(admission).resolves.toMatchObject({ admission: "obsolete-navigation" });
         expect(state.calls.slice(before).map((call) => call.operation)).not.toContain(
           "input.begin",
         );

@@ -192,6 +192,8 @@ export function SharedBrowserPanel({
   active = true,
 }: PluginWorkspacePanelProps & { active?: boolean }) {
   const queryClient = useQueryClient();
+  // Match the touch-first input policy, including wide native tablets.
+  const touchFirstLayout = layout.platform !== "web" || layout.compact;
   const styles = useMemo(() => createStyles(theme, layout.compact), [theme, layout.compact]);
   const screenPixelRatio = useBrowserDisplayScale();
   const viewerLabel = useState(() =>
@@ -1013,7 +1015,7 @@ export function SharedBrowserPanel({
     state?.viewportGeneration,
   ]);
   // Touch-first surfaces (native and compact web) get the explicit draft; desktop web types on the canvas.
-  const composeAvailable = layout.platform !== "web" || layout.compact;
+  const composeAvailable = touchFirstLayout;
   const requestCompose = (kind: "keyboard" | "compose" | "commit") => {
     if (!canSendInput) return;
     nextComposeRequest.current += 1;
@@ -1686,6 +1688,34 @@ export function SharedBrowserPanel({
     );
   }
 
+  const browserTabs = (
+    <BrowserTabs
+      styles={styles}
+      bottom={touchFirstLayout}
+      theme={theme}
+      tabs={tabsQuery.data?.tabs ?? []}
+      selectedId={selectedTabId ?? state?.tabId ?? null}
+      selectedState={state}
+      statusColor={statusColor}
+      statusLabel={statusLabel}
+      controlAction={controlAction}
+      canCreate={
+        Boolean(viewerToken) &&
+        !tabMutationPending &&
+        (tabsQuery.data?.tabs.filter((tab) => !isPrintPreviewUrl(tab.url)).length ?? 0) <
+          MAX_BROWSER_TABS
+      }
+      canClose={
+        Boolean(viewerToken) && !tabMutationPending && (tabsQuery.data?.tabs.length ?? 0) > 0
+      }
+      onSelect={setSelectedTabId}
+      onCreate={() => void createBrowserTab()}
+      onClose={() =>
+        requestControlled("close this tab", () => controlledActionsRef.current?.closeTab())
+      }
+    />
+  );
+
   return (
     <View
       ref={paneRef}
@@ -1698,30 +1728,7 @@ export function SharedBrowserPanel({
         );
       }}
     >
-      <BrowserTabs
-        styles={styles}
-        theme={theme}
-        tabs={tabsQuery.data?.tabs ?? []}
-        selectedId={selectedTabId ?? state?.tabId ?? null}
-        selectedState={state}
-        statusColor={statusColor}
-        statusLabel={statusLabel}
-        controlAction={controlAction}
-        canCreate={
-          Boolean(viewerToken) &&
-          !tabMutationPending &&
-          (tabsQuery.data?.tabs.filter((tab) => !isPrintPreviewUrl(tab.url)).length ?? 0) <
-            MAX_BROWSER_TABS
-        }
-        canClose={
-          Boolean(viewerToken) && !tabMutationPending && (tabsQuery.data?.tabs.length ?? 0) > 0
-        }
-        onSelect={setSelectedTabId}
-        onCreate={() => void createBrowserTab()}
-        onClose={() =>
-          requestControlled("close this tab", () => controlledActionsRef.current?.closeTab())
-        }
-      />
+      {touchFirstLayout ? null : browserTabs}
 
       <View style={styles.chrome}>
         <View style={styles.addressRow}>
@@ -1832,7 +1839,7 @@ export function SharedBrowserPanel({
         />
       ) : null}
 
-      <View style={styles.canvasShell}>
+      <View style={[styles.canvasShell, touchFirstLayout ? styles.canvasShellFlexible : null]}>
         <BrowserCanvasViewport
           mode={scaleMode}
           style={styles.canvas}
@@ -1943,6 +1950,8 @@ export function SharedBrowserPanel({
           </Text>
         </View>
       </View>
+
+      {touchFirstLayout ? browserTabs : null}
 
       {layout.platform !== "web" ? (
         <NativeKeyboardControls
@@ -2107,7 +2116,7 @@ export function SharedBrowserPanel({
       {toolbarMenu === "display" ? (
         <BrowserDisplayMenu
           theme={theme}
-          compact={layout.compact || layout.platform !== "web"}
+          compact={touchFirstLayout}
           paneRef={paneRef}
           paneSize={paneSize}
           anchorRef={displayAnchorRef}

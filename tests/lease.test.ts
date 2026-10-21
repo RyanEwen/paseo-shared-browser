@@ -102,7 +102,7 @@ class FakeSupervisorClient {
           width: Number(data.width),
           height: Number(data.height),
         };
-        workspace.userAgent = String(data.userAgent);
+        workspace.userAgent = data.userAgent ? String(data.userAgent) : "Fake Chromium";
         return null;
       case "frame": {
         const bytes = Buffer.from("fake-jpeg-frame");
@@ -511,6 +511,25 @@ describe("SessionManager control leases", () => {
     });
   });
 
+  it("preserves native identity when opening and resizing desktop tabs", async () => {
+    const { manager, client } = createManager();
+    const viewer = await manager.attach("workspace-native", "Client");
+    const control = await manager.acquireControl(viewer.viewerToken, false);
+    const resized = await manager.resize({
+      viewerToken: viewer.viewerToken,
+      controlToken: control.controlToken,
+      expected: expected(control.state),
+      viewport: { width: 1440, height: 900 },
+      preserveEmulation: true,
+    });
+
+    expect(resized.state.userAgent).toBe("Fake Chromium");
+    expect(client.operations.filter(({ operation }) => operation === "emulate")).toHaveLength(2);
+    for (const operation of client.operations.filter(({ operation }) => operation === "emulate")) {
+      expect(operation.input).toMatchObject({ userAgent: "", platform: "" });
+    }
+  });
+
   it("switches mobile and desktop behavior while preserving the current custom display", async () => {
     const { manager, client } = createManager();
     const viewer = await manager.attach("workspace-mode", "Client");
@@ -554,9 +573,18 @@ describe("SessionManager control leases", () => {
     });
     expect(desktop.state.viewport).toEqual({ width: 1920, height: 1200 });
     expect(desktop.state.captureScale).toBe(1);
+    expect(desktop.state.userAgent).toBe("Fake Chromium");
     expect(
       client.operations.filter((op) => op.operation === "emulate").at(-1)?.input,
-    ).toMatchObject({ width: 1920, height: 1200, captureScale: 1, mobile: false, touch: false });
+    ).toMatchObject({
+      width: 1920,
+      height: 1200,
+      captureScale: 1,
+      mobile: false,
+      touch: false,
+      userAgent: "",
+      platform: "",
+    });
     expect(client.operations.some((op) => ["reload", "navigate"].includes(op.operation))).toBe(
       false,
     );

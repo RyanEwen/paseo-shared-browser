@@ -1,12 +1,13 @@
 /** Device emulation facts and display sizes shared by the picker and server policy. */
-const DESKTOP_CHROME_EMULATION = {
+const DESKTOP_BROWSER_SETTINGS = {
   deviceScaleFactor: 1,
   captureScale: 1,
   isMobile: false,
   hasTouch: false,
-  platform: "Win32",
-  userAgent:
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.8010.12 Safari/537.36",
+  // Resolution presets retain the host Chromium identity, including its client hints.
+  // Only explicit device emulation supplies a different user agent or platform.
+  platform: null,
+  userAgent: null,
 } as const;
 
 /** Larger desktop presets change resolution while retaining the same input and browser behavior. */
@@ -14,7 +15,7 @@ function createDesktopPreset<const Id extends string>(id: Id, width: number, hei
   const name = width === height ? `${width} square` : `${height}p`;
 
   return {
-    ...DESKTOP_CHROME_EMULATION,
+    ...DESKTOP_BROWSER_SETTINGS,
     id,
     label: name,
     shortLabel: name,

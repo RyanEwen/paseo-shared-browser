@@ -14,6 +14,7 @@ const { values } = parseArgs({
     "tooling-root": { type: "string" },
     fixture: { type: "string", default: "handoff" },
     compact: { type: "boolean", default: false },
+    platform: { type: "string", default: "web" },
   },
 });
 if (
@@ -27,9 +28,13 @@ if (
     "control-gate-takeover",
     "control-gate-stale",
     "tab-focus",
+    "tab-layout",
   ].includes(values.fixture)
 )
   throw new Error("Unsupported panel fixture");
+if (!["web", "ios", "android"].includes(values.platform)) {
+  throw new Error("Unsupported panel platform");
+}
 const toolingRoot = resolve(values["tooling-root"] ?? repository);
 const tooling = createRequire(join(toolingRoot, "package.json"));
 // Existing tooling is required; this fixture never installs dependencies.
@@ -249,7 +254,7 @@ try {
         React.createElement(SharedBrowserPanel, {
           theme: { colors: new Proxy({}, { get: () => "#777" }) },
           host: { id: "fixture", label: "Fixture" },
-          layout: { compact: values.compact, platform: "web" },
+          layout: { compact: values.compact, platform: values.platform },
           workspaceId: "workspace",
         }),
       ),
@@ -270,20 +275,53 @@ try {
   );
   await flush(10);
   await React.act(async () => f.imageLoads.pop()());
-  assert(f.reads.length > 0, "first video request");
-  await React.act(async () =>
-    f.reads[0].resolve({
-      status: "ready",
-      state: { ...f.state },
-      streamId: "z".repeat(32),
-      packets: [frame(1)],
-    }),
-  );
-  await React.act(async () => f.paint());
-  await flush(20);
-  assert(document.body.textContent.includes("Video"), "video displayed");
-  console.log("PASS full panel painted Video");
-  if (values.fixture === "tab-focus") {
+  if (values.fixture !== "tab-layout") {
+    assert(f.reads.length > 0, "first video request");
+    await React.act(async () =>
+      f.reads[0].resolve({
+        status: "ready",
+        state: { ...f.state },
+        streamId: "z".repeat(32),
+        packets: [frame(1)],
+      }),
+    );
+    await React.act(async () => f.paint());
+    await flush(20);
+    assert(document.body.textContent.includes("Video"), "video displayed");
+    console.log("PASS full panel painted Video");
+  }
+  if (values.fixture === "tab-layout") {
+    const selected = document.querySelector('button[role="tab"][aria-selected="true"]');
+    assert(selected, "selected tab remains accessible");
+    const create = document.querySelector('button[aria-label="New browser tab"]');
+    const close = document.querySelector('button[aria-label="Close selected browser tab"]');
+    assert(create && !create.disabled, "new tab action remains available");
+    assert(close && !close.disabled, "close action remains available");
+    assert.equal(document.querySelectorAll('button[role="tab"]').length, 1);
+    const bar = create.parentElement;
+    const screen = bar.parentElement;
+    const chrome = document.querySelector('button[aria-label="Back"]').parentElement.parentElement;
+    const canvas = Array.from(screen.children).find((node) => node.style.overflow === "hidden");
+    assert(canvas, "rendered canvas shell exists");
+    assert.equal(canvas.parentElement, screen, "canvas and tabs share the panel flex column");
+    assert.equal(chrome.parentElement, screen);
+    const children = Array.from(screen.children);
+    const bottom = values.platform !== "web" || values.compact;
+    assert.equal(children.indexOf(bar) > children.indexOf(canvas), bottom);
+    assert.equal(children.indexOf(bar) > children.indexOf(chrome), bottom);
+    if (bottom) {
+      assert.equal(bar.style.flexShrink, "0", "bottom tabs keep their height");
+      assert.equal(bar.style.borderTopWidth, "1px");
+      assert.equal(Number.parseFloat(bar.style.borderBottomWidth), 0);
+      assert.equal(canvas.style.minHeight, "0", "canvas can shrink for a shorter host viewport");
+    } else {
+      assert.equal(bar.style.borderBottomWidth, "1px");
+      assert.equal(canvas.style.minHeight, "320px");
+    }
+    console.log(
+      `PASS mounted tab placement and actions: ${values.platform}, compact=${values.compact}, bottom=${bottom}`,
+    );
+  } else if (values.fixture === "tab-focus") {
     f.deferTabs = true;
     await React.act(async () => {
       void query.refetchQueries({ queryKey: ["shared-browser", "tabs", "fixture", "workspace"] });
