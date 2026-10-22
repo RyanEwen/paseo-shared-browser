@@ -114,7 +114,11 @@ class RemoteBrowserManager {
   }
 
   closeTab(input: CloseTabInput): Promise<CloseTabOutput> {
-    return this.requestBrowser<CloseTabOutput>("tabs.close", input);
+    const { controlToken, ...selection } = input;
+    return this.requestBrowser<CloseTabOutput>("tabs.close", {
+      ...selection,
+      ...(controlToken ? { controlToken } : {}),
+    });
   }
 
   detach(viewerToken: string): Promise<DetachOutput> {

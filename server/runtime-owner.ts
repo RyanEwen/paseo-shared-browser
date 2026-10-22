@@ -100,7 +100,7 @@ async function tabRuntime(owned: OwnedRuntime, targetId: string): Promise<AgentB
     }
     const runtime = new AgentBrowserRuntime(owned.runtimeOptions);
     try {
-      await runtime.attachTarget(targetId);
+      await runtime.attachTarget(targetId, owned.runtime);
       return runtime;
     } catch (error) {
       await runtime.shutdown().catch(() => undefined);
@@ -239,7 +239,7 @@ export async function createRuntimeOwner(
         throw error;
       }
     },
-    async request(owned, operation, input) {
+    async request(owned, operation, input, beforeMutation) {
       owned.display?.assertAvailable();
       const data =
         input && typeof input === "object" && !Array.isArray(input)
@@ -288,19 +288,23 @@ export async function createRuntimeOwner(
         const controller = owned.tabs.get(targetId);
         let previewController: AgentBrowserRuntime | undefined;
         let closeError: unknown;
+        beforeMutation?.();
         if (preview) {
           // Preview WebContents are tab-modal UI, not ordinary tabs. Chromium
           // can acknowledge Target.closeTarget without closing them. Use its
           // actual Cancel control and independently confirm disappearance below.
           try {
             previewController = await tabRuntime(owned, targetId);
-            await previewController.cancelPrintPreview();
+            await previewController.cancelPrintPreview(beforeMutation);
           } catch (error) {
             closeError = error;
           }
         } else {
-          if (controller) await (await controller).shutdown();
+          // Retire media/input reversibly until close is published. An expired guard
+          // must leave this pinned controller able to reattach to its surviving page.
+          if (controller) await (await controller).releaseTarget();
           if (owned.rootTargetId === targetId) await owned.runtime.releaseTarget();
+          beforeMutation?.();
           await owned.runtime.closeTarget(targetId);
         }
         // Target.closeTarget can acknowledge before Chromium drops the page from
@@ -321,6 +325,7 @@ export async function createRuntimeOwner(
         // Closing an unseen preview creates its first controller. Retain that
         // attachment until disappearance is confirmed, then release its CDP session.
         if (previewController) await previewController.shutdown();
+        else if (controller) await (await controller).shutdown();
         owned.tabs.delete(targetId);
         if (owned.rootTargetId === targetId) owned.rootTargetId = null;
         owned.tabOrder = owned.tabOrder.filter((id) => id !== targetId);

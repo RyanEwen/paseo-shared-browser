@@ -81,13 +81,14 @@ afterEach(() => {
   for (const manager of managers.splice(0)) manager.disconnect();
 });
 
-function createManager() {
+function createManager(now?: () => number) {
   let counter = 0;
   const client = new TabRuntimeClient();
   const manager = new SessionManager({
     client,
     validateWorkspace: async () => true,
     issueToken: () => `token_${String(++counter).padStart(40, "0")}`,
+    ...(now ? { now } : {}),
   });
   managers.push(manager);
   return { client, manager };
@@ -176,22 +177,89 @@ it("coalesces simultaneous first attachments to the same tab", async () => {
 it("closes one tab without ending another tab or the shared profile runtime", async () => {
   const { client, manager } = createManager();
   const first = await manager.attach("workspace-one", "First viewer");
+  await manager.acquireControl(first.viewerToken);
   const created = await manager.createTab(first.viewerToken);
   const second = await manager.attach("workspace-one", "Second viewer", created.tabId);
-  const control = await manager.acquireControl(second.viewerToken);
+  const otherController = await manager.attach("workspace-one", "Controller", created.tabId);
+  await manager.acquireControl(otherController.viewerToken);
 
   await manager.closeTab({
     viewerToken: second.viewerToken,
-    controlToken: control.controlToken,
     tabId: created.tabId,
     sessionId: second.state.sessionId,
     runtimeId: second.state.runtimeId!,
     scope: "tab",
   });
   await expect(manager.status(second.viewerToken)).rejects.toThrow("Browser tab is closed");
+  await expect(manager.status(otherController.viewerToken)).rejects.toThrow(
+    "Browser tab is closed",
+  );
   expect((await manager.status(first.viewerToken)).state.tabId).toBe("page-one");
+  expect((await manager.status(first.viewerToken)).state.controller).toBe("self");
   expect(client.pages.has("page-one")).toBe(true);
   expect((await manager.listTabs("workspace-one")).tabs.map((tab) => tab.id)).toEqual(["page-one"]);
+});
+
+it("refuses unconfirmed final closure, expired viewers, and stale tab identities without control", async () => {
+  const { client, manager } = createManager();
+  const first = await manager.attach("workspace-one", "Viewer");
+  const input = {
+    viewerToken: first.viewerToken,
+    tabId: first.state.tabId!,
+    sessionId: first.state.sessionId,
+    runtimeId: first.state.runtimeId!,
+    scope: "tab" as const,
+  };
+  await expect(manager.closeTab(input)).rejects.toThrow("last browser tab");
+  await expect(manager.closeTab({ ...input, scope: "last-tab" })).rejects.toThrow("control");
+  await manager.createTab(first.viewerToken);
+  for (const stale of [
+    { tabId: "page-2" },
+    { sessionId: "stale-session" },
+    { runtimeId: "stale-runtime" },
+  ]) {
+    await expect(manager.closeTab({ ...input, ...stale })).rejects.toThrow("stale");
+  }
+  await manager.detach(first.viewerToken);
+  await expect(manager.closeTab(input)).rejects.toThrow("invalid or expired");
+  expect(client.pages.size).toBe(2);
+});
+
+it("rechecks viewer expiry at native publication after waiting for tab metadata", async () => {
+  let now = 0;
+  const { client, manager } = createManager(() => now);
+  const viewer = await manager.attach("workspace-one", "Observer");
+  await manager.createTab(viewer.viewerToken);
+  const entered = Promise.withResolvers<void>();
+  const gate = Promise.withResolvers<void>();
+  const request = client.requestWorkspace.bind(client);
+  // The production runtime calls the same guard after its asynchronous target read.
+  (client as BrowserRuntimeClient).requestWorkspace = async (
+    workspace,
+    operation,
+    input,
+    guard,
+  ) => {
+    if (operation === "tabs.close") {
+      entered.resolve();
+      await gate.promise;
+      guard!.assertCurrent();
+    }
+    return request(workspace, operation, input);
+  };
+  const closing = manager.closeTab({
+    viewerToken: viewer.viewerToken,
+    tabId: viewer.state.tabId!,
+    sessionId: viewer.state.sessionId,
+    runtimeId: viewer.state.runtimeId!,
+    scope: "tab",
+  });
+  const refused = expect(closing).rejects.toThrow("invalid or expired");
+  await entered.promise;
+  now = 1_000_000;
+  gate.resolve();
+  await refused;
+  expect(client.pages.size).toBe(2);
 });
 
 it("keeps the browser runtime when an explicit tab is no longer available", async () => {

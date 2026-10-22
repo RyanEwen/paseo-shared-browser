@@ -28,7 +28,11 @@ if (
     "control-gate-takeover",
     "control-gate-stale",
     "tab-focus",
+    "tab-close",
+    "tab-close-last",
     "tab-layout",
+    "errors",
+    "quiet-video",
   ].includes(values.fixture)
 )
   throw new Error("Unsupported panel fixture");
@@ -67,7 +71,9 @@ const state = {
   viewport: { width: 1280, height: 800 },
   captureScale: 1,
   presetId: "desktop-1280x800",
-  controller: values.fixture === "control-gate-takeover" ? "other" : "none",
+  controller: ["control-gate-takeover", "tab-close", "tab-close-last"].includes(values.fixture)
+    ? "other"
+    : "none",
   controllerLabel: values.fixture === "control-gate-takeover" ? "Agent fixture" : null,
   canGoBack: false,
   canGoForward: false,
@@ -92,7 +98,9 @@ const f = {
   staleBeginOnce: false,
   deferTabs: false,
   tabReplies: [],
-  createdTabId: null,
+  createdTabId: values.fixture === "tab-close" ? "n".repeat(32) : null,
+  closedTabId: null,
+  createError: null,
 };
 globalThis.panelFixture = f;
 const rpcCache = new Map();
@@ -101,14 +109,19 @@ f.rpc = (contract) => {
     rpcCache.set(contract.name, async (input) => {
       f.calls.push({ name: contract.name, input });
       if (contract.name === "shared-browser.attach") {
-        if (values.fixture === "tab-focus" && input.tabId) {
+        if (["tab-focus", "tab-close"].includes(values.fixture) && input.tabId) {
           f.state = { ...f.state, tabId: input.tabId, sessionId: input.tabId };
         }
         return { viewerToken: f.token, state: { ...f.state } };
       }
       if (contract.name === "shared-browser.tabs.create") {
+        if (f.createError) throw f.createError;
         f.createdTabId = "n".repeat(32);
         return { tabId: f.createdTabId };
+      }
+      if (contract.name === "shared-browser.tabs.close") {
+        f.closedTabId = input.tabId;
+        return { closed: true, browserClosed: input.scope === "last-tab" };
       }
       if (contract.name === "shared-browser.tabs.list") {
         const result = {
@@ -131,7 +144,7 @@ f.rpc = (contract) => {
                   },
                 ]
               : []),
-          ],
+          ].filter((tab) => tab.id !== f.closedTabId),
         };
         if (f.deferTabs) {
           return new Promise((resolve) => f.tabReplies.push({ result, resolve }));
@@ -177,7 +190,7 @@ const native = await readFile(
 await writeFile(
   join(out, "sdk.cjs"),
   native +
-    `\nmodule.exports.useRpc=c=>globalThis.panelFixture.rpc(c);module.exports.useSettings=()=>({status:'loading',saving:false});\nmodule.exports.Image=props=>{React.useEffect(()=>{globalThis.panelFixture.imageLoads.push(()=>props.onLoad?.())},[props.source?.uri]);return React.createElement('img',{'data-image':'yes',style:rnStyle(props.style),src:props.source?.uri})};\nmodule.exports.AppState.currentState='active';`,
+    `\nmodule.exports.useRpc=c=>globalThis.panelFixture.rpc(c);module.exports.useSettings=()=>(${["errors", "quiet-video"].includes(values.fixture) ? "{status:'ready',saving:false,values:{favoritePresetIds:[],captureQuality:'high',liveVideoEnabled:true,videoBitrate:12000000,videoFps:30,graphicsPreference:'host-default'},revision:'fixture',saveError:null,save:async()=>true,reload:async()=>{},reset:async()=>true}" : "{status:'loading',saving:false}"});\nmodule.exports.Image=props=>{React.useEffect(()=>{globalThis.panelFixture.imageLoads.push(()=>props.onLoad?.())},[props.source?.uri]);return React.createElement('img',{'data-image':'yes',style:rnStyle(props.style),src:props.source?.uri})};\nmodule.exports.AppState.currentState='active';`,
 );
 await writeFile(
   join(out, "web.ts"),
@@ -275,7 +288,7 @@ try {
   );
   await flush(10);
   await React.act(async () => f.imageLoads.pop()());
-  if (values.fixture !== "tab-layout") {
+  if (values.fixture !== "tab-layout" && !values.fixture.startsWith("tab-close")) {
     assert(f.reads.length > 0, "first video request");
     await React.act(async () =>
       f.reads[0].resolve({
@@ -287,7 +300,9 @@ try {
     );
     await React.act(async () => f.paint());
     await flush(20);
-    assert(document.body.textContent.includes("Video"), "video displayed");
+    if (["errors", "quiet-video"].includes(values.fixture))
+      assert.equal(f.draws, 1, "production video presentation painted");
+    else assert(document.body.textContent.includes("Video"), "video displayed");
     console.log("PASS full panel painted Video");
   }
   if (values.fixture === "tab-layout") {
@@ -360,6 +375,43 @@ try {
     }
     console.log(
       `PASS mounted tab placement and actions: ${values.platform}, compact=${values.compact}, bottom=${bottom}`,
+    );
+  } else if (values.fixture.startsWith("tab-close")) {
+    const close = document.querySelector('button[aria-label="Close selected browser tab"]');
+    assert(close && !close.disabled);
+    await React.act(async () => close.click());
+    await flush(20);
+    const calls = (name) => f.calls.filter((call) => call.name === `shared-browser.${name}`);
+    if (values.fixture === "tab-close-last") {
+      assert(
+        document.querySelector('section[aria-label$="control?"]'),
+        "final close still asks for control",
+      );
+      assert.equal(calls("tabs.close").length, 0);
+    } else {
+      const dialog = document.querySelector('section[aria-label="Close browser tab?"]');
+      assert(dialog, "observer gets the close confirmation directly");
+      assert.equal(calls("control.acquire").length, 0);
+      // Another viewer's control change does not revoke tab-management authority.
+      f.state = { ...f.state, controller: "none", controllerLabel: null };
+      await React.act(async () =>
+        query.refetchQueries({ queryKey: ["shared-browser", "attach", "fixture", "workspace"] }),
+      );
+      await flush(20);
+      assert(
+        document.body.textContent.includes("No controller"),
+        "new controller observation reached the panel",
+      );
+      await React.act(async () => dialog.querySelector('button[aria-label="Close tab"]').click());
+      await flush(30);
+      assert.equal(calls("tabs.close").length, 1);
+      assert.equal(calls("tabs.close")[0].input.controlToken, undefined);
+      assert.equal(calls("tabs.close")[0].input.scope, "tab");
+      assert.equal(calls("control.acquire").length, 0);
+      assert.equal(f.closedTabId, state.tabId);
+    }
+    console.log(
+      `PASS mounted ${values.fixture}: ordinary close observes only; final close requires control`,
     );
   } else if (values.fixture === "tab-focus") {
     f.deferTabs = true;
@@ -451,7 +503,148 @@ try {
         "icon-only controls expose native hover titles",
       );
     }
-    if (values.fixture === "settlement") {
+    if (values.fixture === "quiet-video") {
+      const overlay = f.host.nextElementSibling;
+      overlay.getBoundingClientRect = () => ({ left: 0, top: 0, width: 800, height: 500 });
+      let resolved = 1;
+      const keepAlive = setInterval(() => {
+        while (resolved < f.reads.length)
+          f.reads[resolved++].resolve({
+            status: "waiting",
+            state: { ...f.state },
+            streamId: "z".repeat(32),
+            packets: [],
+          });
+      }, 80);
+      try {
+        await flush(3400);
+      } finally {
+        clearInterval(keepAlive);
+      }
+      assert(f.captures.length >= 2, "healthy empty video reads still request fresh image pixels");
+      const capture = f.captures.at(-1);
+      assert.equal(capture.input.knownFrameId, null, "fallback requires an actual image payload");
+      assert.equal(f.calls.filter((c) => c.name === "shared-browser.gesture.update").length, 0);
+      await React.act(async () =>
+        capture.resolve({
+          state: { ...f.state },
+          frame: {
+            ...frame(2).frame,
+            mimeType: "image/jpeg",
+            transport: "screenshot",
+            dataBase64: "AQ==",
+            byteLength: 1,
+          },
+        }),
+      );
+      await flush(20);
+      await React.act(async () => f.imageLoads.pop()());
+      await flush(20);
+      const pointer = async (type) => {
+        await React.act(async () =>
+          overlay.dispatchEvent(
+            new dom.window.MouseEvent(type, {
+              clientX: 200,
+              clientY: 100,
+              button: 0,
+              buttons: type === "mousedown" ? 1 : 0,
+              bubbles: true,
+            }),
+          ),
+        );
+        await flush(20);
+      };
+      await pointer("mousedown");
+      await pointer("mouseup");
+      const down = f.calls.find(
+        (c) => c.name === "shared-browser.gesture.update" && c.input.event.kind === "down",
+      );
+      assert(down, "one explicit click publishes after fresh image decode");
+      assert.equal(down.input.target.frameId, frame(2).frame.frameId);
+      assert.equal(
+        f.calls.filter(
+          (c) => c.name === "shared-browser.gesture.update" && c.input.event.kind === "down",
+        ).length,
+        1,
+      );
+      console.log(
+        "PASS quiet healthy video hands off through actual JPEG decode before one explicit fresh-frame click",
+      );
+    } else if (values.fixture === "errors") {
+      f.deferNavigation = true;
+      const temporaryError =
+        "The view expired before this action could start. The action was not sent. Wait for the view to refresh, then try again.";
+      const expired = () =>
+        new Error(
+          "Request failed: Browser frame is stale (stage=admission; reason=expired; ageMs=5126) requestType=plugin.rpc.invoke.request code=handler_error",
+        );
+      const reload = () => document.querySelector('button[aria-label="Reload"]');
+      const publishReload = async () => {
+        await React.act(async () => reload().click());
+        await flush(20);
+        return f.deferredNavigations.at(-1);
+      };
+      const original = await publishReload();
+      await React.act(async () => original.reject(expired()));
+      await flush(20);
+      assert(document.body.textContent.includes(temporaryError));
+      const dismiss = document.querySelector('button[aria-label="Dismiss message"]');
+      assert(dismiss, "visible operation failure has accessible dismissal");
+      const publishedBeforeDismiss = f.calls.length;
+      await React.act(async () => dismiss.click());
+      await flush(20);
+      assert(!document.body.textContent.includes(temporaryError));
+      assert.equal(f.calls.length, publishedBeforeDismiss, "dismissal performs no browser RPC");
+      const repeated = await publishReload();
+      await React.act(async () => repeated.reject(expired()));
+      await flush(20);
+      assert(document.body.textContent.includes(temporaryError), "same new failure resurfaces");
+      const recovery = await publishReload();
+      await React.act(async () => recovery.resolve({ state: { ...f.state } }));
+      await flush(20);
+      assert(
+        !document.body.textContent.includes(temporaryError),
+        "successful retry clears its prior failure",
+      );
+      const older = await publishReload();
+      f.createError = new Error("Newer tab failure");
+      const create = document.querySelector('button[aria-label="New browser tab"]');
+      assert(create && !create.disabled);
+      await React.act(async () => create.click());
+      await flush(20);
+      assert(document.body.textContent.includes("Newer tab failure"));
+      await React.act(async () => older.resolve({ state: { ...f.state } }));
+      await flush(20);
+      assert(
+        document.body.textContent.includes("Newer tab failure"),
+        "old success cannot clear newer failure",
+      );
+      assert.equal(
+        f.calls.filter((c) => c.name === "shared-browser.navigate").length,
+        4,
+        "only four explicit retries published",
+      );
+      assert.equal(f.calls.filter((c) => c.name === "shared-browser.tabs.create").length, 1);
+      await React.act(async () =>
+        document.querySelector('button[aria-label="Dismiss message"]').click(),
+      );
+      await flush(20);
+      assert(!document.body.textContent.includes("Newer tab failure"));
+      await React.act(async () => f.reads.at(-1).reject(new Error("Viewing failed")));
+      await flush(20);
+      assert(document.body.textContent.includes("Viewing failed"));
+      await React.act(async () =>
+        document.querySelector('button[aria-label="Dismiss message"]').click(),
+      );
+      await flush(20);
+      assert(
+        !document.body.textContent.includes("Viewing failed"),
+        "viewing error can be dismissed while retry remains active",
+      );
+      console.log(
+        "PASS mounted error dismissal, repeat failure, relevant recovery and old-success/new-error race; no action replay",
+      );
+    } else if (values.fixture === "settlement") {
       // Real Query callback replacement: viewing recovery completes while a
       // published control acquisition is still awaiting its original reply.
       f.token = "n".repeat(32);

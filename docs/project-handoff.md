@@ -8,6 +8,22 @@ Keep all existing fork features active, including Android video, direct native k
 
 Trusted agent attachment selects a 60-second screenshot receipt and five-minute idle control and viewer leases. Public viewer attachment keeps its existing 5-second frame, 30-second control, and 45-second heartbeat policy. Never infer agent trust from a label. Receipt authority is separated between human and agent observations of the same cached frame. Human takeover remains immediate, and navigation, viewport, document, runtime, attachment, and control fences still apply. Native gesture cleanup has a separate five-second idle timer; it does not reduce the agent screenshot lifetime. Effective policy is exposed in agent state and descriptions.
 
+## Independent native windows and tab closing
+
+Ryan approved one invisible native window per content tab to satisfy browser-side WebAuthn visibility without changing independent viewer selections. The hidden window manager uses exact debugger/native-tab identity, preserves existing browsing contexts and opener relationships, and excludes capture helpers and print previews. No new extension permissions are required. Headless and owned private displays are supported; real-desktop headed launches are rejected before starting Chromium. Keep image-only raster policy separate from idle extension availability.
+
+Safe identity/state/tab observations can recreate the hidden manager and its browser-management connection only while the original nonce-owned browser is alive. This remains possible after the launch content tab closes. Never adopt a survivor as the root page, replace the process, or replay an uncertain action during recovery. Input fails closed until native target readiness is known.
+
+Ordinary tab closure requires an active viewer and exact runtime/tab/selection fences, with explicit human confirmation, but does not require control. Final-tab closure still requires control and explicit `last-tab` scope, and preview survivors still refuse browser shutdown. Cleanup before close publication must be reversible if authority expires; permanent controller retirement follows confirmed target disappearance.
+
+The [focus investigation](page-focus-investigation.md) records Linux Chrome 155 headless/Xvfb/Wayland admission, popup identity, independent capture, management-loss recovery and real print/close evidence. It also records the immediate-script popup race, untested real passkey enrollment and native cross-platform limits, zero measured colour change from HEAD without a fidelity claim, and an unchanged-HEAD forced-screencast recovery failure. Do not describe that full retained smoke suite as passing.
+
+## Frame freshness and error recovery
+
+Healthy empty video reads cannot renew painted-frame input authority. The existing 2.5-second watchdog requests fresh image/video pixels before the human five-second receipt expires, keeping old video visible only until the exact replacement decodes. Do not extend frame TTLs, relabel source timestamps or replay clicks to hide freshness failures. The [frame investigation](stale-frame-investigation.md) records the exact age5126 reproduction, layered native/policy/mounted proofs and unresolved live capture trigger.
+
+Notices are dismissible per occurrence and panel scope. Relevant successful actions clear only the failure they observed at publication; old success must never hide a newer failure. Dismissal changes presentation only. Native passkey chooser capture/input remains a separate pending decision; focus admission alone does not qualify complete passkey interaction.
+
 ## Mobile tab placement
 
 The tab row follows the panel's existing touch-first policy: `layout.platform !== "web" || layout.compact`. All iOS and Android hosts, including wide tablets, place the page title and display status bar above the canvas, followed by tabs and then the address toolbar below the canvas. Compact web layouts do the same; other web layouts keep tabs above the address toolbar and the title/display status below the canvas. The host supplies `layout.compact`; this plugin does not introduce a width breakpoint or infer mobile from the remote browser's emulation settings.

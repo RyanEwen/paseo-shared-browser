@@ -26,7 +26,7 @@ import { browserDisplayDemandRpc } from "../shared/browser-display-demand";
 import { readBrowserVideoRpc, runtimeVideoReadInputSchema } from "../shared/browser-video";
 import { DEFAULT_CAPTURE_QUALITY } from "../shared/capture-settings";
 import { AgentBindingStore } from "./agent-binding-store";
-import { SessionManager } from "./browser-policy";
+import { type BrowserRuntimeMutationGuard, SessionManager } from "./browser-policy";
 import { AGENT_VIEWER_POLICY } from "./browser-viewer-policy";
 import { CdpUnknownOutcomeError } from "./cdp";
 import {
@@ -69,7 +69,13 @@ export interface RuntimeInstance {
 
 export interface RuntimeOwner<Runtime extends RuntimeInstance = RuntimeInstance> {
   create(workspaceId: string): Promise<Runtime>;
-  request(runtime: Runtime, operation: string, input: JsonValue): Promise<JsonValue>;
+  /** Invoke beforeMutation after awaited preparation and immediately before publishing a guarded mutation. */
+  request(
+    runtime: Runtime,
+    operation: string,
+    input: JsonValue,
+    beforeMutation?: () => void,
+  ): Promise<JsonValue>;
   stop(runtime: Runtime): Promise<void>;
 }
 
@@ -162,8 +168,8 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
         connect: async () => ({ epoch: this.nextEpoch }),
         ensureWorkspace: (workspaceId, options) =>
           this.ensureWorkspaceLocal(workspaceId, options?.replaceLost === true),
-        requestWorkspace: (workspaceId, operation, input) =>
-          this.requestWorkspaceLocal(workspaceId, operation, input),
+        requestWorkspace: (workspaceId, operation, input, guard) =>
+          this.requestWorkspaceLocal(workspaceId, operation, input, guard),
         archiveWorkspace: (workspaceId) => this.archiveWorkspaceLocal(workspaceId).then(() => {}),
         closeWorkspace: (workspaceId, runtimeId) =>
           this.closeWorkspaceLocal(workspaceId, runtimeId),
@@ -328,6 +334,7 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
     workspaceId: string,
     operation: string,
     input: JsonValue,
+    guard?: BrowserRuntimeMutationGuard,
   ): Promise<JsonValue> {
     // Capture the caller before entering the workspace tail. Revocation must
     // fence queued native publication, not only the initial ticket lookup.
@@ -363,7 +370,31 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
         if (operation === "input.begin") agent.channels.set(channelId, entry.runtime);
       }
       try {
-        const result = await this.owner.request(entry.runtime, operation, input);
+        const beforeMutation = () => {
+          if (guard) {
+            if (
+              this.workspaces.get(workspaceId) !== entry ||
+              entry.runtime.runtimeId !== guard.runtimeId
+            )
+              throw new RuntimeProtocolError("RUNTIME_FAILURE", "Browser runtime was replaced");
+            guard.assertCurrent();
+          }
+          if (agent) {
+            this.assertAgentBindingCurrent(agent.binding);
+            if (agent.binding.selectionRevision !== agent.selectionRevision)
+              throw new RuntimeProtocolError(
+                "AUTHENTICATION_FAILED",
+                "Agent tab selection changed",
+              );
+          }
+        };
+        if (guard) beforeMutation();
+        const result = await this.owner.request(
+          entry.runtime,
+          operation,
+          input,
+          guard ? beforeMutation : undefined,
+        );
         // Revocation blocks new publication, but never strands a possibly published press.
         // These records allow only its policy-generated paired release, on the
         // original runtime, before the outer request refuses its revoked result.
@@ -826,15 +857,18 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
       const viewerToken = binding.viewerToken;
       const controlToken = binding.controlToken;
       const tabId = binding.tabId;
-      if (!viewerToken || !controlToken || !tabId) {
-        throw new RuntimeProtocolError("AUTHENTICATION_FAILED", "Agent does not control a tab");
+      if (!viewerToken || !tabId) {
+        throw new RuntimeProtocolError(
+          "AUTHENTICATION_FAILED",
+          "Observe the selected browser tab first",
+        );
       }
       const current = binding.lastState;
       if (!current?.runtimeId)
         throw new RuntimeProtocolError("INVALID_REQUEST", "Observe the selected browser tab first");
       const result = await this.browserPolicy.closeTab({
         viewerToken,
-        controlToken,
+        ...(controlToken ? { controlToken } : {}),
         tabId,
         sessionId: current.sessionId,
         runtimeId: current.runtimeId,

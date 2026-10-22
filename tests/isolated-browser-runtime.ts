@@ -14,6 +14,7 @@ type Runtime = Awaited<ReturnType<Owner["create"]>>;
 export async function withIsolatedBrowser(
   run: (owner: Owner, runtime: Runtime) => Promise<void>,
   graphicsMode?: BrowserGraphicsMode,
+  options: { nativeVideo?: boolean; privateDesktop?: boolean } = {},
 ): Promise<void> {
   if (
     !process.env.PASEO_SHARED_BROWSER_AGENT_BROWSER_BINARY ||
@@ -21,7 +22,7 @@ export async function withIsolatedBrowser(
   ) {
     throw new Error("Browser smoke requires explicit agent-browser and Chromium binary paths");
   }
-  const preparedHome = process.env.PASEO_HOME;
+  const preparedHome = process.env.PASEO_SHARED_BROWSER_TEST_ASSETS_HOME ?? process.env.PASEO_HOME;
   const home = await mkdtemp(join(tmpdir(), "shared-browser-smoke-"));
   vi.stubEnv("PASEO_HOME", home);
   let owner: Owner | null = null;
@@ -44,7 +45,14 @@ export async function withIsolatedBrowser(
       // Verify the deployed file path independently of the shell environment.
       vi.stubEnv("PASEO_SHARED_BROWSER_GRAPHICS", undefined);
     }
-    owner = await createRuntimeOwner({ initialUrl: "about:blank" });
+    if (options.privateDesktop) await createRuntimeGraphicsSettings(home).update("private-desktop");
+    owner = await createRuntimeOwner({
+      initialUrl: "about:blank",
+      ...options,
+      ...(process.env.PASEO_SHARED_BROWSER_TEST_XVFB
+        ? { virtualDisplayExecutablePath: process.env.PASEO_SHARED_BROWSER_TEST_XVFB }
+        : {}),
+    });
     runtime = await owner.create("isolated-browser-smoke");
     await run(owner, runtime);
   } finally {

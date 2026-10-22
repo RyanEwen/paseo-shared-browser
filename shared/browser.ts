@@ -149,7 +149,7 @@ export const closeBrowserTabRpc = defineRpc({
   name: "shared-browser.tabs.close",
   input: z.object({
     viewerToken: opaqueTokenSchema,
-    controlToken: opaqueTokenSchema,
+    controlToken: opaqueTokenSchema.optional(),
     tabId: browserTabIdSchema,
     sessionId: opaqueTokenSchema,
     runtimeId: runtimeIdSchema,

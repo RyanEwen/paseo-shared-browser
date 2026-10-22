@@ -2,6 +2,7 @@
 import { createHash } from "node:crypto";
 import { chmod, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { BROWSER_WINDOW_ISOLATION_SOURCE } from "./browser-window-isolation-source";
 import { NATIVE_VIDEO_EXTENSION_SOURCE } from "./native-video-extension-source";
 
 const PUBLIC_EXTENSION_KEY =
@@ -15,6 +16,7 @@ export const NATIVE_VIDEO_EXTENSION_ID = [
   .map((byte) => String.fromCharCode(97 + (byte >> 4), 97 + (byte & 15)))
   .join("");
 const HELPER_HTML = '<!doctype html><meta charset="utf-8"><script src="recorder.js"></script>';
+const WINDOWS_HTML = '<!doctype html><meta charset="utf-8"><script src="windows.js"></script>';
 const HELPER_MANIFEST = JSON.stringify({
   manifest_version: 3,
   name: "Shared Browser native capture",
@@ -26,6 +28,8 @@ const CONTENT_HASH = createHash("sha256")
   .update(HELPER_MANIFEST)
   .update(HELPER_HTML)
   .update(NATIVE_VIDEO_EXTENSION_SOURCE)
+  .update(WINDOWS_HTML)
+  .update(BROWSER_WINDOW_ISOLATION_SOURCE)
   .digest("hex");
 const preparations = new Map<string, Promise<string>>();
 
@@ -57,6 +61,8 @@ async function materializeExtension(ipcDirectory: string): Promise<string> {
       writeFile(join(temporary, "manifest.json"), HELPER_MANIFEST, { mode: 0o600 }),
       writeFile(join(temporary, "recorder.html"), HELPER_HTML, { mode: 0o600 }),
       writeFile(join(temporary, "recorder.js"), NATIVE_VIDEO_EXTENSION_SOURCE, { mode: 0o600 }),
+      writeFile(join(temporary, "windows.html"), WINDOWS_HTML, { mode: 0o600 }),
+      writeFile(join(temporary, "windows.js"), BROWSER_WINDOW_ISOLATION_SOURCE, { mode: 0o600 }),
     ]);
     await writeFile(join(temporary, "complete"), CONTENT_HASH, { mode: 0o600 });
     try {

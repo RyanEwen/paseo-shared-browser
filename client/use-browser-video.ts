@@ -197,7 +197,6 @@ export function useBrowserVideo(options: BrowserVideoOptions) {
       let retryNotBefore = 0;
       let explicitRetryTimer: ReturnType<typeof setTimeout> | null = null;
       let lastPaintedAt = Date.now();
-      let lastQuietReadAt = 0;
       let streamId: string | null = null;
       let sequence = 0;
       let keyRequested = true;
@@ -288,8 +287,7 @@ export function useBrowserVideo(options: BrowserVideoOptions) {
       transport = readTransport;
       activeMedia.current = readTransport;
       const watchdog = setInterval(() => {
-        if (Date.now() - Math.max(lastPaintedAt, lastQuietReadAt) <= 2500 || !visible.current)
-          return;
+        if (Date.now() - lastPaintedAt <= 2500 || !visible.current) return;
         // Request a new image, but hold the already painted canvas until that
         // exact request is decoded. Display retention grants no input receipt.
         if (!fallbackRef.current) {
@@ -399,22 +397,9 @@ export function useBrowserVideo(options: BrowserVideoOptions) {
             if (!result) continue;
             const { reply, observationEpoch: epoch } = result;
             if (!latest.current.acceptState(reply.state)) continue;
-            // An unchanged tab may produce no native frames. Only a healthy
-            // same-stream read with every received packet already painted can
-            // renew the quiet-picture hold. Reset, stale authority and a stuck
-            // decoder still fall through to the ordinary stall watchdog.
-            // Input revocation removes frontRef, but leaves these pixels visible.
-            // Liveness may retain them without restoring their input authority.
-            const painted = displayedPacket.current;
-            if (
-              reply.status === "waiting" &&
-              painted &&
-              reply.streamId === painted.streamId &&
-              painted.sequence === sequence &&
-              latest.current.isCurrent(painted, epoch)
-            ) {
-              lastQuietReadAt = Date.now();
-            }
+            // Successful empty reads renew viewing demand, not the age of the
+            // painted input receipt. The ordinary watchdog must still obtain
+            // fresh pixels before that receipt reaches its host deadline.
             if (reply.status === "unsupported") {
               if (readTransport.usingMedia) {
                 readTransport.fallback(

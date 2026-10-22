@@ -20,6 +20,7 @@ function fixture() {
   }>();
   const retryHistory = Promise.withResolvers<Awaited<typeof history.promise>>();
   const retryMetadata = Promise.withResolvers<Awaited<typeof metadata.promise>>();
+  const readsStarted = Promise.withResolvers<void>();
   const timeouts: number[] = [];
   let onRead: (method: string, attempt: number) => void = () => {};
   const page = {
@@ -31,6 +32,7 @@ function fixture() {
       if (method === "Page.getNavigationHistory") {
         return attempt === 0 ? history.promise : retryHistory.promise;
       }
+      if (attempt === 0) readsStarted.resolve();
       return attempt === 0 ? metadata.promise : retryMetadata.promise;
     },
   };
@@ -52,6 +54,8 @@ function fixture() {
     metadata,
     retryHistory,
     retryMetadata,
+    // Race tests begin after both native reads enter, independent of admission awaits.
+    readsStarted: readsStarted.promise,
     timeouts,
     intercept: (callback: typeof onRead) => {
       onRead = callback;
@@ -67,7 +71,7 @@ describe("fresh parallel native page metadata", () => {
   it("discards both old reads and returns one fresh pair after a same-page document change", async () => {
     const f = fixture();
     const pending = f.runtime.state();
-    await Promise.resolve();
+    await f.readsStarted;
     f.control.documentGeneration++;
     f.retryHistory.resolve({
       currentIndex: 0,
@@ -98,7 +102,7 @@ describe("fresh parallel native page metadata", () => {
   it("starts both independent reads before either resolves and retains native history facts", async () => {
     const f = fixture();
     const pending = f.runtime.state();
-    await Promise.resolve();
+    await f.readsStarted;
     expect(f.calls).toEqual(["Page.getNavigationHistory", "Runtime.evaluate"]);
     f.metadata.resolve({
       result: { value: { url: "https://example.test/current#hash", title: "Fresh title" } },
@@ -127,7 +131,7 @@ describe("fresh parallel native page metadata", () => {
     for (const kind of ["attachment", "page", "shutdown"] as const) {
       const f = fixture();
       const pending = f.runtime.state();
-      await Promise.resolve();
+      await f.readsStarted;
       if (kind === "shutdown") f.control.stopping = true;
       if (kind === "attachment") f.control.attachmentGeneration++;
       if (kind === "page")
@@ -146,7 +150,7 @@ describe("fresh parallel native page metadata", () => {
       if (method === "Runtime.evaluate" && attempt === 1) f.control.documentGeneration++;
     });
     const pending = f.runtime.state();
-    await Promise.resolve();
+    await f.readsStarted;
     f.control.documentGeneration++;
     f.history.resolve({ currentIndex: 1, entries });
     f.metadata.resolve({ result: {} });
@@ -162,7 +166,7 @@ describe("fresh parallel native page metadata", () => {
     const monotonic = vi.spyOn(performance, "now").mockImplementation(() => clock);
     try {
       const pending = f.runtime.state({ timeoutMs: 1_000 });
-      await Promise.resolve();
+      await f.readsStarted;
       clock += 700;
       f.control.documentGeneration++;
       f.history.resolve({ currentIndex: 1, entries });
@@ -184,7 +188,7 @@ describe("fresh parallel native page metadata", () => {
     const monotonic = vi.spyOn(performance, "now").mockImplementation(() => clock);
     try {
       const pending = f.runtime.state({ timeoutMs: 1_000 });
-      await Promise.resolve();
+      await f.readsStarted;
       clock += 1_000;
       f.control.documentGeneration++;
       f.history.resolve({ currentIndex: 1, entries });
@@ -207,7 +211,7 @@ describe("fresh parallel native page metadata", () => {
           if (method === "Runtime.evaluate" && attempt === 1) secondStarted.resolve();
         });
         const pending = f.runtime.state({ timeoutMs: 1_000 });
-        await Promise.resolve();
+        await f.readsStarted;
         if (phase === "second") {
           clock += 700;
           f.control.documentGeneration++;
@@ -236,7 +240,7 @@ describe("fresh parallel native page metadata", () => {
       const f = fixture();
       const pending = f.runtime.state();
       const refusal = expect(pending).rejects.toThrow("Read unavailable");
-      await Promise.resolve();
+      await f.readsStarted;
       f.control.documentGeneration++;
       if (failed === "history") f.history.reject(new Error("Read unavailable"));
       else f.history.resolve({ currentIndex: 1, entries });

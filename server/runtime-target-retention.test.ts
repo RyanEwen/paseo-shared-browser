@@ -2,6 +2,7 @@
 import { EventEmitter } from "node:events";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentBrowserRuntime } from "./agent-browser-runtime";
+import { BrowserWindowIsolation } from "./browser-window-isolation";
 import { CdpConnection, type CdpSession } from "./cdp";
 
 class ConnectionFixture extends EventEmitter {
@@ -48,6 +49,13 @@ interface RuntimeControl {
 
 /** Stub only binary discovery and CDP transport, preserving runtime selection policy. */
 function fixture(targetLists: string[][]) {
+  // Window ownership has its own real-browser and helper tests. Keep this fixture
+  // at the transport/selection seam, without creating an extension document.
+  vi.spyOn(BrowserWindowIsolation, "connect").mockResolvedValue({
+    settle: async () => {},
+    isAvailable: true,
+    dispose: async () => {},
+  } as unknown as BrowserWindowIsolation);
   const connections = targetLists.map((ids) => new ConnectionFixture(ids));
   let next = 0;
   vi.spyOn(CdpConnection, "connect").mockImplementation(async () => {

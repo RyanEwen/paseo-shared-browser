@@ -3,9 +3,11 @@ import { randomUUID } from "node:crypto";
 import { chmod, mkdir, readFile, rm } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
 import { promisify } from "node:util";
+import { isPrintPreviewUrl } from "../shared/browser-page";
 import { canUseCaptureDensity, captureDensitySchema } from "../shared/capture-density";
 import { captureDimensions, DEFAULT_JPEG_QUALITY } from "../shared/capture-settings";
 import { MAX_VIEWPORT } from "../shared/viewport-limits";
+import { BrowserWindowIsolation } from "./browser-window-isolation";
 import {
   attachToTarget,
   CdpConnection,
@@ -319,6 +321,11 @@ export class AgentBrowserRuntime {
   private readonly daemonExitWaitMs: number;
   private connection: CdpConnection | null = null;
   private page: CdpSession | null = null;
+  private windowIsolation: BrowserWindowIsolation | null = null;
+  private windowIsolationOwner: AgentBrowserRuntime | null = null;
+  private windowIsolationRequired = false;
+  private managementRecovery: Promise<void> | null = null;
+  private contentTarget = true;
   private targetId: string | null = null;
   private viewport: DeviceEmulation | null = null;
   private emulationAppliedPage: CdpSession | null = null;
@@ -397,6 +404,11 @@ export class AgentBrowserRuntime {
   async launch(): Promise<void> {
     this.assertRuntimeOpen();
     if (this.connection?.isOpen) return;
+    if (this.headed && !this.privateDisplay) {
+      throw new AgentBrowserIncompatibleError(
+        "Independent browser windows require headless mode or an owned private display",
+      );
+    }
     this.invalidateScreencastFrame();
     await mkdir(this.profilePath, { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
     await mkdir(this.ipcDirectory, { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
@@ -407,11 +419,9 @@ export class AgentBrowserRuntime {
     this.assertRuntimeOpen();
     await this.assertVersion();
     this.assertRuntimeOpen();
-    // Preparing the helper does not create a capture page, stream or encoder.
-    // readVideo checks the current host choice before acquiring any of them.
-    const videoExtension = this.nativeVideo
-      ? await prepareNativeVideoExtension(this.ipcDirectory)
-      : null;
+    // The window manager uses the same trusted extension in image-only mode.
+    // Its hidden management page never starts a capture stream or encoder.
+    const runtimeExtension = await prepareNativeVideoExtension(this.ipcDirectory);
     this.assertRuntimeOpen();
     const existingArguments = process.env.PASEO_SHARED_BROWSER_CHROMIUM_ARGS;
     const chromiumArguments = [
@@ -420,12 +430,12 @@ export class AgentBrowserRuntime {
       // agent-browser suppresses headless flags whenever an extension is present.
       // This helper has no content scripts and works in modern headless Chrome;
       // preserve the selected display mode while keeping capture ready but idle.
-      videoExtension && !this.headed ? "--headless=new" : undefined,
+      !this.headed ? "--headless=new" : undefined,
       // Tab capture copies the native compositor surface. Page emulation's DPR
       // alone can leave it rasterized at 1x, then enlarged to a nominal 2x stream.
       // Prepare the surface for our maximum capture density; each tab still
       // independently controls its CSS size, emulated DPR and 1x/2x output.
-      videoExtension && this.graphics.mode !== "wayland"
+      this.nativeVideo && this.graphics.mode !== "wayland"
         ? "--force-device-scale-factor=2"
         : undefined,
       // Retain the image-only headless path's software WebGL fallback, including
@@ -436,7 +446,7 @@ export class AgentBrowserRuntime {
       // agent-browser creates the launch page itself. Chromium's default
       // startup window otherwise leaves an additional chrome://newtab page.
       "--no-startup-window",
-      videoExtension ? `--allowlisted-extension-id=${NATIVE_VIDEO_EXTENSION_ID}` : undefined,
+      `--allowlisted-extension-id=${NATIVE_VIDEO_EXTENSION_ID}`,
     ]
       .filter(Boolean)
       .join(",");
@@ -451,7 +461,8 @@ export class AgentBrowserRuntime {
       this.profilePath,
       "--executable-path",
       this.executablePath,
-      ...(videoExtension ? ["--extension", videoExtension] : []),
+      "--extension",
+      runtimeExtension,
       "--hide-scrollbars",
       "false",
       ...(this.headed ? ["--headed"] : []),
@@ -514,19 +525,37 @@ export class AgentBrowserRuntime {
   }
 
   /** Attach an independent page controller to an existing browser session. */
-  async attachTarget(targetId: string): Promise<void> {
+  async attachTarget(targetId: string, owner: AgentBrowserRuntime): Promise<void> {
     this.assertRuntimeOpen();
+    if (
+      owner === this ||
+      !owner.ownsBrowser ||
+      owner.session !== this.session ||
+      owner.ipcDirectory !== this.ipcDirectory ||
+      owner.profilePath !== this.profilePath
+    ) {
+      throw new AgentBrowserIncompatibleError("Browser window owner does not match this session");
+    }
     this.ownsBrowser = false;
+    this.windowIsolationOwner = owner;
     await this.connectCdp(targetId, false);
   }
 
   /** Create a page in the existing profile without changing another controller's selected page. */
   async createTarget(url = "about:blank"): Promise<string> {
+    await this.settleWindows();
     const result = await this.requireConnection().send<{ targetId: string }>(
       "Target.createTarget",
-      { url },
+      { url, newWindow: true, background: true },
       { mutation: true },
     );
+    try {
+      await this.settleWindows(result.targetId);
+    } catch {
+      throw new CdpUnknownOutcomeError(
+        "Browser tab was created but its native window readiness is unknown; refresh the tab list before creating again",
+      );
+    }
     return result.targetId;
   }
 
@@ -541,10 +570,11 @@ export class AgentBrowserRuntime {
   }
 
   /** Close the exact attached preview through Chromium's Cancel UI, never an OS dialog or source tab. */
-  async cancelPrintPreview(): Promise<void> {
+  async cancelPrintPreview(assertCurrent?: () => void): Promise<void> {
     const page = await this.requirePage();
     const generation = this.attachmentGeneration;
     await cancelPrintPreview(page, () => {
+      assertCurrent?.();
       this.assertRuntimeOpen();
       if (this.page !== page || this.attachmentGeneration !== generation)
         throw new CdpUnavailableError("Print preview attachment changed");
@@ -607,6 +637,7 @@ export class AgentBrowserRuntime {
       this.invalidateScreencastFrame();
       this.connection?.close();
       this.connection = null;
+      this.windowIsolation = null;
       this.page = null;
       await this.assertVersion();
       this.assertRuntimeOpen();
@@ -679,6 +710,7 @@ export class AgentBrowserRuntime {
   }
 
   async identity(): Promise<RuntimeIdentity> {
+    await this.recoverWindowManagement(this.targetId ?? undefined);
     const connection = this.requireConnection();
     const version = await connection.send<VersionResult>("Browser.getVersion");
     const processId = await this.daemonPid();
@@ -696,9 +728,15 @@ export class AgentBrowserRuntime {
   }
 
   async targets(): Promise<RuntimeTarget[]> {
-    return (await listPageTargets(this.requireConnection())).filter(
+    await this.recoverWindowManagement();
+    await this.settleWindows();
+    const targets = (await listPageTargets(this.requireConnection())).filter(
       (target) => !target.url.startsWith(`chrome-extension://${NATIVE_VIDEO_EXTENSION_ID}/`),
     );
+    for (const target of targets) {
+      if (!isPrintPreviewUrl(target.url)) await this.settleWindows(target.targetId);
+    }
+    return targets;
   }
 
   async selectTarget(targetId: string, activate = true): Promise<void> {
@@ -736,6 +774,7 @@ export class AgentBrowserRuntime {
         this.assertAttachmentCurrent(connection, attachmentGeneration);
         this.page = replacement;
         this.targetId = targetId;
+        this.contentTarget = !isPrintPreviewUrl(target.url);
       } catch (error) {
         await replacement.detach().catch(() => undefined);
         // Detaching a partial emulation can clear target metrics even if a newer
@@ -778,6 +817,7 @@ export class AgentBrowserRuntime {
    * milliseconds. Failed reads, replacement attachments and repeated document
    * changes reject; this read-only recovery never repeats a native mutation. */
   async state(options: { timeoutMs?: number } = {}): Promise<RuntimePageState> {
+    await this.recoverWindowManagement(this.targetId ?? undefined);
     if (
       options.timeoutMs !== undefined &&
       (!Number.isInteger(options.timeoutMs) ||
@@ -1029,10 +1069,10 @@ export class AgentBrowserRuntime {
       { enabled: device.touch, maxTouchPoints: device.touch ? 5 : 1 },
       { mutation: true },
     );
-    // A page controlled through its own session may sit behind another tab in the shared
-    // browser. Chromium holds a hidden page's mouseMoved acknowledgement for ~5 s (equal to the
-    // input idle bound), so every press there failed. Target-scoped focus emulation makes only
-    // this page report visible/focused: no tab is raised and no viewer's selection changes.
+    // An independently visible native window can still be inactive. Retain renderer
+    // focus and prompt pointer acknowledgements without raising it or changing a viewer's
+    // selection. Browser-side WebAuthn visibility comes from native window isolation;
+    // this renderer override alone cannot satisfy that security check.
     await page.send("Emulation.setFocusEmulationEnabled", { enabled: true }, { mutation: true });
     // An empty override restores Chromium's real identity after device emulation.
     // Sending its native UA as a nonempty override would still remove client hints.
@@ -1987,6 +2027,7 @@ export class AgentBrowserRuntime {
       if (this.ownsBrowser) await this.stopDaemon(force);
       this.connection?.close();
       this.connection = null;
+      this.windowIsolation = null;
       this.page = null;
       this.targetId = null;
       this.invalidateScreencastFrame();
@@ -2115,11 +2156,12 @@ export class AgentBrowserRuntime {
   private async connectCdp(
     preferredTargetId: string | null = null,
     activate = this.ownsBrowser,
+    managementOnly = false,
   ): Promise<void> {
     this.assertRuntimeOpen();
     // A launch-selected page remains the intended target even if its first
     // attachment fails. Otherwise a retry could silently adopt another tab.
-    if (this.targetId === null && preferredTargetId !== null) {
+    if (!managementOnly && this.targetId === null && preferredTargetId !== null) {
       this.targetId = preferredTargetId;
     }
     const response = await this.invoke(["--session", this.session, "--json", "get", "cdp-url"]);
@@ -2139,33 +2181,105 @@ export class AgentBrowserRuntime {
       this.assertRuntimeOpen();
     }
     this.connection = connection;
+    this.windowIsolationRequired = true;
     connection.once("disconnect", () => {
       if (this.connection !== connection) return;
       this.page = null;
+      this.windowIsolation = null;
       // Keep the selected page identity. A transport loss does not authorize
       // adopting another tab, even when the original page still exists.
       this.emulationAppliedPage = null;
       this.attachmentGeneration += 1;
       this.invalidateScreencastFrame();
     });
-    const targets = await listPageTargets(this.connection);
-    this.assertRuntimeOpen();
-    const expectedTargetId = preferredTargetId ?? this.targetId;
-    const target =
-      expectedTargetId === null
-        ? targets[0]
-        : targets.find((candidate) => candidate.targetId === expectedTargetId);
-    if (expectedTargetId !== null && !target) {
-      throw new CdpUnavailableError("The selected browser page is no longer available");
+    try {
+      const targets = await listPageTargets(connection);
+      this.assertRuntimeOpen();
+      if (managementOnly) {
+        if (preferredTargetId && !targets.some((target) => target.targetId === preferredTargetId)) {
+          throw new CdpUnavailableError("The selected browser page is no longer available");
+        }
+        this.windowIsolation = await BrowserWindowIsolation.connect(connection, true);
+        return;
+      }
+      const expectedTargetId = preferredTargetId ?? this.targetId;
+      const target =
+        expectedTargetId === null
+          ? targets.find(
+              (target) =>
+                !target.url.startsWith(`chrome-extension://${NATIVE_VIDEO_EXTENSION_ID}/`),
+            )
+          : targets.find((candidate) => candidate.targetId === expectedTargetId);
+      if (expectedTargetId !== null && !target) {
+        throw new CdpUnavailableError("The selected browser page is no longer available");
+      }
+      if (!target) throw new CdpUnavailableError("Chromium has no page target");
+      // A missing selected page must refuse before creating helpers or moving any
+      // surviving tab. Partial helper initialization never leaves a usable connection.
+      if (this.ownsBrowser)
+        this.windowIsolation = await BrowserWindowIsolation.connect(connection, true);
+      await this.selectTarget(target.targetId, activate);
+    } catch (error) {
+      connection.close();
+      if (this.connection === connection) {
+        this.connection = null;
+        this.windowIsolation = null;
+      }
+      throw error;
     }
-    if (!target) throw new CdpUnavailableError("Chromium has no page target");
-    await this.selectTarget(target.targetId, activate);
+  }
+
+  /** Repair only browser-management transport on safe observations, including after the launch tab closes.
+   * No content page is adopted, no browser process is launched, and no input is replayed.
+   */
+  private async recoverWindowManagement(expectedTargetId?: string): Promise<void> {
+    this.assertRuntimeOpen();
+    if (this.windowIsolationOwner) {
+      await this.windowIsolationOwner.recoverWindowManagement(expectedTargetId);
+      return;
+    }
+    if (!this.windowIsolationRequired || this.windowIsolation?.isAvailable) return;
+    if (this.managementRecovery) {
+      await this.managementRecovery;
+      return;
+    }
+    const operation = (async () => {
+      const connection = this.connection;
+      if (connection?.isOpen) {
+        if (
+          expectedTargetId &&
+          !(await listPageTargets(connection)).some(
+            (target) => target.targetId === expectedTargetId,
+          )
+        ) {
+          throw new CdpUnavailableError("The selected browser page is no longer available");
+        }
+        const previous = this.windowIsolation;
+        this.windowIsolation = null;
+        await previous?.dispose();
+        this.windowIsolation = await BrowserWindowIsolation.connect(connection, true);
+        return;
+      }
+      // Never let a CLI discovery command implicitly replace a lost session daemon.
+      // The original nonce-owned process must still be alive before reconnecting.
+      if ((await this.daemonState()) !== "owned") {
+        throw new CdpUnavailableError("Existing browser management process is unavailable");
+      }
+      await this.connectCdp(expectedTargetId ?? null, false, true);
+    })();
+    this.managementRecovery = operation;
+    try {
+      await operation;
+    } finally {
+      if (this.managementRecovery === operation) this.managementRecovery = null;
+    }
   }
 
   private async requirePage(): Promise<CdpSession> {
     this.assertRuntimeOpen();
     if (this.page && this.connection?.isOpen) {
       const page = this.page;
+      await this.settleWindows(this.contentTarget ? page.targetId : undefined);
       await this.restoreConfiguredEmulation(page);
       this.assertRuntimeOpen();
       if (this.page !== page || !this.connection?.isOpen) {
@@ -2177,6 +2291,18 @@ export class AgentBrowserRuntime {
     this.assertRuntimeOpen();
     if (!this.page) throw new CdpUnavailableError("No page target is attached");
     return this.page;
+  }
+
+  /** The hidden manager belongs to its creator connection; share owner authority directly, never discover it by URL from another controller. */
+  private async settleWindows(targetId?: string): Promise<void> {
+    if (this.windowIsolationOwner) {
+      await this.windowIsolationOwner.settleWindows(targetId);
+      return;
+    }
+    if (this.windowIsolationRequired && !this.windowIsolation) {
+      throw new CdpUnavailableError("Browser window manager is reconnecting or unavailable");
+    }
+    await this.windowIsolation?.settle(targetId);
   }
 
   private requireConnection(): CdpConnection {

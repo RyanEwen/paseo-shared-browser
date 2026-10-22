@@ -22,7 +22,7 @@ import {
 
 /** Real private headed Chromium through policy routes, with no system dialogs or physical printing. */
 it.each(["human", "agent"] as const)(
-  "opens controlled %s print from a hidden source among eight tabs and preserves it",
+  "opens controlled %s print among eight independent windows and preserves the source",
   async (trigger) => {
     if (
       !process.env.PASEO_SHARED_BROWSER_AGENT_BROWSER_BINARY ||
@@ -50,6 +50,9 @@ it.each(["human", "agent"] as const)(
     const owner = await createRuntimeOwner({
       initialUrl: `http://127.0.0.1:${address.port}/`,
       nativeVideo: false,
+      ...(process.env.PASEO_SHARED_BROWSER_TEST_XVFB
+        ? { virtualDisplayExecutablePath: process.env.PASEO_SHARED_BROWSER_TEST_XVFB }
+        : {}),
     });
     let sourcePage: CdpSession | null = null;
     const running = await startSupervisorServer(
@@ -60,9 +63,9 @@ it.each(["human", "agent"] as const)(
           sourcePage = (owned.runtime as unknown as { page: CdpSession }).page;
           return owned;
         },
-        request: async (runtime, operation, input) => {
+        request: async (runtime, operation, input, beforeMutation) => {
           try {
-            return await owner.request(runtime, operation, input);
+            return await owner.request(runtime, operation, input, beforeMutation);
           } catch (error) {
             console.error("print-smoke: native failure", operation, String(error));
             throw error;
@@ -184,21 +187,20 @@ it.each(["human", "agent"] as const)(
         await human("tabs.create", { viewerToken: originalViewer.viewerToken });
       await agent("acquire-control");
       const hiddenSource = await agent("dom.snapshot");
-      // Production focus emulation reports visible even for background tabs.
-      // Temporarily remove only that override on the exact fixture source to
-      // measure its native visibility, then restore the normal product setting.
+      // Independent native windows must retain visibility even with renderer
+      // focus emulation disabled on this exact synthetic source.
       await sourcePage!.send("Emulation.setFocusEmulationEnabled", { enabled: false });
       try {
         const visibility = await agent("dom.evaluate", {
           snapshotId: hiddenSource.snapshotId,
           expression: "document.visibilityState",
         });
-        expect(visibility.result.json).toBe('"hidden"');
+        expect(visibility.result.json).toBe('"visible"');
       } finally {
         await sourcePage!.send("Emulation.setFocusEmulationEnabled", { enabled: true });
       }
       const originalTabs = (await tabs()).tabs.map((tab) => tab.id);
-      console.log(`print-smoke: ${trigger} controlled print on hidden source`);
+      console.log(`print-smoke: ${trigger} controlled print on independent source window`);
       if (trigger === "human") {
         await agent("release-control");
         const originalControl = await human<{ controlToken: string }>("acquire-control", {

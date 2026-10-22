@@ -1,4 +1,4 @@
-/** Encoded video is host-opt-in: image-only sessions never load the capture extension. */
+/** Encoded video remains opt-in while the shared extension also owns invisible native windows. */
 
 import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -23,7 +23,7 @@ afterEach(async () => {
   await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true })));
 });
 
-async function fixture(nativeVideo?: boolean) {
+async function fixture(nativeVideo?: boolean, headed = false) {
   const directory = await mkdtemp(join(tmpdir(), "shared-browser-video-opt-in-"));
   temporary.push(directory);
   const binary = join(directory, "owned-cli");
@@ -34,6 +34,7 @@ async function fixture(nativeVideo?: boolean) {
     profilePath: join(directory, "profile"),
     ipcDirectory,
     session: "video-opt-in",
+    headed,
     ...(nativeVideo === undefined ? {} : { nativeVideo }),
   });
   const internal = runtime as unknown as {
@@ -49,19 +50,25 @@ async function fixture(nativeVideo?: boolean) {
 }
 
 describe("encoded video opt-in", () => {
-  it("launches image-only sessions without the extension, its allowlist or any materialized files", async () => {
+  it("refuses foreground windows on an unowned real display before launching a process", async () => {
+    const f = await fixture(false, true);
+    await expect(f.runtime.launch()).rejects.toThrow("owned private display");
+    expect(f.launches).toHaveLength(0);
+  });
+  it("loads window management for image-only sessions without enabling video or 2x rasterization", async () => {
     for (const option of [undefined, false]) {
       const f = await fixture(option);
       await expect(f.runtime.launch()).rejects.toThrow("stops before a browser");
       const [args] = f.launches;
-      expect(args).not.toContain("--extension");
-      expect(args?.join(" ")).not.toContain("allowlisted-extension-id");
+      expect(args).toContain("--extension");
+      expect(args?.join(" ")).toContain("allowlisted-extension-id");
       expect(args?.join(" ")).not.toContain("force-device-scale-factor");
-      expect(await readdir(f.ipcDirectory)).toEqual([]);
+      expect(await readdir(f.ipcDirectory)).toHaveLength(1);
+      expect(f.internal.video).toBeNull();
     }
   });
 
-  it("loads and allowlists the capture extension only when the host opted in", async () => {
+  it("retains video's 2x raster policy only when video capability is enabled", async () => {
     const f = await fixture(true);
     await expect(f.runtime.launch()).rejects.toThrow("stops before a browser");
     const [args] = f.launches;

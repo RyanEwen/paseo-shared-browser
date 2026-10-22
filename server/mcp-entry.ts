@@ -232,7 +232,7 @@ async function main(): Promise<void> {
     "shared_browser_tab_close",
     {
       description:
-        "Close this agent's selected and controlled tab for every viewer. Use scope 'tab' when other tabs remain. To close the final tab and stop this workspace's browser for every viewer and agent, explicitly use scope 'last-tab'. Saved site data is retained; unsaved changes are lost. A changed tab list refuses the close, without replay. A stopped browser stays closed until explicitly reopened.",
+        "Close this agent's selected tab for every viewer without acquiring control. Use scope 'tab' when other tabs remain. To close the final tab and stop this workspace's browser for every viewer and agent, acquire control and explicitly use scope 'last-tab'. Saved site data is retained; unsaved changes are lost. A changed tab list refuses the close, without replay. A stopped browser stays closed until explicitly reopened.",
       inputSchema: z.object({ scope: browserTabCloseScopeSchema.default("tab") }),
       annotations: {
         readOnlyHint: false,

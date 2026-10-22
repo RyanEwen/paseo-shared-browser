@@ -113,7 +113,14 @@ it("retains native desktop identity and client hints through device switches and
       /** Assert browser-reported identity and network headers agree with the original native tab. */
       const expectNative = async (path: string) => {
         await runtime.navigate(`${origin}/${path}`);
-        expect(await inspectIdentity(runtime)).toEqual(native);
+        // Navigation admission waits for commit, not fixture script execution or
+        // the replacement Runtime context. Read only until that real fixture is ready.
+        await vi.waitFor(
+          async () => {
+            expect(await inspectIdentity(runtime)).toEqual(native);
+          },
+          { timeout: 2000, interval: 25 },
+        );
         const headers = requests.get(`/${path}`);
         expect(headers?.["user-agent"]).toBe(native.userAgent);
         expect(headers?.["sec-ch-ua"]).toBe(requests.get("/native")?.["sec-ch-ua"]);

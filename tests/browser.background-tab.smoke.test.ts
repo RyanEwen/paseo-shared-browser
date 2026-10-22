@@ -11,13 +11,13 @@ afterEach(async () => {
 });
 
 /**
- * Real Chromium. A page controlled while another tab is in front is a hidden page, and
- * Chromium holds a hidden page's mouseMoved acknowledgement for ~5 s, which equals the
- * input idle bound and made every press on such a tab fail. Target-scoped focus emulation
- * must make it acknowledge promptly without raising it or changing the other tab.
+ * Real Chromium regression for pointer acknowledgements after opening another page.
+ * The old shared native window could hold mouseMoved for ~5 s on its hidden tab.
+ * Independent inactive windows and renderer focus emulation must retain prompt input
+ * without activating another participant's target.
  */
 it.skipIf(process.platform !== "linux")(
-  "acknowledges pointer input on a controlled tab that is behind another tab",
+  "acknowledges pointer input after opening another independent window",
   async () => {
     const runtimeRoot = resolveBrowserRuntimeRoot(
       process.env.PASEO_HOME ?? join(homedir(), ".paseo"),
@@ -58,7 +58,7 @@ it.skipIf(process.platform !== "linux")(
           expression,
           returnByValue: true,
         });
-      // A new tab is created in front of the controlled one, which becomes hidden to the user.
+      // Opening another independent window must leave this attachment usable.
       await runtime.createTarget("about:blank");
       await new Promise((resolve) => setTimeout(resolve, 500));
       expect((await evaluate("document.visibilityState")).result.value).toBe("visible");

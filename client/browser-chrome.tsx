@@ -1,7 +1,7 @@
 /** Public themed panel controls and notices. Leaves own only focus/hover styling, never browser authority. */
 import type { PluginWorkspacePanelProps } from "@getpaseo/plugin/client";
 import { Icon, TextInput } from "@getpaseo/plugin/client/react-native";
-import { type ReactNode, useCallback, useState } from "react";
+import { type ReactNode, useCallback, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Pressable,
@@ -182,6 +182,9 @@ export function ErrorNotice({
   action,
   onAction,
   actionDisabled = false,
+  noticeId,
+  noticeScope,
+  onDismiss,
 }: {
   styles: ErrorNoticeStyles;
   theme: Theme;
@@ -189,7 +192,26 @@ export function ErrorNotice({
   action?: string | undefined;
   onAction?: (() => void) | undefined;
   actionDisabled?: boolean;
+  /** Distinguish repeated failures with identical text. Defaults to the message. */
+  noticeId?: unknown;
+  /** A retained leaf must not carry dismissal into another owner. */
+  noticeScope?: string;
+  onDismiss?: (() => void) | undefined;
 }) {
+  const identity = noticeId ?? message;
+  const observed = useRef({ identity, noticeScope, message });
+  if (
+    observed.current.identity !== identity ||
+    observed.current.noticeScope !== noticeScope ||
+    observed.current.message !== message
+  ) {
+    // Returning to identical text after recovery is a new occurrence, even when
+    // this leaf stayed mounted for another informational notice in between.
+    observed.current = { identity, noticeScope, message };
+  }
+  const occurrence = observed.current;
+  const [dismissed, setDismissed] = useState<typeof occurrence | null>(null);
+  if (dismissed === occurrence) return null;
   return (
     <View accessibilityRole="alert" style={styles.errorRow}>
       <Icon name="CircleAlert" size={DIMENSION.icon} color={theme.colors.statusDanger} />
@@ -203,6 +225,18 @@ export function ErrorNotice({
           onPress={onAction}
         />
       ) : null}
+      <ControlButton
+        styles={styles}
+        theme={theme}
+        label="Dismiss message"
+        icon="X"
+        iconOnly
+        onPress={() => {
+          if (observed.current !== occurrence) return;
+          setDismissed(occurrence);
+          onDismiss?.();
+        }}
+      />
     </View>
   );
 }

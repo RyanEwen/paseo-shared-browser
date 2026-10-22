@@ -99,6 +99,13 @@ const MAX_VIEWERS_PER_SESSION = 16;
 const MAX_SESSIONS = 64;
 const SCREENCAST_WAIT_MS = 500;
 
+/** Process-local authority that must survive queued work and awaited native metadata. */
+export interface BrowserRuntimeMutationGuard {
+  runtimeId: string;
+  /** Refuse before mutation publication if the caller's original viewer/selection expired. */
+  assertCurrent(): void;
+}
+
 export interface BrowserRuntimeClient {
   connect(): Promise<{ epoch: number }>;
   /** `replaceLost` is internal authority; without it a lost runtime is reported, never replaced. */
@@ -110,7 +117,13 @@ export interface BrowserRuntimeClient {
     runtimeId: string;
     createdAt: number;
   }>;
-  requestWorkspace(workspaceId: string, operation: string, input: JsonValue): Promise<JsonValue>;
+  /** A guarded mutation must recheck its runtime and caller immediately before native dispatch. */
+  requestWorkspace(
+    workspaceId: string,
+    operation: string,
+    input: JsonValue,
+    guard?: BrowserRuntimeMutationGuard,
+  ): Promise<JsonValue>;
   archiveWorkspace(workspaceId: string): Promise<void>;
   closeWorkspace(workspaceId: string, runtimeId: string): Promise<void>;
   /** Check the exact sole target and call onClosing synchronously within the workspace queue before stopping. */
@@ -506,19 +519,36 @@ export class SessionManager {
   async closeTab(input: CloseTabInput): Promise<{ closed: true; browserClosed: boolean }> {
     const session = this.requireViewer(input.viewerToken);
     if (input.scope === "last-tab") {
-      await this.closeBrowser(input, input.tabId);
+      if (!input.controlToken)
+        throw new Error("Browser control is required to close the final tab");
+      await this.closeBrowser({ ...input, controlToken: input.controlToken }, input.tabId);
       return { closed: true, browserClosed: true };
     }
     return this.serialize(session, async () => {
-      this.requireController(session, input.viewerToken, input.controlToken);
-      if (
-        session.tabId !== input.tabId ||
-        session.sessionId !== input.sessionId ||
-        session.runtimeId !== input.runtimeId
-      )
-        throw new Error("Browser tab selection is stale");
+      // Tab management needs an active viewer, independently of page input control.
+      // Recheck after cleanup and again at native publication, including time in queues.
+      const assertCurrent = () => {
+        if (
+          this.requireViewer(input.viewerToken) !== session ||
+          session.archived ||
+          session.tabId !== input.tabId ||
+          session.sessionId !== input.sessionId ||
+          session.runtimeId !== input.runtimeId
+        )
+          throw new Error("Browser tab selection is stale");
+      };
+      assertCurrent();
       await this.cancelGesture(session);
-      await this.request(session, "tabs.close", { targetId: input.tabId });
+      assertCurrent();
+      await this.request(
+        session,
+        "tabs.close",
+        { targetId: input.tabId },
+        {
+          runtimeId: input.runtimeId,
+          assertCurrent,
+        },
+      );
       session.archived = true;
       session.videoLifetime?.cancel();
       session.displayDemand?.dispose();
@@ -1802,6 +1832,7 @@ export class SessionManager {
     session: BrowserSession,
     operation: string,
     input: JsonValue,
+    guard?: BrowserRuntimeMutationGuard,
   ): Promise<JsonValue> {
     if (session.archived) throw new Error("Workspace was archived");
     const data = input && typeof input === "object" && !Array.isArray(input) ? input : {};
@@ -1810,6 +1841,7 @@ export class SessionManager {
         session.workspaceId,
         operation,
         session.tabId ? { ...data, targetId: session.tabId } : input,
+        guard,
       )
       .catch((error) => {
         if (error instanceof RuntimeProtocolError && error.code === "RUNTIME_LOST") {

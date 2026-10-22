@@ -94,6 +94,7 @@ import { useBrowserEmulationMode } from "./use-browser-emulation-mode";
 import { useBrowserFillViewport } from "./use-browser-fill-viewport";
 import { useBrowserFrameBuffer } from "./use-browser-frame-buffer";
 import { useBrowserImageCapture } from "./use-browser-image-capture";
+import { useBrowserOperationError } from "./use-browser-operation-error";
 import { useBrowserScopedMutation } from "./use-browser-scoped-mutation";
 import { useBrowserVideo } from "./use-browser-video";
 import { useBrowserViewerRecovery } from "./use-browser-viewer-recovery";
@@ -148,7 +149,17 @@ const SPECIAL_KEYS: readonly { key: SpecialKey; label: string }[] = [
 ];
 
 function errorMessage(error: unknown): string {
-  if (error instanceof Error && error.message.trim()) return error.message;
+  if (error instanceof Error && error.message.trim()) {
+    if (
+      !hasUnknownMutationOutcome(error) &&
+      /^(?:Request failed: )?Browser frame is stale \(stage=admission; reason=expired; ageMs=\d+\)(?: requestType=plugin\.rpc\.invoke\.request code=handler_error)?$/.test(
+        error.message,
+      )
+    ) {
+      return "The view expired before this action could start. The action was not sent. Wait for the view to refresh, then try again.";
+    }
+    return error.message;
+  }
   return "The shared browser request failed.";
 }
 function hasUnknownMutationOutcome(error: unknown): boolean {
@@ -247,7 +258,9 @@ export function SharedBrowserPanel({
 
   const [state, setState] = useState<BrowserState | null>(null);
   const [controlToken, setControlToken] = useState<string | null>(null);
-  const [operationError, setOperationError] = useState<string | null>(null);
+  const operationNotice = useBrowserOperationError(JSON.stringify([host.id, workspaceId]));
+  const operationError = operationNotice.message;
+  const setOperationError = operationNotice.publish;
   const [reconnecting, setReconnecting] = useState(false);
   const [browserClosed, setBrowserClosed] = useState(false);
   const [selectedTabId, setSelectedTabId] = useState<string | null>(null);
@@ -629,7 +642,6 @@ export function SharedBrowserPanel({
 
   const mutationSucceeded = useCallback(
     (next: BrowserState) => {
-      setOperationError(null);
       acceptState(next);
       refreshCapture();
     },
@@ -655,7 +667,8 @@ export function SharedBrowserPanel({
   const acquireMutation = useBrowserScopedMutation({
     identity: mutationIdentity,
     currentIdentity: currentMutationIdentity,
-    mutationFn: acquireControl,
+    mutationFn: (input: Parameters<typeof acquireControl>[0]) =>
+      operationNotice.recover(() => acquireControl(input)),
     onSuccess: (result) => {
       setControlToken(result.controlToken);
       mutationSucceeded(result.state);
@@ -665,7 +678,8 @@ export function SharedBrowserPanel({
   const releaseMutation = useBrowserScopedMutation({
     identity: mutationIdentity,
     currentIdentity: currentMutationIdentity,
-    mutationFn: releaseControl,
+    mutationFn: (input: Parameters<typeof releaseControl>[0]) =>
+      operationNotice.recover(() => releaseControl(input)),
     onSuccess: (result) => {
       setControlToken(null);
       mutationSucceeded(result.state);
@@ -675,7 +689,8 @@ export function SharedBrowserPanel({
   const printMutation = useBrowserScopedMutation({
     identity: mutationIdentity,
     currentIdentity: currentMutationIdentity,
-    mutationFn: printBrowser,
+    mutationFn: (input: Parameters<typeof printBrowser>[0]) =>
+      operationNotice.recover(() => printBrowser(input)),
     onSuccess: (result) => {
       mutationSucceeded(result.state);
       setRuntimeNotice(
@@ -691,7 +706,8 @@ export function SharedBrowserPanel({
   const navigateMutation = useBrowserScopedMutation({
     identity: mutationIdentity,
     currentIdentity: currentMutationIdentity,
-    mutationFn: navigateBrowser,
+    mutationFn: (input: Parameters<typeof navigateBrowser>[0]) =>
+      operationNotice.recover(() => navigateBrowser(input)),
     onSuccess: (result) => {
       mutationSucceeded(result.state);
       // Only acknowledged navigation grants explicit viewing recovery. Ordinary
@@ -703,7 +719,8 @@ export function SharedBrowserPanel({
   const resizeMutation = useBrowserScopedMutation({
     identity: mutationIdentity,
     currentIdentity: currentMutationIdentity,
-    mutationFn: resizeBrowser,
+    mutationFn: (input: Parameters<typeof resizeBrowser>[0]) =>
+      operationNotice.recover(() => resizeBrowser(input)),
     onSuccess: (result) => {
       mutationSucceeded(result.state);
     },
@@ -715,7 +732,8 @@ export function SharedBrowserPanel({
   const deviceMutation = useBrowserScopedMutation({
     identity: mutationIdentity,
     currentIdentity: currentMutationIdentity,
-    mutationFn: applyDevicePreset,
+    mutationFn: (input: Parameters<typeof applyDevicePreset>[0]) =>
+      operationNotice.recover(() => applyDevicePreset(input)),
     onSuccess: (result) => mutationSucceeded(result.state),
     onError: mutationFailed,
   });
@@ -728,7 +746,8 @@ export function SharedBrowserPanel({
   const inputMutation = useBrowserScopedMutation({
     identity: mutationIdentity,
     currentIdentity: currentMutationIdentity,
-    mutationFn: sendBrowserInput,
+    mutationFn: (input: Parameters<typeof sendBrowserInput>[0]) =>
+      operationNotice.recover(() => sendBrowserInput(input)),
     onSuccess: (result) => {
       settleLegacyInput();
       mutationSucceeded(result.state);
@@ -960,7 +979,14 @@ export function SharedBrowserPanel({
       return input && context ? { ...context, target: input.target } : null;
     },
     controlAuthority: gestureControlContext,
-    transport: { begin: beginBrowserGesture, update: updateBrowserGesture, end: endBrowserGesture },
+    transport: {
+      begin: beginBrowserGesture,
+      update: (input) =>
+        input.event.kind === "move" || input.event.kind === "leave"
+          ? updateBrowserGesture(input)
+          : operationNotice.recover(() => updateBrowserGesture(input)),
+      end: endBrowserGesture,
+    },
     ownershipKey: JSON.stringify([
       viewerToken,
       controlToken,
@@ -1067,8 +1093,9 @@ export function SharedBrowserPanel({
     });
   };
 
+  /** Viewer-only tab management keeps page fences while allowing another controller's handoff. */
   const requestIsCurrent = useCallback(
-    (basis: ControlRequestBasis) =>
+    (basis: ControlRequestBasis, checkController = true) =>
       !closedViewRef.current &&
       (!selectedTabIdRef.current || selectedTabIdRef.current === basis.tabId) &&
       isControlRequestCurrent(
@@ -1076,7 +1103,7 @@ export function SharedBrowserPanel({
         panelScopeRef.current,
         activeViewerTokenRef.current,
         stateRef.current,
-        controllerObservationRevision.current,
+        checkController ? controllerObservationRevision.current : basis.controllerRevision,
       ),
     [],
   );
@@ -1378,6 +1405,10 @@ export function SharedBrowserPanel({
     const tabs = tabsQuery.data?.tabs;
     if (!current?.runtimeId || !viewer || !current.tabId || !tabs) return;
     if (!tabs.some((tab) => tab.id === current.tabId)) return;
+    if (tabs.length === 1 && (!controlToken || current.controller !== "self")) {
+      requestControlled("close the browser", () => controlledActionsRef.current?.closeTab());
+      return;
+    }
     setTabCloseConfirmation({
       basis: controlRequestBasis(
         panelScope,
@@ -1393,9 +1424,14 @@ export function SharedBrowserPanel({
   /** Never upgrade a tab-only confirmation if it becomes the final page while the dialog is open. */
   const confirmCloseSelectedTab = async () => {
     const confirmation = tabCloseConfirmation;
-    if (!confirmation || !controlToken || tabMutationPending || tabMutationRequestRef.current)
+    if (
+      !confirmation ||
+      (confirmation.scope === "last-tab" && !controlToken) ||
+      tabMutationPending ||
+      tabMutationRequestRef.current
+    )
       return;
-    if (!requestIsCurrent(confirmation.basis)) {
+    if (!requestIsCurrent(confirmation.basis, confirmation.scope === "last-tab")) {
       setTabCloseConfirmation(null);
       setOperationError("The browser changed. Select Close tab again.");
       return;
@@ -1409,7 +1445,7 @@ export function SharedBrowserPanel({
     try {
       const result = await closeTab({
         viewerToken: basis.viewerToken,
-        controlToken,
+        ...(controlToken ? { controlToken } : {}),
         tabId,
         sessionId: basis.sessionId,
         runtimeId,
@@ -1682,7 +1718,14 @@ export function SharedBrowserPanel({
           />
         </CanvasPlaceholder>
         {operationError ? (
-          <ErrorNotice styles={styles} theme={theme} message={operationError} />
+          <ErrorNotice
+            noticeScope={panelScope}
+            styles={styles}
+            theme={theme}
+            message={operationError}
+            noticeId={operationNotice.id}
+            onDismiss={() => operationNotice.dismiss(operationNotice.id!)}
+          />
         ) : null}
       </View>
     );
@@ -1710,9 +1753,7 @@ export function SharedBrowserPanel({
       }
       onSelect={setSelectedTabId}
       onCreate={() => void createBrowserTab()}
-      onClose={() =>
-        requestControlled("close this tab", () => controlledActionsRef.current?.closeTab())
-      }
+      onClose={requestCloseSelectedTab}
     />
   );
 
@@ -1841,10 +1882,22 @@ export function SharedBrowserPanel({
 
       {runtimeNotice || visibleError || state?.notice || video.codecFallbackReason ? (
         <ErrorNotice
+          noticeScope={panelScope}
           styles={styles}
           theme={theme}
           message={
             runtimeNotice ?? visibleError ?? state?.notice ?? video.codecFallbackReason ?? ""
+          }
+          noticeId={
+            runtimeNotice ??
+            (operationError ? operationNotice.id : (connectionError ?? visibleError))
+          }
+          onDismiss={
+            runtimeNotice
+              ? () => setRuntimeNotice((current) => (current === runtimeNotice ? null : current))
+              : operationError
+                ? () => operationNotice.dismiss(operationNotice.id!)
+                : undefined
           }
           action={noticeAction}
           onAction={onNoticeAction}
@@ -2042,9 +2095,11 @@ export function SharedBrowserPanel({
                   danger
                   disabled={!viewerToken || tabMutationPending}
                   onPress={() =>
-                    requestControlled("close this tab", () =>
-                      controlledActionsRef.current?.confirmCloseTab(),
-                    )
+                    tabCloseConfirmation?.scope === "last-tab"
+                      ? requestControlled("close the browser", () =>
+                          controlledActionsRef.current?.confirmCloseTab(),
+                        )
+                      : void confirmCloseSelectedTab()
                   }
                 />
               </>
@@ -2201,9 +2256,12 @@ export function SharedBrowserPanel({
           error={
             preferences.error ? (
               <View style={{ padding: 12, gap: 8 }}>
-                <Text accessibilityRole="alert" style={styles.mutedText}>
-                  {preferences.error}
-                </Text>
+                <ErrorNotice
+                  noticeScope={panelScope}
+                  styles={styles}
+                  theme={theme}
+                  message={preferences.error}
+                />
                 <BrowserMenuItem
                   theme={theme}
                   compact={layout.compact}
@@ -2216,7 +2274,16 @@ export function SharedBrowserPanel({
           customViewport={
             <>
               {visibleError ? (
-                <ErrorNotice styles={styles} theme={theme} message={visibleError} />
+                <ErrorNotice
+                  noticeScope={panelScope}
+                  styles={styles}
+                  theme={theme}
+                  message={visibleError}
+                  noticeId={operationError ? operationNotice.id : (connectionError ?? visibleError)}
+                  onDismiss={
+                    operationError ? () => operationNotice.dismiss(operationNotice.id!) : undefined
+                  }
+                />
               ) : null}
               <View style={styles.customViewportRow}>
                 <Field

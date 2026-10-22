@@ -41,6 +41,9 @@ it.each(["human", "agent"] as const)(
       initialUrl: `http://127.0.0.1:${address.port}/`,
       nativeVideo: false,
       virtualDisplay: false,
+      ...(process.env.PASEO_SHARED_BROWSER_TEST_XVFB
+        ? { virtualDisplayExecutablePath: process.env.PASEO_SHARED_BROWSER_TEST_XVFB }
+        : {}),
     });
     const pages = new Map<string, CdpSession>();
     const stopped: string[] = [];
@@ -131,10 +134,21 @@ it.each(["human", "agent"] as const)(
       ).rejects.toThrow("Browser tabs changed");
       expect(stopped).toEqual([]);
       const extraViewer = await attach("closing-workspace", "Extra page", extra.tabId);
-      const extraControl = await acquire(extraViewer.viewerToken);
+      const extraController = await attach("closing-workspace", "Extra controller", extra.tabId);
+      await acquire(extraController.viewerToken);
       await expect(
-        human("tabs.close", input(extraViewer, extraControl.controlToken, "tab")),
+        human("tabs.close", {
+          viewerToken: extraViewer.viewerToken,
+          tabId: extra.tabId,
+          sessionId: extraViewer.state.sessionId,
+          runtimeId: extraViewer.state.runtimeId!,
+          scope: "tab",
+        }),
       ).resolves.toMatchObject({ browserClosed: false });
+      expect(
+        (await human<{ state: BrowserState }>("status", { viewerToken: first.viewerToken })).state
+          .controller,
+      ).toBe("self");
       expect(
         (await human<{ state: BrowserState }>("status", { viewerToken: observer.viewerToken }))
           .state.tabId,
@@ -221,6 +235,23 @@ it.each(["human", "agent"] as const)(
             stderr: "pipe",
           }),
         );
+        // The shipped tool can close an observed page while a human owns its input lease.
+        const agentExtra = await tool<{ tabId: string }>("tab_open");
+        const humanExtra = await attach(
+          "closing-workspace",
+          "Human on agent page",
+          agentExtra.tabId,
+        );
+        await acquire(humanExtra.viewerToken);
+        await expect(tool("tab_close")).resolves.toMatchObject({
+          state: { tabId: originalId, controller: "none" },
+        });
+        await expect(human("status", { viewerToken: humanExtra.viewerToken })).rejects.toThrow(
+          "Browser tab is closed",
+        );
+        expect(
+          (await tool<{ isError: boolean }>("tab_close", { scope: "last-tab" }, true)).isError,
+        ).toBe(true);
         await tool("acquire_control");
         expect((await tool<{ isError: boolean }>("tab_close", {}, true)).isError).toBe(true);
         expect(stopped).toEqual([]);

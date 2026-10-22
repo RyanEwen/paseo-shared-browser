@@ -2,6 +2,7 @@ import { mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promise
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import { BROWSER_WINDOW_ISOLATION_SOURCE } from "./browser-window-isolation-source";
 import { prepareNativeVideoExtension } from "./native-video-extension";
 import { NATIVE_VIDEO_EXTENSION_SOURCE } from "./native-video-extension-source";
 
@@ -15,6 +16,9 @@ describe("immutable trusted native video helper", () => {
       expect(new Set(paths).size).toBe(1);
       const path = paths[0]!;
       expect(await readFile(join(path, "recorder.js"), "utf8")).toBe(NATIVE_VIDEO_EXTENSION_SOURCE);
+      expect(await readFile(join(path, "windows.js"), "utf8")).toBe(
+        BROWSER_WINDOW_ISOLATION_SOURCE,
+      );
       expect((await readdir(directory)).length).toBe(1);
       const modified = (await stat(join(path, "recorder.js"))).mtimeMs;
       await prepareNativeVideoExtension(directory);

@@ -327,15 +327,16 @@ describe("native video runtime fence", () => {
     const { runtime, internal } = setup();
     await runtime.readVideo({ quality: "high", waitMs: 0 });
     let resolveRead: (value: unknown) => void = () => {};
+    const enteredRead = Promise.withResolvers<void>();
     fixture.captures[0]!.read.mockImplementationOnce(
       () =>
         new Promise((resolve) => {
           resolveRead = resolve;
+          enteredRead.resolve();
         }),
     );
     const pending = runtime.readVideo({ quality: "high", waitMs: 500 });
-    await Promise.resolve();
-    await Promise.resolve();
+    await enteredRead.promise;
     internal.documentGeneration++;
     resolveRead({ status: "ready", streamId: "old", packets: [{ dataBase64: "old" }] });
     expect(await pending).toMatchObject({ status: "reset", packets: [] });

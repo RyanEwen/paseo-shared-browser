@@ -101,6 +101,27 @@ it("preserves the existing last-tab refusal", async () => {
   expect(f.native.closeTarget).not.toHaveBeenCalled();
 });
 
+it("rechecks close authority after target observation and controller cleanup", async () => {
+  const f = await fixture(0);
+  const guard = vi.fn<() => void>(() => {
+    throw new Error("Viewer expired");
+  });
+  await expect(
+    f.owner.request(f.owned, "tabs.close", { targetId: "closing" }, guard),
+  ).rejects.toThrow("Viewer expired");
+  expect(f.native.closeTarget).not.toHaveBeenCalled();
+
+  const controller = { releaseTarget: vi.fn(async () => {}), shutdown: vi.fn(async () => {}) };
+  f.owned.tabs.set("closing", Promise.resolve(controller) as never);
+  guard.mockImplementationOnce(() => {});
+  await expect(
+    f.owner.request(f.owned, "tabs.close", { targetId: "closing" }, guard),
+  ).rejects.toThrow("Viewer expired");
+  expect(controller.releaseTarget).toHaveBeenCalledOnce();
+  expect(controller.shutdown).not.toHaveBeenCalled();
+  expect(f.native.closeTarget).not.toHaveBeenCalled();
+});
+
 it("preserves source and preview when a tab-only close would remove the sole content page", async () => {
   const f = await fixture(null);
   const targets = f.native.targets.getMockImplementation()!;
@@ -190,7 +211,7 @@ it("releases a previously unattached preview controller only after confirmed can
   await vi.runAllTimersAsync();
   await expect(pending).resolves.toBeNull();
 
-  expect(attach).toHaveBeenCalledExactlyOnceWith("closing");
+  expect(attach).toHaveBeenCalledExactlyOnceWith("closing", f.owned.runtime);
   expect(cancel).toHaveBeenCalledOnce();
   expect(shutdown).toHaveBeenCalledOnce();
   expect(shutdown.mock.instances[0]).toBe(cancel.mock.instances[0]);

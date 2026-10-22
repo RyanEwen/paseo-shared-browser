@@ -44,7 +44,12 @@ class AgentRuntimeOwner implements RuntimeOwner<AgentRuntime> {
     return { workspaceId, runtimeId: `runtime_${workspaceId}_${"r".repeat(32)}` };
   }
 
-  async request(runtime: AgentRuntime, operation: string, input: JsonValue): Promise<JsonValue> {
+  async request(
+    runtime: AgentRuntime,
+    operation: string,
+    input: JsonValue,
+    _beforeMutation?: () => void,
+  ): Promise<JsonValue> {
     const state = this.states.get(runtime.workspaceId);
     if (!state) throw new Error(`Runtime is stopped: ${runtime.workspaceId}`);
     this.operations.push(operation);
@@ -283,6 +288,52 @@ describe("agent shared-browser authorization", () => {
     await revoking;
     expect(owner.states.get("workspace-one")?.url).toBe("https://workspace-one.example/");
   });
+
+  it.each(["selection", "revocation"] as const)(
+    "refuses ordinary close after agent %s changes during target observation",
+    async (change) => {
+      const { owner, supervisor, bridge } = createHarness();
+      const original = owner.request.bind(owner);
+      const entered = Promise.withResolvers<void>();
+      const gate = Promise.withResolvers<void>();
+      let closed = false;
+      owner.request = async (runtime, operation, input, beforeMutation) => {
+        const data = input && typeof input === "object" && !Array.isArray(input) ? input : {};
+        if (operation === "tabs.list")
+          return ["page-one", "page-two"].map((targetId) => ({
+            targetId,
+            title: targetId,
+            url: "https://fixture.example/",
+          }));
+        if (operation === "identity")
+          return { targetId: data.targetId ?? "page-one", userAgent: "Fake Chromium" };
+        if (operation === "tabs.close") {
+          entered.resolve();
+          await gate.promise;
+          beforeMutation!();
+          closed = true;
+          return null;
+        }
+        return original(runtime, operation, input);
+      };
+      const agentTicket = ticket("close-fence");
+      await issueTicket(supervisor, bridge, agentTicket);
+      await bindTicket(supervisor, bridge, agentTicket, "agent-one", "workspace-one");
+      await agentRequest(supervisor, agentTicket, "status");
+      const closing = agentRequest(supervisor, agentTicket, "tabs.close");
+      const refused = expect(closing).rejects.toMatchObject({ code: "AUTHENTICATION_FAILED" });
+      await entered.promise;
+      const changing =
+        change === "selection"
+          ? agentRequest(supervisor, agentTicket, "tabs.select", { tabId: "page-two" })
+          : revokeAgent(supervisor, bridge, "agent-one");
+      gate.resolve();
+      await refused;
+      await changing;
+      expect(closed).toBe(false);
+      expect(owner.stopped).toHaveLength(0);
+    },
+  );
 
   for (const heldCase of [
     { name: "key", down: "key.down", up: "key.up", event: { kind: "key", key: "Enter" } },

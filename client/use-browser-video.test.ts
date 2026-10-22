@@ -1025,36 +1025,173 @@ it("stops hidden-panel JPEG requests, including a queued refresh follow-up", asy
   expect(imageQuery.refetch).toHaveBeenCalledOnce();
 });
 
-it.each([false, true])("keeps a healthy quiet video after local input: %s", async (afterInput) => {
-  const f = setup();
-  f.reply(0, 1);
-  await drain();
-  f.paint();
-  f.render();
-  f.commit();
-  if (afterInput) {
-    f.advanceEpoch();
+it.each([false, true])(
+  "renews quiet video through fallback even with healthy empty reads after input: %s",
+  async (afterInput) => {
+    const f = setup();
+    f.reply(0, 1);
+    await drain();
+    f.paint();
     f.render();
     f.commit();
-  }
-  await vi.advanceTimersByTimeAsync(1);
-  for (let index = 1; index <= 8; index++) {
-    harness.reads[index]!.resolve({
-      status: "waiting",
-      streamId: "s".repeat(32),
-      state: {},
-      packets: [],
-    } as unknown as BrowserVideoReadReply);
-    await drain();
-    await vi.advanceTimersByTimeAsync(500);
-  }
-  expect(f.render().fallbackRevision).toBe(0);
-  if (afterInput) {
+    if (afterInput) {
+      f.advanceEpoch();
+      f.render();
+      f.commit();
+    }
+    await vi.advanceTimersByTimeAsync(1);
+    for (let index = 1; index <= 8; index++) {
+      harness.reads[index]!.resolve({
+        status: "waiting",
+        streamId: "s".repeat(32),
+        state: {},
+        packets: [],
+      } as unknown as BrowserVideoReadReply);
+      await drain();
+      await vi.advanceTimersByTimeAsync(500);
+    }
+    expect(f.render().fallbackRevision).toBeGreaterThan(0);
     expect(f.render().frontRef.current).toBeNull();
-  } else {
-    expect(f.render().frontRef.current?.sequence).toBe(1);
+    expect(f.render().front?.sequence).toBe(1);
+  },
+);
+
+it("renews quiet video pixels before a hovering viewer's next press expires", async () => {
+  const { SessionManager } = await import("../server/browser-policy");
+  let ids = 0;
+  let sourceSequence = 0;
+  let sourceRequestedKey = true;
+  const manager = new SessionManager({
+    now: Date.now,
+    monotonicNow: Date.now,
+    validateWorkspace: async () => true,
+    issueToken: () => String(++ids).padStart(32, "0"),
+    client: {
+      connect: async () => ({ epoch: 1 }),
+      ensureWorkspace: async (workspaceId) => ({
+        workspaceId,
+        runtimeId: "r".repeat(32),
+        createdAt: Date.now(),
+      }),
+      archiveWorkspace: async () => {},
+      closeWorkspace: async () => {},
+      disconnect() {},
+      requestWorkspace: async (_workspace, operation, input) => {
+        if (operation === "identity") return { userAgent: "Fixture" };
+        if (operation === "state")
+          return {
+            url: "https://fixture.invalid/",
+            title: "Fixture",
+            inputGeneration: "1:1",
+            canGoBack: false,
+            canGoForward: false,
+          };
+        if (operation === "video.read") {
+          sourceRequestedKey = (input as { requestKeyFrame: boolean }).requestKeyFrame;
+          return {
+            status: sourceRequestedKey ? "ready" : "waiting",
+            streamId: "s".repeat(32),
+            inputGeneration: "1:1",
+            packets: sourceRequestedKey
+              ? [
+                  {
+                    streamId: "s".repeat(32),
+                    captureGeneration: 1,
+                    sequence: ++sourceSequence,
+                    timestampUs: sourceSequence * 1000,
+                    type: "key",
+                    codec: "vp8",
+                    width: 1280,
+                    height: 800,
+                    dataBase64: "AA==",
+                    capturedAt: new Date().toISOString(),
+                    capturedAtMonotonicMs: Date.now(),
+                  },
+                ]
+              : [],
+          };
+        }
+        return null;
+      },
+    },
+  });
+  const f = setup();
+  try {
+    await manager.connect();
+    const { viewerToken } = await manager.attach("owned", "Fixture");
+    const { controlToken } = await manager.acquireControl(viewerToken);
+    const firstRead = await manager.readVideo({
+      viewerToken,
+      quality: "high",
+      streamId: null,
+      afterSequence: 0,
+      waitMs: 0,
+      requestKeyFrame: true,
+    });
+    f.identity("sessionId", firstRead.state.sessionId);
+    f.identity("captureEpoch", firstRead.state.bridgeEpoch!);
+    f.identity("navigationGeneration", firstRead.state.navigationGeneration);
+    f.identity("viewportGeneration", firstRead.state.viewportGeneration);
+    harness.reads[0]!.resolve(firstRead);
+    await drain();
+    f.paint();
+    f.render();
+    f.commit();
+    const expected = {
+      sessionId: firstRead.state.sessionId,
+      runtimeId: firstRead.state.runtimeId!,
+      bridgeEpoch: firstRead.state.bridgeEpoch!,
+      navigationGeneration: firstRead.state.navigationGeneration,
+      viewportGeneration: firstRead.state.viewportGeneration,
+    };
+    const begin = await manager.beginGesture({
+      viewerToken,
+      controlToken,
+      expected,
+      pointerKind: "mouse",
+      target: firstRead.packets[0]!.frame,
+    });
+    if (!("gestureId" in begin)) throw new Error("Fixture admission failed");
+    let inputSequence = 1;
+    // Healthy no-change video reads keep the picture painted. Hover keeps the
+    // exact native channel alive, but never renews a frame's five-second receipt.
+    for (let index = 0; index < 10; index++) {
+      await vi.advanceTimersByTimeAsync(500);
+      const read = harness.reads.at(-1)!;
+      read.resolve(await manager.readVideo({ ...read.input, viewerToken }));
+      await drain();
+      f.paint();
+      f.render();
+      f.commit();
+      await manager.updateGesture({
+        viewerToken,
+        controlToken,
+        expected,
+        gestureId: begin.gestureId,
+        sequence: inputSequence++,
+        event: { kind: "move", point: { x: 20, y: 20, width: 1280, height: 800 } },
+      });
+    }
+    await vi.advanceTimersByTimeAsync(126);
+    const visible = f.render().frontRef.current;
+    expect(visible).not.toBeNull();
+    await expect(
+      manager.updateGesture({
+        viewerToken,
+        controlToken,
+        expected,
+        gestureId: begin.gestureId,
+        sequence: inputSequence,
+        target: visible!.frame,
+        event: {
+          kind: "down",
+          button: "left",
+          clickCount: 1,
+          point: { x: 20, y: 20, width: 1280, height: 800 },
+        },
+      }),
+    ).resolves.toHaveProperty("nextSequence");
+  } finally {
+    manager.disconnect();
   }
-  // A genuinely stuck next read still invokes the existing fallback watchdog.
-  await vi.advanceTimersByTimeAsync(3000);
-  expect(f.render().fallbackRevision).toBeGreaterThan(0);
 });

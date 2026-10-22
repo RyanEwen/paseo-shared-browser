@@ -252,7 +252,7 @@ it("retains prepared headless capture when an optional private display is unavai
   }
 });
 
-it("keeps explicit headed mode and unavailable-display headless behavior unchanged", async () => {
+it("passes explicit headed intent to the runtime safety boundary and retains unavailable-display headless fallback", async () => {
   vi.stubEnv("PASEO_SHARED_BROWSER_XVFB", "1");
   await (await createRuntimeOwner({ headed: true, nativeVideo: false })).create("headed-fixture");
   expect(fake.display).not.toHaveBeenCalled();
