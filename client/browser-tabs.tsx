@@ -56,7 +56,7 @@ export function BrowserTabs({
         horizontal
         showsHorizontalScrollIndicator={false}
         style={styles.tabList}
-        contentContainerStyle={styles.tabListContent}
+        contentContainerStyle={[styles.tabListContent, bottom ? styles.tabListContentFill : null]}
       >
         {tabs.length === 0 ? <Text style={styles.tabMeta}>Connecting browser…</Text> : null}
         {tabs.map((tab) => {
@@ -66,7 +66,15 @@ export function BrowserTabs({
           const controller = controllerSummary(tab, currentState);
           const presence = `${viewerCount} viewer${viewerCount === 1 ? "" : "s"} · ${controller}`;
           return (
-            <View key={tab.id} style={[styles.tabItem, selected ? styles.tabItemSelected : null]}>
+            <View
+              key={tab.id}
+              style={[
+                styles.tabItem,
+                selected ? styles.tabItemSelected : null,
+                bottom ? styles.tabItemFill : null,
+                bottom && selected ? styles.tabItemSelectedFill : null,
+              ]}
+            >
               <Pressable
                 accessibilityRole="tab"
                 accessibilityLabel={`${tab.title || tab.url || "New tab"}, ${presence}${selected ? `, ${statusLabel}` : ""}`}

@@ -1716,6 +1716,113 @@ export function SharedBrowserPanel({
     />
   );
 
+  const browserToolbar = (
+    <View style={styles.chrome}>
+      <View style={styles.addressRow}>
+        <ChromeIconButton
+          styles={styles}
+          theme={theme}
+          label="Back"
+          icon="ArrowLeft"
+          disabled={!viewerToken || !state?.canGoBack || anyMutationPending}
+          onPress={() =>
+            requestControlled("go back", () => controlledActionsRef.current?.navigate("back"))
+          }
+        />
+        <ChromeIconButton
+          styles={styles}
+          theme={theme}
+          label="Forward"
+          icon="ArrowRight"
+          disabled={!viewerToken || !state?.canGoForward || anyMutationPending}
+          onPress={() =>
+            requestControlled("go forward", () => controlledActionsRef.current?.navigate("forward"))
+          }
+        />
+        <ChromeIconButton
+          styles={styles}
+          theme={theme}
+          label="Reload"
+          icon="RotateCw"
+          disabled={!viewerToken || anyMutationPending}
+          onPress={() =>
+            requestControlled("reload the page", () =>
+              controlledActionsRef.current?.navigate("reload"),
+            )
+          }
+        />
+        <Field
+          styles={styles}
+          theme={theme}
+          value={addressDraft}
+          accessibilityLabel="Browser address"
+          placeholder="Enter a URL"
+          editable={Boolean(viewerToken) && !navigateMutation.isPending}
+          dimWhenReadOnly={false}
+          keyboardType="url"
+          maxLength={MAX_URL_LENGTH}
+          returnKeyType="go"
+          style={[styles.addressInput, styles.chromeAddressInput]}
+          onChangeText={setAddressDraft}
+          onFocus={() => setAddressFocused(true)}
+          onBlur={() => setAddressFocused(false)}
+          onSubmit={() => {
+            const target = addressDraft;
+            requestControlled("open this address", () =>
+              controlledActionsRef.current?.navigate("goto", target),
+            );
+          }}
+        />
+        <View ref={displayAnchorRef} collapsable={false}>
+          <ChromeIconButton
+            styles={styles}
+            theme={theme}
+            label="Display options"
+            icon="Monitor"
+            selected={toolbarMenu === "display"}
+            expanded={toolbarMenu === "display"}
+            onPress={() => toggleToolbarMenu("display")}
+          />
+        </View>
+        <ChromeIconButton
+          styles={styles}
+          theme={theme}
+          label={`${emulation.mode === "mobile" ? "Disable" : "Enable"} mobile emulation`}
+          icon="Smartphone"
+          selected={emulation.mode === "mobile"}
+          disabled={!viewerToken || anyMutationPending}
+          onPress={() =>
+            requestControlled("change mobile emulation", () =>
+              controlledActionsRef.current?.toggleEmulation(),
+            )
+          }
+        />
+        <View ref={actionsAnchorRef} collapsable={false}>
+          <ChromeIconButton
+            styles={styles}
+            theme={theme}
+            label="Browser menu"
+            icon="EllipsisVertical"
+            selected={toolbarMenu === "actions"}
+            expanded={toolbarMenu === "actions"}
+            onPress={() => toggleToolbarMenu("actions")}
+          />
+        </View>
+      </View>
+    </View>
+  );
+
+  const canvasStatus = (
+    <View style={[styles.canvasFooter, touchFirstLayout ? styles.canvasStatusTop : null]}>
+      <Text numberOfLines={1} style={styles.canvasFooterText}>
+        {state?.title || state?.url || "Shared browser"}
+      </Text>
+      <Text numberOfLines={1} style={styles.canvasFooterText}>
+        {frameSummary}
+      </Text>
+    </View>
+  );
+
   return (
     <View
       ref={paneRef}
@@ -1730,101 +1837,7 @@ export function SharedBrowserPanel({
     >
       {touchFirstLayout ? null : browserTabs}
 
-      <View style={styles.chrome}>
-        <View style={styles.addressRow}>
-          <ChromeIconButton
-            styles={styles}
-            theme={theme}
-            label="Back"
-            icon="ArrowLeft"
-            disabled={!viewerToken || !state?.canGoBack || anyMutationPending}
-            onPress={() =>
-              requestControlled("go back", () => controlledActionsRef.current?.navigate("back"))
-            }
-          />
-          <ChromeIconButton
-            styles={styles}
-            theme={theme}
-            label="Forward"
-            icon="ArrowRight"
-            disabled={!viewerToken || !state?.canGoForward || anyMutationPending}
-            onPress={() =>
-              requestControlled("go forward", () =>
-                controlledActionsRef.current?.navigate("forward"),
-              )
-            }
-          />
-          <ChromeIconButton
-            styles={styles}
-            theme={theme}
-            label="Reload"
-            icon="RotateCw"
-            disabled={!viewerToken || anyMutationPending}
-            onPress={() =>
-              requestControlled("reload the page", () =>
-                controlledActionsRef.current?.navigate("reload"),
-              )
-            }
-          />
-          <Field
-            styles={styles}
-            theme={theme}
-            value={addressDraft}
-            accessibilityLabel="Browser address"
-            placeholder="Enter a URL"
-            editable={Boolean(viewerToken) && !navigateMutation.isPending}
-            dimWhenReadOnly={false}
-            keyboardType="url"
-            maxLength={MAX_URL_LENGTH}
-            returnKeyType="go"
-            style={[styles.addressInput, styles.chromeAddressInput]}
-            onChangeText={setAddressDraft}
-            onFocus={() => setAddressFocused(true)}
-            onBlur={() => setAddressFocused(false)}
-            onSubmit={() => {
-              const target = addressDraft;
-              requestControlled("open this address", () =>
-                controlledActionsRef.current?.navigate("goto", target),
-              );
-            }}
-          />
-          <View ref={displayAnchorRef} collapsable={false}>
-            <ChromeIconButton
-              styles={styles}
-              theme={theme}
-              label="Display options"
-              icon="Monitor"
-              selected={toolbarMenu === "display"}
-              expanded={toolbarMenu === "display"}
-              onPress={() => toggleToolbarMenu("display")}
-            />
-          </View>
-          <ChromeIconButton
-            styles={styles}
-            theme={theme}
-            label={`${emulation.mode === "mobile" ? "Disable" : "Enable"} mobile emulation`}
-            icon="Smartphone"
-            selected={emulation.mode === "mobile"}
-            disabled={!viewerToken || anyMutationPending}
-            onPress={() =>
-              requestControlled("change mobile emulation", () =>
-                controlledActionsRef.current?.toggleEmulation(),
-              )
-            }
-          />
-          <View ref={actionsAnchorRef} collapsable={false}>
-            <ChromeIconButton
-              styles={styles}
-              theme={theme}
-              label="Browser menu"
-              icon="EllipsisVertical"
-              selected={toolbarMenu === "actions"}
-              expanded={toolbarMenu === "actions"}
-              onPress={() => toggleToolbarMenu("actions")}
-            />
-          </View>
-        </View>
-      </View>
+      {touchFirstLayout ? canvasStatus : browserToolbar}
 
       {runtimeNotice || visibleError || state?.notice || video.codecFallbackReason ? (
         <ErrorNotice
@@ -1941,17 +1954,15 @@ export function SharedBrowserPanel({
             />
           ) : null}
         </BrowserCanvasViewport>
-        <View style={styles.canvasFooter}>
-          <Text numberOfLines={1} style={styles.canvasFooterText}>
-            {state?.title || state?.url || "Shared browser"}
-          </Text>
-          <Text numberOfLines={1} style={styles.canvasFooterText}>
-            {frameSummary}
-          </Text>
-        </View>
+        {touchFirstLayout ? null : canvasStatus}
       </View>
 
-      {touchFirstLayout ? browserTabs : null}
+      {touchFirstLayout ? (
+        <>
+          {browserTabs}
+          {browserToolbar}
+        </>
+      ) : null}
 
       {layout.platform !== "web" ? (
         <NativeKeyboardControls

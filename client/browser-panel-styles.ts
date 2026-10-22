@@ -26,6 +26,9 @@ export const DIMENSION = {
 } as const;
 /** Build stable theme/compact styles without changing shared browser state. */
 export function createStyles(theme: Theme, compact: boolean) {
+  const tabMinWidth = compact ? 132 : 176;
+  const selectedTabMinWidth = compact ? 200 : 230;
+
   return StyleSheet.create({
     screen: {
       flex: 1,
@@ -56,17 +59,30 @@ export function createStyles(theme: Theme, compact: boolean) {
       alignItems: "center",
       gap: SPACE.xs,
     },
+    tabListContentFill: {
+      flexGrow: 1,
+    },
     tabItem: {
       minHeight: DIMENSION.touch,
-      width: compact ? 132 : 176,
+      width: tabMinWidth,
       flexDirection: "row",
       alignItems: "center",
       borderBottomWidth: 2,
       borderBottomColor: "transparent",
     },
     tabItemSelected: {
-      width: compact ? 200 : 230,
+      width: selectedTabMinWidth,
       borderBottomColor: theme.colors.accent,
+    },
+    // Keep each fixed width as its flex basis so long titles cannot force early scrolling.
+    // Grow touch tabs into spare room, retaining space for the selected tab's actions.
+    tabItemFill: {
+      flexGrow: 1,
+      flexShrink: 1,
+      minWidth: tabMinWidth,
+    },
+    tabItemSelectedFill: {
+      minWidth: selectedTabMinWidth,
     },
     tabSelect: {
       flex: 1,
@@ -247,7 +263,7 @@ export function createStyles(theme: Theme, compact: boolean) {
       overflow: "hidden",
       backgroundColor: theme.colors.surface1,
     },
-    // Leave room for bottom tabs when the host resizes for a software keyboard.
+    // Leave room for bottom tabs and toolbar when the host resizes for a software keyboard.
     canvasShellFlexible: {
       minHeight: 0,
     },
@@ -288,6 +304,12 @@ export function createStyles(theme: Theme, compact: boolean) {
       justifyContent: "space-between",
       gap: SPACE.sm,
       backgroundColor: theme.colors.surface1,
+    },
+    canvasStatusTop: {
+      flexShrink: 0,
+      borderTopWidth: 0,
+      borderBottomWidth: 1,
+      borderBottomColor: theme.colors.border,
     },
     canvasFooterText: {
       color: theme.colors.foregroundMuted,

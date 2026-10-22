@@ -305,16 +305,56 @@ try {
     assert(canvas, "rendered canvas shell exists");
     assert.equal(canvas.parentElement, screen, "canvas and tabs share the panel flex column");
     assert.equal(chrome.parentElement, screen);
+    const title = Array.from(screen.querySelectorAll("span")).find(
+      (node) =>
+        node.textContent === state.title &&
+        node.parentElement.style.justifyContent === "space-between",
+    );
+    assert(title, "page title remains visible in the display status bar");
+    const status = title.parentElement;
+    assert.equal(status.children.length, 2, "title and display info share one bar");
+    assert(status.children[1].textContent, "display info remains visible");
+    for (const label of ["Back", "Forward", "Reload", "Display options", "Browser menu"]) {
+      assert.equal(
+        document.querySelectorAll(`button[aria-label="${label}"]`).length,
+        1,
+        `toolbar control ${label} appears once`,
+      );
+    }
     const children = Array.from(screen.children);
     const bottom = values.platform !== "web" || values.compact;
+    const selectedItem = selected.parentElement;
+    const tabContent = selectedItem.parentElement;
+    const selectedMinWidth = values.compact ? "200px" : "230px";
+    assert.equal(selectedItem.style.width, selectedMinWidth);
+    assert.equal(tabContent.style.flexGrow, bottom ? "1" : "");
+    assert.equal(selectedItem.style.flexGrow, bottom ? "1" : "");
+    assert.equal(selectedItem.style.flexShrink, bottom ? "1" : "");
+    assert.equal(selectedItem.style.minWidth, bottom ? selectedMinWidth : "");
     assert.equal(children.indexOf(bar) > children.indexOf(canvas), bottom);
-    assert.equal(children.indexOf(bar) > children.indexOf(chrome), bottom);
     if (bottom) {
+      assert.equal(status.parentElement, screen, "touch status is outside the canvas");
+      assert.deepEqual(
+        children.filter((node) => [status, canvas, bar, chrome].includes(node)),
+        [status, canvas, bar, chrome],
+        "touch order is title/display, canvas, tabs, toolbar",
+      );
+      assert.equal(status.style.flexShrink, "0", "top status keeps its height");
+      assert.equal(status.style.borderBottomWidth, "1px");
+      assert.equal(Number.parseFloat(status.style.borderTopWidth), 0);
       assert.equal(bar.style.flexShrink, "0", "bottom tabs keep their height");
       assert.equal(bar.style.borderTopWidth, "1px");
       assert.equal(Number.parseFloat(bar.style.borderBottomWidth), 0);
       assert.equal(canvas.style.minHeight, "0", "canvas can shrink for a shorter host viewport");
     } else {
+      assert.deepEqual(
+        children.filter((node) => [canvas, bar, chrome].includes(node)),
+        [bar, chrome, canvas],
+        "desktop order remains tabs, toolbar, canvas",
+      );
+      assert.equal(status.parentElement, canvas, "desktop status remains inside the canvas shell");
+      assert.equal(canvas.lastElementChild, status, "desktop status remains below the viewport");
+      assert.equal(status.style.borderTopWidth, "1px");
       assert.equal(bar.style.borderBottomWidth, "1px");
       assert.equal(canvas.style.minHeight, "320px");
     }
