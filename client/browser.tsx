@@ -54,7 +54,7 @@ import { isPrintPreviewUrl } from "../shared/browser-page";
 import type { BrowserFrameAuthority } from "../shared/browser-video";
 import { BrowserActionsMenu } from "./browser-actions-menu";
 import { BrowserAgentPointer } from "./browser-agent-pointer";
-import { type BrowserCanvasDisplayMode, getBrowserCanvasLayout } from "./browser-canvas-layout";
+import { getBrowserCanvasLayout } from "./browser-canvas-layout";
 import { BrowserCanvasViewport } from "./browser-canvas-viewport";
 import {
   CanvasPlaceholder,
@@ -97,6 +97,7 @@ import { useBrowserImageCapture } from "./use-browser-image-capture";
 import { useBrowserOperationError } from "./use-browser-operation-error";
 import { useBrowserScopedMutation } from "./use-browser-scoped-mutation";
 import { useBrowserVideo } from "./use-browser-video";
+import { useBrowserViewSize } from "./use-browser-view-size";
 import { useBrowserViewerRecovery } from "./use-browser-viewer-recovery";
 import { useResolutionFavorites } from "./use-resolution-favorites";
 
@@ -293,7 +294,7 @@ export function SharedBrowserPanel({
   const [keysSubmenuOpen, setKeysSubmenuOpen] = useState(false);
   const keysAnchorRef = useRef<View | null>(null);
   const [toolbarMenu, setToolbarMenu] = useState<"display" | "actions" | null>(null);
-  const [scaleMode, setScaleMode] = useState<BrowserCanvasDisplayMode>("fit");
+  const [scaleMode, setScaleMode] = useBrowserViewSize(host.id, workspaceId);
   const paneRef = useRef<View | null>(null);
   const displayAnchorRef = useRef<View | null>(null);
   const actionsAnchorRef = useRef<View | null>(null);
@@ -1277,6 +1278,7 @@ export function SharedBrowserPanel({
     inputLifecycle,
     panelScope,
     fillTarget,
+    setScaleMode,
   ]);
 
   useBrowserFillViewport({

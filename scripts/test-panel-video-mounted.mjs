@@ -33,6 +33,7 @@ if (
     "tab-layout",
     "errors",
     "quiet-video",
+    "view-size",
   ].includes(values.fixture)
 )
   throw new Error("Unsupported panel fixture");
@@ -230,6 +231,13 @@ const root = createRoot(document.getElementById("root"));
 const query = new QueryClient({
   defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
 });
+if (values.fixture === "view-size") {
+  // Session choices must survive even when the host immediately retires other inactive queries.
+  query.setDefaultOptions({
+    queries: { retry: false, gcTime: 0 },
+    mutations: { retry: false },
+  });
+}
 const frame = (n) => ({
   streamId: "z".repeat(32),
   captureGeneration: 1,
@@ -258,22 +266,30 @@ async function flush(ms = 0) {
     await new Promise((r) => setTimeout(r, ms));
   });
 }
-try {
+/** Remount keyed workspace panels as the host does when selecting another workspace. */
+async function renderWorkspace(
+  workspaceId,
+  { hostId = "fixture", client = query, panelKey = JSON.stringify([hostId, workspaceId]) } = {},
+) {
   await React.act(async () =>
     root.render(
       React.createElement(
         QueryClientProvider,
-        { client: query },
+        { client },
         React.createElement(SharedBrowserPanel, {
+          key: panelKey,
           theme: { colors: new Proxy({}, { get: () => "#777" }) },
-          host: { id: "fixture", label: "Fixture" },
+          host: { id: hostId, label: "Fixture" },
           layout: { compact: values.compact, platform: values.platform },
-          workspaceId: "workspace",
+          workspaceId,
         }),
       ),
     ),
   );
   await flush(30);
+}
+try {
+  await renderWorkspace("workspace");
   await React.act(async () =>
     f.captures[0].resolve({
       state: { ...f.state },
@@ -288,7 +304,10 @@ try {
   );
   await flush(10);
   await React.act(async () => f.imageLoads.pop()());
-  if (values.fixture !== "tab-layout" && !values.fixture.startsWith("tab-close")) {
+  if (
+    !["tab-layout", "view-size"].includes(values.fixture) &&
+    !values.fixture.startsWith("tab-close")
+  ) {
     assert(f.reads.length > 0, "first video request");
     await React.act(async () =>
       f.reads[0].resolve({
@@ -305,7 +324,79 @@ try {
     else assert(document.body.textContent.includes("Video"), "video displayed");
     console.log("PASS full panel painted Video");
   }
-  if (values.fixture === "tab-layout") {
+  if (values.fixture === "view-size") {
+    const toggleDisplay = async () => {
+      const button = document.querySelector('button[aria-label="Display options"]');
+      assert(button && !button.disabled);
+      await React.act(async () => button.click());
+      await flush(10);
+    };
+    const choice = (mode = "actual") =>
+      document.querySelector(
+        `button[aria-label="${mode === "actual" ? "Actual size (100%)" : "Fit to panel"}"]`,
+      );
+    const expectChoice = async (mode, message) => {
+      await toggleDisplay();
+      assert.equal(choice(mode).getAttribute("aria-selected"), "true", message);
+    };
+    const selectChoice = async (mode) => {
+      assert(choice(mode), "view size choice is available");
+      await React.act(async () => choice(mode).click());
+      await flush(10);
+    };
+    await toggleDisplay();
+    await selectChoice("actual");
+    await expectChoice("actual", "Actual size was selected");
+    await renderWorkspace("workspace");
+    // An unchanged mounted panel keeps the choice before exercising the remount.
+    assert.equal(choice().getAttribute("aria-selected"), "true");
+    await renderWorkspace("other-workspace");
+    await expectChoice("fit", "an untouched workspace retains its own Fit default");
+    await selectChoice("actual");
+    await renderWorkspace("workspace");
+    await expectChoice("actual", "Actual size survives leaving and returning to the workspace");
+    await selectChoice("fit");
+    await renderWorkspace("other-workspace");
+    await expectChoice("actual", "another workspace's Actual size remains independent");
+    await renderWorkspace("workspace");
+    await expectChoice("fit", "an explicit Fit choice also survives workspace leave/return");
+    await renderWorkspace("workspace", { hostId: "other-host" });
+    await expectChoice("fit", "the same workspace ID on another host starts independently");
+    await selectChoice("actual");
+    await renderWorkspace("workspace");
+    await expectChoice("fit", "another host cannot change this host's workspace choice");
+    await renderWorkspace("workspace", { hostId: "other-host" });
+    await expectChoice("actual", "the other host's choice also survives remount");
+    await renderWorkspace("workspace", { panelKey: "retained-panel" });
+    await expectChoice("fit", "retained panels read the current workspace choice");
+    await toggleDisplay();
+    await renderWorkspace("other-workspace", { panelKey: "retained-panel" });
+    await expectChoice("actual", "a prop-only workspace switch reads the new scope immediately");
+    await toggleDisplay();
+    await renderWorkspace("workspace", { panelKey: "retained-panel" });
+    await expectChoice("fit", "a prop-only return also restores the stored Fit choice");
+    await toggleDisplay();
+    await renderWorkspace("workspace", { hostId: "other-host", panelKey: "retained-panel" });
+    await expectChoice("actual", "a host-only prop switch restores its separate workspace choice");
+    const otherClient = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    await renderWorkspace("other-workspace", { client: otherClient, panelKey: "other-viewer" });
+    await expectChoice("fit", "another viewer's cache keeps an independent choice");
+    await renderWorkspace("other-workspace");
+    otherClient.clear();
+    await expectChoice("actual", "returning to the original viewer retains its own choice");
+    assert.equal(
+      f.calls.filter((call) =>
+        /shared-browser\.(resize|device|control|input|navigate)/.test(call.name),
+      ).length,
+      0,
+      "view size changes never mutate browser viewport, control or page",
+    );
+    console.log(
+      "PASS Actual/Fit survive remount and prop-only workspace switches, isolated by host and viewer, without browser mutations",
+    );
+  } else if (values.fixture === "tab-layout") {
     const selected = document.querySelector('button[role="tab"][aria-selected="true"]');
     assert(selected, "selected tab remains accessible");
     const create = document.querySelector('button[aria-label="New browser tab"]');

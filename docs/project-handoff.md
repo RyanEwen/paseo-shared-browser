@@ -26,6 +26,10 @@ Notices are dismissible per occurrence and panel scope. Relevant successful acti
 
 ## Mobile tab placement
 
+View size (Fit to panel or Actual size) is a client-session choice for each exact host/workspace pair. The installation's query cache retains it across panel remounts without fetching or saving host settings. Other connected clients keep independent choices. Unloading the plugin or restarting the app clears this session-only preference. Keep view size separate from browser viewport/device dimensions and the explicitly controlled Fill viewport action.
+
+The mounted `--fixture view-size` check in `scripts/test-panel-video-mounted.mjs` covers workspace leave/return and prop-only switches, both Actual and Fit, host/client isolation, and retention with immediate collection of ordinary inactive queries. It runs the production panel/menu/cache without browser mutations. Use the same `--tooling-root` convention as the layout fixture below.
+
 The tab row follows the panel's existing touch-first policy: `layout.platform !== "web" || layout.compact`. All iOS and Android hosts, including wide tablets, place the page title and display status bar above the canvas, followed by tabs and then the address toolbar below the canvas. Compact web layouts do the same; other web layouts keep tabs above the address toolbar and the title/display status below the canvas. The host supplies `layout.compact`; this plugin does not introduce a width breakpoint or infer mobile from the remote browser's emulation settings.
 
 Touch-first tabs fill the available list width and shrink as tabs are added, stopping at their existing compact/regular minimum widths (132/176 for other tabs, 200/230 for the selected tab and its actions). The list scrolls only when those minimums no longer fit; the new-tab button stays outside the scroll area. Desktop tabs retain their fixed widths.
