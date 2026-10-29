@@ -10,6 +10,20 @@ paseo plugin install github:RyanEwen/paseo-shared-browser --ref main
 
 Run on the Paseo host with plugins enabled, Node.js 24+ and npm installed. Requires a compatible Paseo 0.11 app and daemon. Open **Shared Browser** from a workspace or the Command Center.
 
+Paseo++ previews 0.12.0-preview.33, preview.34, and preview.35 are also supported explicitly. Other prereleases require separate compatibility verification.
+
+For a local checkout, prepare its locked production dependencies and runtime before registering it. Local-directory installation does not run the manifest's build commands:
+
+```bash
+# Run from the plugin checkout; set the intended host's actual Paseo home.
+export PASEO_HOME=/path/to/paseo-home
+node scripts/prepare-dependencies.mjs
+npm run prepare:runtime
+paseo plugin install "$PWD" --host 127.0.0.1:PORT
+```
+
+Use a dedicated installation copy: dependency preparation installs only production dependencies. For development verification, use `scripts/dev-daemon.sh` as described in `AGENTS.md`. If `shared-browser` is already registered, inspect its status before changing it; a failed local load after missing dependency preparation can be reloaded once preparation completes. Replacing an active runtime can close browser sessions and lose unsaved page state.
+
 ## What this fork changes
 
 Forked from Omer Cohen's [Shared Browser in omercnet/paseo-plugins](https://github.com/omercnet/paseo-plugins/tree/main/paseo-shared-browser). These are our additions and refinements, including contributions also accepted upstream:

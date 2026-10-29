@@ -1,5 +1,30 @@
 # Changelog
 
+## 2.1.0 (2026-10-29)
+
+First standalone fork release. Original upstream history and attribution are retained below.
+Published as a GitHub prerelease because the retained forced-screencast recovery smoke gate remains unresolved.
+
+### Features
+
+- Retain independent browser tabs and hidden native windows, native Android input/video, optional GPU graphics and PyroWave LAN, real Chromium print preview, and explicit agent recovery.
+- Improve mobile toolbar and tab placement, display controls, and client-session view size retention across workspace switches.
+- Allow confirmed ordinary tab closure by viewers; final-tab closure still requires control.
+
+### Fixes
+
+- Support Paseo 0.12.0-preview.35 alongside the retained stable and explicit prerelease versions.
+- Refresh stale video presentations without renewing input authority from empty video reads.
+- Keep error dismissal and recovery tied to the exact occurrence and panel scope.
+- Document locked dependency and runtime preparation before local-directory installation.
+- Exclude staged development copies and the private recovery archive from every Vitest suite.
+
+### Validation and limits
+
+- Required repository checks and isolated daemon installation are release gates.
+- The browser smoke suite still fails its documented forced-fallback recovery assertion (`screenshot` instead of `cdp-screencast` within ten seconds). Do not treat the full browser suite as passing.
+- Real passkey enrollment, operating-system dialogs, and complete cross-platform native capture remain unqualified. Existing capture recovery and immediate popup readiness limits are documented in the project handoff.
+
 ## [2.0.0](https://github.com/omercnet/paseo-plugins/compare/shared-browser-v1.2.2...shared-browser-v2.0.0) (2026-10-11)
 
 

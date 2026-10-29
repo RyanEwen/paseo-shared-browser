@@ -48,6 +48,8 @@ The retirement source cutover changed only the registered plugin directory. It v
 
 ## Validation baseline
 
+The 2.1.0 standalone release adds explicit Paseo 0.12.0-preview.35 compatibility and local-directory preparation guidance. Every Vitest suite now excludes staged `.dev` copies and the private `.local-history` recovery archive. GitHub publication is a prerelease while the documented forced-screencast recovery smoke failure remains unresolved. The package name and `shared-browser` runtime ID retain upstream identity; this GitHub release does not publish the upstream-owned npm package.
+
 The standalone baseline passed 784 unit tests, five script tests, build, typecheck, lint, and shrinkwrap checks. Linux, macOS, and Windows CI passed, including Linux native-video capture/decode. The exact GitHub-install path was also exercised on an isolated daemon and cleaned up.
 
 - [Standalone CI run](https://github.com/RyanEwen/paseo-shared-browser/actions/runs/38944617359)
