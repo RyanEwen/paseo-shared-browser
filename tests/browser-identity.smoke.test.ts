@@ -142,7 +142,16 @@ it("retains native desktop identity and client hints through device switches and
             presetId: "pixel-7",
           });
           await runtime.navigate(`${origin}/mobile`);
-          const emulated = await inspectIdentity(runtime);
+          // As in expectNative: navigation admission waits for commit, not the fixture's
+          // script or replacement Runtime context, so read until that page is ready.
+          const emulated = await vi.waitFor(
+            async () => {
+              const identity = await inspectIdentity(runtime);
+              expect(identity?.scriptExecuted).toBe(true);
+              return identity;
+            },
+            { timeout: 2000, interval: 25 },
+          );
           expect(emulated.userAgent).toContain("Pixel 7");
           expect(emulated.platform).toBe("Linux armv81");
           expect(emulated.webdriver).toBe(native.webdriver);
