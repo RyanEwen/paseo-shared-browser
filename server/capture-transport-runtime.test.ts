@@ -3,7 +3,7 @@ import { DEFAULT_JPEG_QUALITY } from "../shared/capture-settings";
 import { AgentBrowserRuntime } from "./agent-browser-runtime";
 
 /** Header fixture exercises actual bounded JPEG validation without launching Chromium. */
-function jpeg(tag = 1): string {
+function jpegOf(width: number, height: number, tag = 1): string {
   return Buffer.from([
     255,
     216,
@@ -17,10 +17,10 @@ function jpeg(tag = 1): string {
     0,
     11,
     8,
-    3,
-    32,
-    5,
-    0,
+    height >> 8,
+    height & 255,
+    width >> 8,
+    width & 255,
     1,
     1,
     17,
@@ -28,6 +28,11 @@ function jpeg(tag = 1): string {
     255,
     217,
   ]).toString("base64");
+}
+
+/** The fixture's default 1280x800 desktop frame. */
+function jpeg(tag = 1): string {
+  return jpegOf(1280, 800, tag);
 }
 let clock = 10_000;
 beforeEach(() => {
@@ -47,12 +52,14 @@ function fixture() {
     session: "test",
   });
   const calls: string[] = [];
+  const sent: { method: string; params: Record<string, unknown> }[] = [];
   let capture: (params: Record<string, unknown>) => Promise<{ data: string }> = async () => ({
     data: jpeg(),
   });
   const page = {
     send: async (method: string, params: Record<string, unknown> = {}) => {
       calls.push(method);
+      sent.push({ method, params });
       if (method === "Page.captureScreenshot") return capture(params);
       if (method === "Page.getLayoutMetrics") return { cssVisualViewport: { pageX: 0, pageY: 0 } };
       return {};
@@ -60,8 +67,9 @@ function fixture() {
   };
   const control = runtime as unknown as {
     requirePage: () => Promise<typeof page>;
-    attachment: { page: typeof page };
+    attachment: { page: typeof page; viewport: Record<string, unknown> };
     capture: {
+      screencastActive: boolean;
       invalidateScreencastFrame: () => void;
       onScreencastFrame: (source: typeof page, event: object) => void;
     };
@@ -73,9 +81,9 @@ function fixture() {
   });
   Object.assign((runtime as unknown as { capture: object }).capture, { screencastActive: true });
   control.requirePage = async () => control.attachment.page;
-  const emit = (timestamp: number, source = page) =>
+  const emit = (timestamp: number, source = page, data = jpeg(2)) =>
     control.capture.onScreencastFrame(source, {
-      data: jpeg(2),
+      data,
       metadata: {
         deviceWidth: 1280,
         deviceHeight: 800,
@@ -88,6 +96,7 @@ function fixture() {
     control,
     page,
     calls,
+    sent,
     emit,
     setCapture: (next: typeof capture) => {
       capture = next;
@@ -200,6 +209,50 @@ it("honors low/medium quality independently while high viewers keep the shared s
   expect(qualities).toEqual([70, 90]);
   expect(calls).not.toContain("Page.startScreencast");
   expect(calls).not.toContain("Page.stopScreencast");
+});
+
+it("bounds the screencast to the capture contract so emulated frames can recover the stream", async () => {
+  const { runtime, control, page, sent, emit, setCapture } = fixture();
+  // A Pixel 7 at capture scale 1 renders on the forced 2x native display, so an unbounded
+  // screencast emitted 824x1678 frames against the 412x839 contract and none could recover.
+  control.attachment.viewport = {
+    width: 412,
+    height: 839,
+    deviceScaleFactor: 2.625,
+    captureScale: 1,
+    mobile: true,
+    touch: true,
+  };
+  control.capture.screencastActive = false;
+  setCapture(async () => ({ data: jpegOf(412, 839) }));
+  expect((await runtime.frame(100, DEFAULT_JPEG_QUALITY, 0)).transport).toBe("screenshot");
+  expect(sent.find((call) => call.method === "Page.startScreencast")?.params).toEqual({
+    format: "jpeg",
+    quality: DEFAULT_JPEG_QUALITY,
+    everyNthFrame: 1,
+    maxWidth: 412,
+    maxHeight: 839,
+  });
+
+  // Surface-sized frames are still not the contract and cannot count as recovery evidence.
+  clock += 1600;
+  emit(1, page, jpegOf(824, 1678, 2));
+  clock += 250;
+  emit(2, page, jpegOf(824, 1678, 2));
+  clock += 250;
+  emit(3, page, jpegOf(824, 1678, 2));
+  expect((await runtime.frame(100, DEFAULT_JPEG_QUALITY, 0)).transport).toBe("screenshot");
+
+  // Frames Chromium scaled to the bounds are the sustained evidence that recovers the stream.
+  clock += 300;
+  emit(4, page, jpegOf(412, 839, 2));
+  clock += 250;
+  emit(5, page, jpegOf(412, 839, 2));
+  clock += 250;
+  emit(6, page, jpegOf(412, 839, 2));
+  const recovered = await runtime.frame(100, DEFAULT_JPEG_QUALITY, 0);
+  expect(recovered.transport).toBe("cdp-screencast");
+  expect([recovered.width, recovered.height]).toEqual([412, 839]);
 });
 
 it("reduces quality only to satisfy the byte cap and never substitutes a cached high-quality frame", async () => {

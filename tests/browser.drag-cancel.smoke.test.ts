@@ -85,7 +85,8 @@ it("releases a cancelled held drag at its last pointer position and drops late c
   process.env.PASEO_HOME = paseoHome;
   const paths = resolveSupervisorPaths(paseoHome);
   const running = await startSupervisorServer(
-    await createRuntimeOwner({ initialUrl: `${origin}/`, headed: process.platform === "win32" }),
+    // Headless on every platform: the runtime refuses real-desktop windows for independent tabs.
+    await createRuntimeOwner({ initialUrl: `${origin}/` }),
     paths,
   );
   const manager = new SessionManager({

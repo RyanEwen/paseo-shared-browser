@@ -252,7 +252,6 @@ async function proveNativeVideo(pointerKind: "mouse" | "touch") {
     vi.stubEnv("PASEO_SHARED_BROWSER_CHROMIUM_EXECUTABLE", executablePath);
     const owner = await createRuntimeOwner({
       initialUrl: `${origin}/source`,
-      headed: process.platform === "win32",
       ...(existsSync(join(runtimeRoot, "xvfb", "usr", "bin", "Xvfb"))
         ? { virtualDisplayExecutablePath: join(runtimeRoot, "xvfb", "usr", "bin", "Xvfb") }
         : {}),
@@ -1005,10 +1004,13 @@ async function proveNativeVideo(pointerKind: "mouse" | "touch") {
     expect(firstVideo.state.tabId).toBe(attached.state.tabId);
     expect(firstVideo.state.controller).toBe("self");
     expect(firstVideo.state.url).toBe(`${origin}/pending-dom`);
+    // Ordinary tab close carries the exact session and runtime fences it confirms.
     await client.requestBrowser("tabs.close", {
       viewerToken: attached.viewerToken,
       controlToken: lease.controlToken,
       tabId: attached.state.tabId!,
+      sessionId: attached.state.sessionId,
+      runtimeId: attached.state.runtimeId!,
     });
     const afterOriginalClose = await readTabPacket(second.viewerToken);
     expect(afterOriginalClose.state.tabId).toBe(tab.tabId);

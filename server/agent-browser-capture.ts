@@ -562,11 +562,9 @@ export class RuntimeCapture {
         if (this.attachment.page !== candidate) {
           throw new CdpUnavailableError("Browser page changed before screencast start");
         }
-        await candidate.send(
-          "Page.startScreencast",
-          { format: "jpeg", quality: this.screencastQuality, everyNthFrame: 1 },
-          { mutation: true },
-        );
+        await candidate.send("Page.startScreencast", this.screencastParameters(), {
+          mutation: true,
+        });
         this.attachment.assertRuntimeOpen();
         return;
       } catch (error) {
@@ -583,6 +581,27 @@ export class RuntimeCapture {
         await promise;
       }
     }
+  }
+
+  /**
+   * `Page.startScreencast` parameters, bounded to the capture contract of the configured viewport.
+   * Chromium emits screencast frames at the compositor surface size. That size follows the native
+   * display scale (the runtime forces 2x for native video) and device emulation, not the configured
+   * capture density: a Pixel 7 at capture scale 1 produced 824x1678 frames against a 412x839
+   * contract, so `onScreencastFrame` rejected every frame and fallback could never recover.
+   * Chromium scales frames down to fit these bounds and never scales up, so a frame that still
+   * mismatches keeps using the bounded screenshot fallback. The viewport is read at start time;
+   * every emulation change restarts the stream through `withInvalidatedScreencast`.
+   */
+  private screencastParameters(): Record<string, unknown> {
+    const viewport = this.attachment.viewport;
+    const bounds = viewport ? captureDimensions(viewport, viewport.captureScale) : null;
+    return {
+      format: "jpeg",
+      quality: this.screencastQuality,
+      everyNthFrame: 1,
+      ...(bounds ? { maxWidth: bounds.width, maxHeight: bounds.height } : {}),
+    };
   }
 
   /**

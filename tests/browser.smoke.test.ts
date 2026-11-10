@@ -153,8 +153,8 @@ it("shares and persists a production agent-browser runtime across supervisor cli
   const running = await startSupervisorServer(
     await createRuntimeOwner({
       initialUrl: `${origin}/`,
-      // agent-browser 0.37.1's private desktop does not start on Windows Server CI.
-      headed: process.platform === "win32",
+      // Headless on every platform: the runtime refuses real-desktop windows for independent
+      // tabs, so a Windows headed launch can no longer be used to avoid a private desktop.
     }),
     paths,
   );

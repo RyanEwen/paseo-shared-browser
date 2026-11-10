@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.2.1 (2026-11-10)
+
+### Fixes
+
+- The live view returns to smooth streaming after falling back to screenshots. Under device emulation, streamed frames arrived at a different size than expected and were all discarded, so the view could stay on slower screenshots indefinitely.
+
+### Validation
+
+- The full browser smoke suite and the native video smoke now pass. Two stale smoke tests were updated (tab close fences, and headless launches on Windows), with no assertions loosened.
+
 ## 2.2.0 (2026-11-10)
 
 Published as a GitHub prerelease because the retained forced-screencast recovery smoke gate remains unresolved.
