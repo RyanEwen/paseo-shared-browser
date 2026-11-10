@@ -1,7 +1,8 @@
-import { readFile } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import contribute from "../index.server";
 import {
   type BrowserState,
@@ -80,6 +81,17 @@ type AgentCreateRequest = {
 };
 
 type AgentCreateHook = (input: { request: AgentCreateRequest }) => Promise<AgentCreateRequest>;
+
+// The server entry writes plugin data under PASEO_HOME; never let tests reach a real home.
+let isolatedHome = "";
+beforeAll(async () => {
+  isolatedHome = await mkdtemp(join(tmpdir(), "shared-browser-contracts-"));
+  vi.stubEnv("PASEO_HOME", isolatedHome);
+});
+afterAll(async () => {
+  vi.unstubAllEnvs();
+  await rm(isolatedHome, { recursive: true, force: true });
+});
 
 function captureAgentCreateHook(): AgentCreateHook {
   let hook: AgentCreateHook | undefined;

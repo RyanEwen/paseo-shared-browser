@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { expect, it } from "vitest";
@@ -50,7 +50,11 @@ it("accepts a complete qualified immutable asset set and derives private storage
   const f = await fixture();
   try {
     const result = await readRuntimeMediaAssets(f.home);
-    expect(result?.worker.workerPath).toBe(join(f.root, "browser-media-worker.cjs"));
+    // The reader returns the realpath'd runtime: temporary directories are reached through
+    // links on macOS (/var) and short names on Windows (RUNNER~1).
+    expect(result?.worker.workerPath).toBe(
+      join(await realpath(f.root), "browser-media-worker.cjs"),
+    );
     expect(result?.pyrowave.credentialDirectory).toBe(
       join(f.home, "plugin-data/shared-browser/.secrets/media"),
     );

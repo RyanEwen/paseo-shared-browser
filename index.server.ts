@@ -104,10 +104,9 @@ function paseoHome(): string {
 
 export default function contribute(server: PluginServerContext) {
   const settings = server.registerSettings(browserDisplayPreferences);
-  // Written once per plugin start; new agents save its fixed path instead of a runtime directory.
-  const adapterLauncher = ensureAgentAdapterLauncher(paseoHome());
-  // Each agent creation handles a failure through its fallback; this only marks it observed.
-  adapterLauncher.catch(() => {});
+  // Written on the first agent creation of this plugin start, not at load, so loading the plugin
+  // writes nothing. New agents save its fixed path instead of a runtime directory.
+  let adapterLauncher: Promise<string> | null = null;
   const videoSettings = createRuntimeVideoSettings(paseoHome());
   const graphicsSettings = createRuntimeGraphicsSettings(paseoHome());
   let liveVideoEnabled = false;
@@ -177,6 +176,7 @@ export default function contribute(server: PluginServerContext) {
     await syncSettings();
     const ticket = randomBytes(32).toString("base64url");
     if (!(await issueTicketWithinDeadline(ticket))) return request;
+    adapterLauncher ??= ensureAgentAdapterLauncher(paseoHome());
     const adapterPath = await resolveAgentAdapterPath(paseoHome(), adapterLauncher);
     return {
       ...request,
