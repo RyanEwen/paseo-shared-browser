@@ -71,7 +71,7 @@ export const viewportSchema = z.object({
 export const browserStateSchema = z.object({
   sessionId: opaqueTokenSchema,
   workspaceId: workspaceIdSchema,
-  status: z.enum(["starting", "ready", "error"]),
+  status: z.enum(["empty", "starting", "ready", "error"]),
   url: z.string().max(8_192),
   title: z.string().max(1_024),
   canGoBack: z.boolean(),
@@ -574,6 +574,10 @@ export type Viewport = z.output<typeof viewportSchema>;
 export type BrowserRecoveryState = z.output<typeof browserRecoveryStateSchema>;
 
 export function isBrowserStateCurrent(previous: BrowserState, next: BrowserState): boolean {
+  // The first URL moves an empty viewer onto a real page without changing its
+  // token. A late pre-open observation cannot replace that acknowledged page.
+  if (previous.tabId && next.status === "empty" && previous.runtimeId === next.runtimeId)
+    return false;
   if (
     previous.runtimeCreatedAt !== undefined &&
     next.runtimeCreatedAt !== undefined &&

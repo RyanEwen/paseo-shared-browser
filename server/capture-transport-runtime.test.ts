@@ -60,19 +60,21 @@ function fixture() {
   };
   const control = runtime as unknown as {
     requirePage: () => Promise<typeof page>;
-    page: typeof page;
-    invalidateScreencastFrame: () => void;
-    onScreencastFrame: (source: typeof page, event: object) => void;
+    attachment: { page: typeof page };
+    capture: {
+      invalidateScreencastFrame: () => void;
+      onScreencastFrame: (source: typeof page, event: object) => void;
+    };
   };
-  Object.assign(runtime, {
+  Object.assign((runtime as unknown as { attachment: object }).attachment, {
     page,
     emulationAppliedPage: page,
-    screencastActive: true,
     viewport: { width: 1280, height: 800, deviceScaleFactor: 1, mobile: false, touch: false },
   });
-  control.requirePage = async () => control.page;
+  Object.assign((runtime as unknown as { capture: object }).capture, { screencastActive: true });
+  control.requirePage = async () => control.attachment.page;
   const emit = (timestamp: number, source = page) =>
-    control.onScreencastFrame(source, {
+    control.capture.onScreencastFrame(source, {
       data: jpeg(2),
       metadata: {
         deviceWidth: 1280,
@@ -158,7 +160,7 @@ describe("runtime capture hysteresis", () => {
     setCapture(async () => ({ data: jpeg(3) }));
     const fresh = await runtime.frame(100, DEFAULT_JPEG_QUALITY, 0);
     expect(fresh.dataBase64).toBe(jpeg(3));
-    control.invalidateScreencastFrame();
+    control.capture.invalidateScreencastFrame();
     setCapture(async () => ({ data: jpeg(4) }));
     expect((await runtime.frame(100, DEFAULT_JPEG_QUALITY, 0)).dataBase64).toBe(jpeg(4));
   });
@@ -173,8 +175,8 @@ describe("runtime capture hysteresis", () => {
     });
     const pending = runtime.frame(100, DEFAULT_JPEG_QUALITY, 0);
     await started.promise;
-    control.page = { ...page };
-    control.invalidateScreencastFrame();
+    control.attachment.page = { ...page };
+    control.capture.invalidateScreencastFrame();
     shot.resolve({ data: jpeg() });
     await expect(pending).rejects.toThrow("capture was invalidated");
   });

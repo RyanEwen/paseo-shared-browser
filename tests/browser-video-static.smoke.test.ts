@@ -59,8 +59,10 @@ it("measures real static delta refinement against the JPEG-derived source refere
         co = await createRuntimeOwner({ nativeVideo: false, initialUrl: `${origin}/decode` });
         consumer = await co.create("owned-static-decoder");
         process.env.PASEO_HOME = sourceHome;
-        const page = (consumer.runtime as unknown as { page: CdpSession }).page,
-          sourcePage = (b.runtime as unknown as { page: CdpSession }).page;
+        const page = (consumer.runtime as unknown as { attachment: { page: CdpSession } })
+            .attachment.page,
+          sourcePage = (b.runtime as unknown as { attachment: { page: CdpSession } }).attachment
+            .page;
         // Match production low-latency decoding and retain at most twelve cropped pictures.
         await page.send("Runtime.evaluate", {
           expression: `window.historyFrames=[];window.lastDecoded=-1;window.decodeError=null;window.decoder=null;window.stream=null;window.consume=(packets)=>{for(const p of packets){if(window.stream!==p.streamId){window.decoder?.close();window.stream=p.streamId;window.decoder=new VideoDecoder({error:e=>window.decodeError=String(e),output:f=>{const c=new OffscreenCanvas(1000,400);const g=c.getContext('2d',{willReadFrequently:true});g.drawImage(f,200,300,1000,400,0,0,1000,400);window.historyFrames.push({t:f.timestamp,data:g.getImageData(0,0,1000,400).data});while(window.historyFrames.length>12)window.historyFrames.shift();window.lastDecoded=f.timestamp;f.close();}});window.decoder.configure({optimizeForLatency:true,codec:p.codec,codedWidth:p.width,codedHeight:p.height,...(p.descriptionBase64?{description:Uint8Array.from(atob(p.descriptionBase64),c=>c.charCodeAt(0))}:{})});}window.decoder.decode(new EncodedVideoChunk({type:p.type,timestamp:p.timestampUs,data:Uint8Array.from(atob(p.dataBase64),c=>c.charCodeAt(0))}));}};`,

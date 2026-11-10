@@ -6,8 +6,9 @@ import { afterEach, expect, it, vi } from "vitest";
 import { SessionManager } from "../server/browser";
 import { createRuntimeOwner } from "../server/runtime-owner";
 import { resolveBrowserRuntimeRoot } from "../server/runtime-path";
-import { resolveSupervisorPaths, startSupervisorServer } from "../server/supervisor";
 import { SupervisorClient } from "../server/supervisor-client";
+import { resolveSupervisorPaths } from "../server/supervisor-paths";
+import { startSupervisorServer } from "../server/supervisor-server";
 import type { BrowserFrame, BrowserState } from "../shared/browser";
 import { DEFAULT_CAPTURE_QUALITY } from "../shared/capture-settings";
 

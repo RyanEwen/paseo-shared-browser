@@ -6,13 +6,10 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { resolveBrowserRuntimeRoot } from "../server/runtime-path";
 import { type JsonValue, RUNTIME_PROTOCOL_VERSION } from "../server/runtime-protocol";
-import {
-  type RuntimeInstance,
-  type RuntimeOwner,
-  RuntimeSupervisor,
-  resolveSupervisorPaths,
-  startSupervisorServer,
-} from "../server/supervisor";
+import { type RuntimeInstance, type RuntimeOwner, RuntimeSupervisor } from "../server/supervisor";
+import { AgentSupervisorClient, SupervisorClient } from "../server/supervisor-client";
+import { resolveSupervisorPaths } from "../server/supervisor-paths";
+import { startSupervisorServer } from "../server/supervisor-server";
 
 type Deferred<T> = {
   promise: Promise<T>;
@@ -100,6 +97,116 @@ function createHarness(maxWorkspaces?: number) {
   });
   return { owner, supervisor };
 }
+
+it("empty workspace protocol refuses an old bridge before it can claim or create a workspace", async () => {
+  const home = await mkdtemp(join(tmpdir(), "shared-browser-protocol-"));
+  const paths = resolveSupervisorPaths(home);
+  const owner = new FakeOwner();
+  const running = await startSupervisorServer(owner, paths);
+  const socket = await openSocket(paths.socket);
+  try {
+    const token = (await readFile(paths.token, "utf8")).trim();
+    expect(
+      await sendRequest(socket, {
+        id: "old-claim",
+        version: 2,
+        token,
+        method: "bridge.claim",
+        bridgeId: "old",
+      }),
+    ).toMatchObject({ ok: false, error: { code: "PROTOCOL_MISMATCH" } });
+    expect(owner.created).toEqual([]);
+    expect(
+      await sendRequest(socket, {
+        id: "new-claim",
+        version: RUNTIME_PROTOCOL_VERSION,
+        token,
+        method: "bridge.claim",
+        bridgeId: "current",
+      }),
+    ).toMatchObject({ ok: true });
+    expect(paths.root).toBe(join(home, "plugin-data", "shared-browser", "supervisor-v2"));
+  } finally {
+    socket.destroy();
+    await running.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+it("admits wire 2 agent adapters pinned in saved agent config, but no older revision", async () => {
+  const home = await mkdtemp(join(tmpdir(), "shared-browser-legacy-agent-"));
+  const paths = resolveSupervisorPaths(home);
+  const owner = new FakeOwner();
+  const running = await startSupervisorServer(owner, paths);
+  const socket = await openSocket(paths.socket);
+  try {
+    // Wire 2 adapters require `version: 2` in the endpoint before connecting.
+    const endpoint = JSON.parse(await readFile(paths.endpoint, "utf8"));
+    expect(endpoint).toMatchObject({ version: 2, protocols: [2, RUNTIME_PROTOCOL_VERSION] });
+
+    // Admission reaches ticket authentication instead of a protocol refusal.
+    const legacy = await sendRequest(socket, {
+      id: "legacy-agent",
+      version: 2,
+      method: "agent.request",
+      ticket: "unissued-ticket",
+      operation: "status",
+      input: {},
+    });
+    expect(legacy).toMatchObject({ ok: false });
+    expect(legacy).not.toMatchObject({ error: { code: "PROTOCOL_MISMATCH" } });
+
+    expect(
+      await sendRequest(socket, {
+        id: "ancient-agent",
+        version: 1,
+        method: "agent.request",
+        ticket: "unissued-ticket",
+        operation: "status",
+        input: {},
+      }),
+    ).toMatchObject({ ok: false, error: { code: "PROTOCOL_MISMATCH" } });
+    expect(owner.created).toEqual([]);
+  } finally {
+    socket.destroy();
+    await running.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+it("current clients connect through the dual-revision endpoint", async () => {
+  const home = await mkdtemp(join(tmpdir(), "shared-browser-endpoint-"));
+  const paths = resolveSupervisorPaths(home);
+  const running = await startSupervisorServer(new FakeOwner(), paths);
+  const bridge = new SupervisorClient({ bridgeId: "current", paths });
+  try {
+    await expect(bridge.connect()).resolves.toMatchObject({ epoch: expect.any(Number) });
+  } finally {
+    bridge.disconnect();
+    await running.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+it("empty workspace protocol refuses old endpoint metadata before opening a socket", async () => {
+  const home = await mkdtemp(join(tmpdir(), "shared-browser-old-endpoint-"));
+  const paths = resolveSupervisorPaths(home);
+  await mkdir(paths.root, { recursive: true, mode: 0o700 });
+  await writeFile(paths.token, "synthetic-token", { mode: 0o600 });
+  await writeFile(paths.endpoint, JSON.stringify({ version: 2, socket: paths.socket }), {
+    mode: 0o600,
+  });
+  const bridge = new SupervisorClient({ bridgeId: "current", paths });
+  const agent = new AgentSupervisorClient({ ticket: "synthetic-ticket", paths });
+  try {
+    await expect(bridge.connect()).rejects.toThrow("Supervisor endpoint protocol mismatch");
+    await expect(agent.open()).rejects.toThrow("Supervisor endpoint protocol mismatch");
+  } finally {
+    bridge.disconnect();
+    agent.disconnect();
+    await rm(home, { recursive: true, force: true });
+  }
+});
 
 async function openSocket(path: string): Promise<Socket> {
   const socket = connect(path);

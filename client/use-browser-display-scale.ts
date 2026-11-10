@@ -1,18 +1,19 @@
 /** Keep capture demand aligned with this client's native scale, monitor, and local web zoom. */
 import { useEffect, useState } from "react";
-import { Platform, useWindowDimensions } from "react-native";
+import { useWindowDimensions } from "react-native";
 import { observeBrowserDisplayScale, readBrowserDisplayScale } from "./browser-display-scale";
+import { webDisplayScaleSource } from "./browser-page-web";
 
 /** React Native owns native scale updates; web additionally observes DPR-only monitor transitions. */
 export function useBrowserDisplayScale(): number {
   const { scale: nativeScale } = useWindowDimensions();
-  const web = Platform.OS === "web";
+  const [source] = useState(webDisplayScaleSource);
   const [browserScale, setBrowserScale] = useState(() =>
-    web ? readBrowserDisplayScale(nativeScale) : nativeScale,
+    source ? readBrowserDisplayScale(nativeScale, source) : nativeScale,
   );
   useEffect(() => {
-    if (!web) return;
-    return observeBrowserDisplayScale(nativeScale, setBrowserScale);
-  }, [web, nativeScale]);
-  return web ? browserScale : nativeScale;
+    if (!source) return;
+    return observeBrowserDisplayScale(nativeScale, setBrowserScale, source);
+  }, [source, nativeScale]);
+  return source ? browserScale : nativeScale;
 }

@@ -38,13 +38,10 @@ class ConnectionFixture extends EventEmitter {
 }
 
 interface RuntimeControl {
-  invoke(args: string[]): Promise<unknown>;
-  assertVersion(): Promise<void>;
+  cli: { invoke(args: string[]): Promise<unknown>; assertVersion(): Promise<void> };
   connectCdp(targetId?: string | null): Promise<void>;
   reattachPageForScreencast(previous: CdpSession): Promise<CdpSession>;
-  connection: CdpConnection;
-  targetId: string | null;
-  page: CdpSession | null;
+  attachment: { connection: CdpConnection; targetId: string | null; page: CdpSession | null };
 }
 
 /** Stub only binary discovery and CDP transport, preserving runtime selection policy. */
@@ -71,8 +68,8 @@ function fixture(targetLists: string[][]) {
     session: "target-retention-test",
   });
   const control = runtime as unknown as RuntimeControl;
-  control.invoke = vi.fn(async () => ({ cdpUrl: "ws://127.0.0.1:1/fixture" }));
-  control.assertVersion = async () => {};
+  control.cli.invoke = vi.fn(async () => ({ cdpUrl: "ws://127.0.0.1:1/fixture" }));
+  control.cli.assertVersion = async () => {};
   return { runtime, control, connections };
 }
 
@@ -81,7 +78,7 @@ describe("exact selected target retention", () => {
   it("permits initial selection when no page has ever been selected", async () => {
     const { control } = fixture([["first", "second"]]);
     await control.connectCdp();
-    expect(control.targetId).toBe("first");
+    expect(control.attachment.targetId).toBe("first");
   });
 
   it("retains the selected surviving page across disconnect instead of adopting the first tab", async () => {
@@ -91,16 +88,16 @@ describe("exact selected target retention", () => {
     ]);
     await control.connectCdp("original");
     connections[0]!.close();
-    expect(control.page).toBeNull();
-    expect(control.targetId).toBe("original");
+    expect(control.attachment.page).toBeNull();
+    expect(control.attachment.targetId).toBe("original");
     await runtime.reconnect();
-    expect(control.page?.targetId).toBe("original");
+    expect(control.attachment.page?.targetId).toBe("original");
     expect(
       connections[1]!.calls
         .filter((call) => call.method === "Target.activateTarget")
         .map((call) => call.params.targetId),
     ).toEqual(["original"]);
-    expect(control.invoke).toHaveBeenCalledWith([
+    expect(control.cli.invoke).toHaveBeenCalledWith([
       "--session",
       "target-retention-test",
       "--json",
@@ -124,8 +121,8 @@ describe("exact selected target retention", () => {
     await expect(runtime.reconnect()).rejects.toThrow(
       "selected browser page is no longer available",
     );
-    expect(control.targetId).toBe("original");
-    expect(control.page).toBeNull();
+    expect(control.attachment.targetId).toBe("original");
+    expect(control.attachment.page).toBeNull();
     expect(
       connections
         .slice(1)
@@ -142,11 +139,11 @@ describe("exact selected target retention", () => {
     await expect(control.connectCdp("missing")).rejects.toThrow(
       "selected browser page is no longer available",
     );
-    expect(control.targetId).toBe("missing");
+    expect(control.attachment.targetId).toBe("missing");
     await expect(runtime.reconnect()).rejects.toThrow(
       "selected browser page is no longer available",
     );
-    expect(control.page).toBeNull();
+    expect(control.attachment.page).toBeNull();
     expect(
       connections
         .flatMap((connection) => connection.calls)
@@ -163,20 +160,20 @@ describe("exact selected target retention", () => {
     await runtime.selectTarget("chosen");
     connections[0]!.close();
     await runtime.reconnect();
-    expect(control.page?.targetId).toBe("chosen");
+    expect(control.attachment.page?.targetId).toBe("chosen");
   });
 
   it("refuses screencast reattachment when its exact former page disappeared", async () => {
     const { control, connections } = fixture([["original", "other"]]);
     await control.connectCdp("original");
-    const previous = control.page!;
+    const previous = control.attachment.page!;
     connections[0]!.targetIds.splice(0, 1);
     const before = connections[0]!.calls.length;
     await expect(control.reattachPageForScreencast(previous)).rejects.toThrow(
       "selected browser page is no longer available",
     );
-    expect(control.page).toBe(previous);
-    expect(control.targetId).toBe("original");
+    expect(control.attachment.page).toBe(previous);
+    expect(control.attachment.targetId).toBe("original");
     expect(
       connections[0]!.calls
         .slice(before)

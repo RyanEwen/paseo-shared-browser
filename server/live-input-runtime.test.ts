@@ -31,24 +31,25 @@ function fixture() {
     },
   };
   const control = runtime as unknown as {
-    page: typeof page;
     requirePage: () => Promise<typeof page>;
-    documentGeneration: number;
-    attachmentGeneration: number;
+    attachment: { page: typeof page; documentGeneration: number; attachmentGeneration: number };
   };
-  Object.assign(runtime, {
+  Object.assign((runtime as unknown as { attachment: object }).attachment, {
     page,
     emulationAppliedPage: page,
     viewport: { width: 1280, height: 800, deviceScaleFactor: 1, mobile: false, touch: false },
   });
-  control.requirePage = async () => control.page;
+  control.requirePage = async () => control.attachment.page;
   return {
     runtime,
     control,
     page,
     calls,
     begin: (id: string) =>
-      runtime.beginLiveInput(id, `${control.attachmentGeneration}:${control.documentGeneration}`),
+      runtime.beginLiveInput(
+        id,
+        `${control.attachment.attachmentGeneration}:${control.attachment.documentGeneration}`,
+      ),
     intercept: (next: typeof intercept) => {
       intercept = next;
     },
@@ -60,6 +61,33 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 describe("runtime-owned live input", () => {
+  it.each([
+    { requested: "Enter", key: "Enter", code: "Enter", text: "\r", virtualKey: 13 },
+    { requested: "Space", key: " ", code: "Space", text: " ", virtualKey: 32 },
+  ])("discrete activation publishes native $requested edges", async (expected) => {
+    const state = fixture();
+    await state.begin("discrete-activation");
+    await state.runtime.keyDown(expected.requested, expected.requested, "discrete-activation");
+    await state.runtime.keyUp(expected.requested, expected.requested, "discrete-activation");
+    await state.runtime.endLiveInput("discrete-activation");
+    const packets = state.calls.filter((call) => call.method === "Input.dispatchKeyEvent");
+    expect(packets).toHaveLength(2);
+    expect(packets[0]?.params).toMatchObject({
+      type: "keyDown",
+      key: expected.key,
+      code: expected.code,
+      text: expected.text,
+      windowsVirtualKeyCode: expected.virtualKey,
+    });
+    expect(packets[1]?.params).toMatchObject({
+      type: "keyUp",
+      key: expected.key,
+      code: expected.code,
+      windowsVirtualKeyCode: expected.virtualKey,
+    });
+    expect(packets[1]?.params).not.toHaveProperty("text");
+  });
+
   it("releases a discrete unknown-down only on its captured original page", async () => {
     const state = fixture();
     await state.begin("internal-discrete");
@@ -72,29 +100,29 @@ describe("runtime-owned live input", () => {
     );
     state.intercept(async () => {});
     const replacementCalls: string[] = [];
-    state.control.page = {
+    state.control.attachment.page = {
       ...state.page,
       send: async (method: string) => {
         replacementCalls.push(method);
         return {};
       },
     };
-    state.control.attachmentGeneration++;
+    state.control.attachment.attachmentGeneration++;
     await state.runtime.endLiveInput("internal-discrete");
     expect(
       state.calls
         .filter((entry) => entry.method === "Input.dispatchKeyEvent")
         .map((entry) => entry.params.type),
-    ).toEqual(["keyDown", "keyUp"]);
+    ).toEqual(["rawKeyDown", "keyUp"]);
     expect(replacementCalls).toEqual([]);
   });
 
   for (const counter of ["documentGeneration", "attachmentGeneration"] as const) {
     it(`refuses ${counter} drift during page attachment before admitting input`, async () => {
       const state = fixture();
-      const expected = `${state.control.attachmentGeneration}:${state.control.documentGeneration}`;
+      const expected = `${state.control.attachment.attachmentGeneration}:${state.control.attachment.documentGeneration}`;
       state.control.requirePage = async () => {
-        state.control[counter]++;
+        state.control.attachment[counter]++;
         return state.page;
       };
 
@@ -109,9 +137,9 @@ describe("runtime-owned live input", () => {
       const state = fixture();
       await state.begin("old");
       await state.runtime.mouseDown(20, 30, "left", 1, "old");
-      const expected = `${state.control.attachmentGeneration}:${state.control.documentGeneration}`;
+      const expected = `${state.control.attachment.attachmentGeneration}:${state.control.attachment.documentGeneration}`;
       state.intercept(async (method) => {
-        if (method === "Input.dispatchMouseEvent") state.control[counter]++;
+        if (method === "Input.dispatchMouseEvent") state.control.attachment[counter]++;
       });
 
       await expect(state.runtime.beginLiveInput("new", expected)).rejects.toThrow(
@@ -171,7 +199,7 @@ describe("runtime-owned live input", () => {
     state.intercept(async (method) => {
       if (method !== "Input.dispatchKeyEvent" || state.calls.at(-1)?.params.type !== "keyDown")
         return;
-      state.control.documentGeneration++;
+      state.control.attachment.documentGeneration++;
       await state.runtime.endLiveInput("owned");
     });
     await expect(
@@ -191,9 +219,9 @@ describe("runtime-owned live input", () => {
       await state.begin("owned");
       state.intercept(async (method) => {
         if (method !== "Input.dispatchMouseEvent") return;
-        state.control.documentGeneration++;
+        state.control.attachment.documentGeneration++;
         if (scenario === "uncertain") throw new Error("Mutation outcome is unknown");
-        state.control.page = { send: async () => ({}) };
+        state.control.attachment.page = { send: async () => ({}) };
       });
       await expect(state.runtime.mouseDown(20, 30, "left", 1, "owned")).rejects.toThrow(
         scenario === "replacement" ? "attachment" : "unknown",
@@ -209,7 +237,7 @@ describe("runtime-owned live input", () => {
     state.intercept(async (method) => {
       if (method !== "Input.dispatchTouchEvent" || state.calls.at(-1)?.params.type !== "touchStart")
         return;
-      state.control.documentGeneration++;
+      state.control.attachment.documentGeneration++;
       await state.runtime.endLiveInput("owned");
     });
     await state.runtime.touch("touchStart", [{ x: 20, y: 30, id: 7 }], "owned");
@@ -257,7 +285,9 @@ describe("runtime-owned live input", () => {
     await state.begin("owned");
     await state.runtime.mouseDown(10, 20, "left", 1, "owned");
     await state.runtime.mouseMove(30, 40, "owned");
-    state.control.page = { send: async (...args: unknown[]) => replacement.push(args) } as never;
+    state.control.attachment.page = {
+      send: async (...args: unknown[]) => replacement.push(args),
+    } as never;
     await expect(state.runtime.mouseMove(500, 600, "owned")).rejects.toThrow("attachment");
     await state.runtime.endLiveInput("owned");
     expect(replacement).toEqual([]);
@@ -269,7 +299,7 @@ describe("runtime-owned live input", () => {
   it("discrete text and key input pinned to a channel never reach a navigated document", async () => {
     const state = fixture();
     await state.begin("discrete");
-    state.control.documentGeneration++;
+    state.control.attachment.documentGeneration++;
     await expect(state.runtime.insertText("late", "discrete")).rejects.toThrow("attachment");
     await expect(state.runtime.keyDown("Enter", "Enter", "discrete")).rejects.toThrow("attachment");
     expect(
@@ -300,7 +330,7 @@ describe("runtime-owned live input", () => {
       state.runtime.touch("touchStart", [{ x: 20, y: 30, id: 7 }], "owned"),
     ).rejects.toThrow("Unknown publication");
     const replacementCalls: string[] = [];
-    state.control.page = {
+    state.control.attachment.page = {
       send: async (method) => {
         replacementCalls.push(method);
         return {};
@@ -345,12 +375,12 @@ describe("runtime-owned live input", () => {
   it("same-URL document replacement refuses publication and optional cursor rejects CSS URL values", async () => {
     const state = fixture();
     await state.begin("owned");
-    state.control.documentGeneration++;
+    state.control.attachment.documentGeneration++;
     await expect(state.runtime.mouseMove(20, 30, "owned")).rejects.toThrow("attachment");
     expect(state.calls).toEqual([]);
     await state.runtime.endLiveInput("owned");
     await state.begin("next");
-    state.control.page.send = async () => ({
+    state.control.attachment.page.send = async () => ({
       result: { value: "url(https://secret.invalid/cursor), pointer" },
     });
     expect(await state.runtime.cursorAt(20, 30, "next")).toBeNull();
@@ -575,7 +605,7 @@ it("cleans possibly published keys on the original page and rejects unmatched re
     if (method === "Input.dispatchKeyEvent") throw new Error("Lost key acknowledgment");
   });
   await expect(state.runtime.dispatchKey(down, "keys")).rejects.toThrow("Lost key");
-  state.control.page = { send: async () => ({}) };
+  state.control.attachment.page = { send: async () => ({}) };
   await state.runtime.endLiveInput("keys");
   expect(state.calls.filter((call) => call.params.type === "keyUp")).toHaveLength(1);
 });

@@ -38,19 +38,23 @@ class ConnectionFixture extends EventEmitter {
 }
 
 interface RuntimeControl {
-  connection: CdpConnection;
-  page: CdpSession | null;
-  targetId: string | null;
-  viewport: DeviceEmulation;
-  emulationAppliedPage: CdpSession | null;
-  screencastActive: boolean;
-  screencastFrame: unknown;
-  attachmentGeneration: number;
-  assertVersion(): Promise<void>;
+  attachment: {
+    connection: CdpConnection;
+    page: CdpSession | null;
+    targetId: string | null;
+    viewport: DeviceEmulation;
+    emulationAppliedPage: CdpSession | null;
+    attachmentGeneration: number;
+  };
+  capture: {
+    screencastActive: boolean;
+    screencastFrame: unknown;
+    onScreencastFrame(page: CdpSession, event: unknown): void;
+  };
+  cli: { assertVersion(): Promise<void> };
   connectCdp(targetId?: string): Promise<void>;
   requirePage(): Promise<CdpSession>;
   reattachPageForScreencast(previous: CdpSession): Promise<CdpSession>;
-  onScreencastFrame(page: CdpSession, event: unknown): void;
 }
 
 const pixel: DeviceEmulation = {
@@ -78,7 +82,7 @@ function fixture() {
   const typedConnection = connection as unknown as CdpConnection;
   const previous = new CdpSession(typedConnection, "previous", "a");
   const control = runtime as unknown as RuntimeControl;
-  Object.assign(control, {
+  Object.assign(control.attachment, {
     connection: typedConnection,
     page: previous,
     targetId: "a",
@@ -118,10 +122,10 @@ describe("session-owned device emulation restoration", () => {
   it("releases only the launch page without adopting a survivor or closing its browser connection", async () => {
     const { runtime, connection, control } = fixture();
     await runtime.releaseTarget();
-    expect(control.page).toBeNull();
-    expect(control.emulationAppliedPage).toBeNull();
-    expect(control.viewport).toEqual(pixel);
-    expect(control.targetId).toBe("a");
+    expect(control.attachment.page).toBeNull();
+    expect(control.attachment.emulationAppliedPage).toBeNull();
+    expect(control.attachment.viewport).toEqual(pixel);
+    expect(control.attachment.targetId).toBe("a");
     expect(connection.isOpen).toBe(true);
     expect(connection.calls.map((call) => call.method)).toEqual(["Target.detachFromTarget"]);
     await expect(runtime.targets()).resolves.toHaveLength(2);
@@ -139,28 +143,28 @@ describe("session-owned device emulation restoration", () => {
     const { runtime, connection, control } = fixture();
     const publications: (CdpSession | null)[] = [];
     connection.intercept = async (method) => {
-      if (method.startsWith("Emulation.")) publications.push(control.page);
+      if (method.startsWith("Emulation.")) publications.push(control.attachment.page);
     };
     await runtime.selectTarget("b");
     expect(publications).toEqual([null, null, null, null]);
-    expect(control.page?.targetId).toBe("b");
-    expect(control.emulationAppliedPage).toBe(control.page);
-    expect(control.viewport.captureScale).toBe(2);
-    assertDeviceRestored(connection, control.page!.sessionId);
+    expect(control.attachment.page?.targetId).toBe("b");
+    expect(control.attachment.emulationAppliedPage).toBe(control.attachment.page);
+    expect(control.attachment.viewport.captureScale).toBe(2);
+    assertDeviceRestored(connection, control.attachment.page!.sessionId);
   });
 
   it("reconnect restores the device on the replacement transport rather than the old connection", async () => {
     const { runtime, connection, control } = fixture();
     const replacement = new ConnectionFixture();
-    control.assertVersion = async () => {};
+    control.cli.assertVersion = async () => {};
     control.connectCdp = async () => {
-      control.connection = replacement as unknown as CdpConnection;
+      control.attachment.connection = replacement as unknown as CdpConnection;
       await runtime.selectTarget("a");
     };
     await runtime.reconnect();
     expect(connection.isOpen).toBe(false);
-    expect(control.page?.connection).toBe(control.connection);
-    assertDeviceRestored(replacement, control.page!.sessionId);
+    expect(control.attachment.page?.connection).toBe(control.attachment.connection);
+    assertDeviceRestored(replacement, control.attachment.page!.sessionId);
   });
 
   it("screencast retry detaches the old controller before applying replacement metrics", async () => {
@@ -172,7 +176,7 @@ describe("session-owned device emulation restoration", () => {
     );
     expect(detach).toBeGreaterThanOrEqual(0);
     expect(metrics).toBeGreaterThan(detach);
-    expect(control.page).toBe(restored);
+    expect(control.attachment.page).toBe(restored);
     assertDeviceRestored(connection, restored.sessionId);
   });
 
@@ -183,14 +187,14 @@ describe("session-owned device emulation restoration", () => {
         throw new Error("touch restore rejected");
     };
     await expect(runtime.selectTarget("b")).rejects.toThrow("touch restore rejected");
-    expect(control.page).toBeNull();
-    expect(control.emulationAppliedPage).toBeNull();
+    expect(control.attachment.page).toBeNull();
+    expect(control.attachment.emulationAppliedPage).toBeNull();
     expect(
       connection.calls.some(
         (call) => call.method === "Target.detachFromTarget" && call.params.sessionId === "new-1",
       ),
     ).toBe(true);
-    control.assertVersion = async () => {
+    control.cli.assertVersion = async () => {
       throw new Error("transport unavailable");
     };
     await expect(runtime.frame(1024, 95, 0)).rejects.toThrow("transport unavailable");
@@ -208,8 +212,8 @@ describe("session-owned device emulation restoration", () => {
       if (method === "Emulation.setUserAgentOverride") connection.close();
     };
     await expect(runtime.selectTarget("b")).rejects.toThrow("attachment changed");
-    expect(control.page).toBeNull();
-    expect(control.emulationAppliedPage).toBeNull();
+    expect(control.attachment.page).toBeNull();
+    expect(control.attachment.emulationAppliedPage).toBeNull();
   });
 
   it("repairs the winning attachment after a stale restoring controller is detached", async () => {
@@ -225,17 +229,17 @@ describe("session-owned device emulation restoration", () => {
     const older = runtime.selectTarget("a");
     await reached.promise;
     await runtime.selectTarget("b");
-    const winner = control.page;
-    expect(control.emulationAppliedPage).toBe(winner);
+    const winner = control.attachment.page;
+    expect(control.attachment.emulationAppliedPage).toBe(winner);
     gate.resolve();
     await expect(older).rejects.toThrow("attachment changed");
-    expect(control.page).toBe(winner);
-    expect(control.emulationAppliedPage).toBeNull();
-    control.screencastActive = true;
-    control.onScreencastFrame(winner!, { data: "ignored", metadata: {}, sessionId: 4 });
-    expect(control.screencastFrame).toBeNull();
+    expect(control.attachment.page).toBe(winner);
+    expect(control.attachment.emulationAppliedPage).toBeNull();
+    control.capture.screencastActive = true;
+    control.capture.onScreencastFrame(winner!, { data: "ignored", metadata: {}, sessionId: 4 });
+    expect(control.capture.screencastFrame).toBeNull();
     expect(await control.requirePage()).toBe(winner);
-    expect(control.emulationAppliedPage).toBe(winner);
+    expect(control.attachment.emulationAppliedPage).toBe(winner);
     assertDeviceRestored(connection, winner!.sessionId);
   });
 
@@ -247,8 +251,8 @@ describe("session-owned device emulation restoration", () => {
     await expect(control.reattachPageForScreencast(previous)).rejects.toThrow(
       "detach outcome unknown",
     );
-    expect(control.page).toBeNull();
-    expect(control.emulationAppliedPage).toBeNull();
+    expect(control.attachment.page).toBeNull();
+    expect(control.attachment.emulationAppliedPage).toBeNull();
     expect(
       connection.calls.some(
         (call) => call.method.startsWith("Emulation.") || call.method === "Page.startScreencast",
@@ -271,12 +275,12 @@ describe("session-owned device emulation restoration", () => {
     const retry = control.reattachPageForScreencast(previous);
     await reached.promise;
     await runtime.selectTarget("b");
-    const winner = control.page;
+    const winner = control.attachment.page;
     gate.resolve();
     expect(await retry).toBe(winner);
-    expect(control.page).toBe(winner);
-    expect(control.emulationAppliedPage).toBeNull();
+    expect(control.attachment.page).toBe(winner);
+    expect(control.attachment.emulationAppliedPage).toBeNull();
     expect(await control.requirePage()).toBe(winner);
-    expect(control.emulationAppliedPage).toBe(winner);
+    expect(control.attachment.emulationAppliedPage).toBe(winner);
   });
 });

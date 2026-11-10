@@ -53,6 +53,14 @@ const SPECIAL_CODES: Record<string, number> = {
   Quote: 222,
 };
 
+/** Discrete tool names use Space; Chromium expects a literal DOM key and physical code. */
+export function normalizeDiscreteKey(key: string, code: string): { key: string; code: string } {
+  return {
+    key: key === "Space" ? " " : key,
+    code: code === " " ? "Space" : code,
+  };
+}
+
 /** Physical code chooses the accelerator code independently of keyboard layout text. */
 export function virtualKeyCode(code: string): number | undefined {
   if (/^Key[A-Z]$/.test(code)) return code.charCodeAt(3);

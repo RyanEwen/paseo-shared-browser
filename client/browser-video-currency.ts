@@ -14,6 +14,20 @@ export function isFrameCurrent(frame: BrowserFrameAuthority, state: BrowserState
   );
 }
 
+/** A painted document may remain visible within the same source and geometry. */
+export function isFrameDisplayCurrent(frame: BrowserFrameAuthority, state: BrowserState): boolean {
+  return Boolean(
+    frame.runtimeId &&
+      state.runtimeId &&
+      frame.captureEpoch !== undefined &&
+      state.bridgeEpoch !== undefined &&
+      frame.sessionId === state.sessionId &&
+      frame.runtimeId === state.runtimeId &&
+      frame.captureEpoch === state.bridgeEpoch &&
+      frame.viewportGeneration === state.viewportGeneration,
+  );
+}
+
 export interface VideoSourceContext {
   mounted: boolean;
   viewerActive: boolean;

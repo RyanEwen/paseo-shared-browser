@@ -102,17 +102,19 @@ async function fixture(waitMs = 400) {
     daemonExitWaitMs: waitMs,
   });
   const native = runtime as unknown as {
-    ownerNonce: string;
-    daemonLaunched: boolean;
-    captureDaemon(): Promise<void>;
-    daemon: { pid: number; identity: { pid: number; startTicks: string } | null } | null;
+    daemon: {
+      ownerNonce: string;
+      launched: boolean;
+      capture(): Promise<void>;
+      record: { pid: number; identity: { pid: number; startTicks: string } | null } | null;
+    };
   };
   const recordPid = async (pid: number) => {
     await mkdir(profile, { recursive: true });
     await writeFile(join(ipc, "owned.pid"), String(pid));
     await writeFile(join(ipc, "owned.sock"), "");
-    native.daemonLaunched = true;
-    await native.captureDaemon();
+    native.daemon.launched = true;
+    await native.daemon.capture();
   };
   return { runtime, native, recordPid, ipc, profile };
 }
@@ -120,9 +122,9 @@ async function fixture(waitMs = 400) {
 describe.skipIf(process.platform !== "linux")("owned daemon shutdown", () => {
   it("waits for the acknowledged close to finish the daemon without signalling it, preserving the profile", async () => {
     const f = await fixture();
-    const daemon = await ownChild(f.native.ownerNonce);
+    const daemon = await ownChild(f.native.daemon.ownerNonce);
     await f.recordPid(daemon.pid as number);
-    expect(f.native.daemon?.identity?.pid).toBe(daemon.pid);
+    expect(f.native.daemon.record?.identity?.pid).toBe(daemon.pid);
     const kill = vi.spyOn(process, "kill");
     cli.onClose = () => void setTimeout(() => daemon.kill("SIGTERM"), 100);
     await f.runtime.shutdown();
@@ -134,7 +136,7 @@ describe.skipIf(process.platform !== "linux")("owned daemon shutdown", () => {
 
   it("force-terminates a daemon that outlives the bounded wait and confirms exit before returning", async () => {
     const f = await fixture(200);
-    const daemon = await ownChild(f.native.ownerNonce);
+    const daemon = await ownChild(f.native.daemon.ownerNonce);
     await f.recordPid(daemon.pid as number);
     const kill = vi.spyOn(process, "kill");
     await f.runtime.shutdown();
@@ -150,7 +152,7 @@ describe.skipIf(process.platform !== "linux")("owned daemon shutdown", () => {
 
   it("fails shutdown instead of reporting success when a signalled daemon does not exit", async () => {
     const f = await fixture(200);
-    const daemon = await ownChild(f.native.ownerNonce);
+    const daemon = await ownChild(f.native.daemon.ownerNonce);
     await f.recordPid(daemon.pid as number);
     const kill = vi.spyOn(process, "kill").mockImplementation(() => true);
     await expect(f.runtime.shutdown(true)).rejects.toThrow("not confirmed");
@@ -160,12 +162,12 @@ describe.skipIf(process.platform !== "linux")("owned daemon shutdown", () => {
 
   it("never signals a verified PID that was recycled after capture", async () => {
     const f = await fixture(200);
-    const recorded = await ownChild(f.native.ownerNonce);
+    const recorded = await ownChild(f.native.daemon.ownerNonce);
     await f.recordPid(recorded.pid as number);
-    const identity = f.native.daemon?.identity;
+    const identity = f.native.daemon.record?.identity;
     expect(identity).toBeTruthy();
     // Same PID, different birth: the recorded start time no longer matches.
-    f.native.daemon = {
+    f.native.daemon.record = {
       pid: recorded.pid as number,
       identity: { ...(identity as { pid: number; startTicks: string }), startTicks: "1" },
     };
@@ -180,7 +182,7 @@ describe.skipIf(process.platform !== "linux")("owned daemon shutdown", () => {
     // Same executable as the runtime's own children, but not launched by this runtime.
     const otherSession = await ownChild();
     await f.recordPid(otherSession.pid as number);
-    expect(f.native.daemon?.identity).toBeNull();
+    expect(f.native.daemon.record?.identity).toBeNull();
     const kill = vi.spyOn(process, "kill");
     await expect(f.runtime.shutdown(true)).rejects.toThrow("not confirmed");
     expect(kill).not.toHaveBeenCalledWith(otherSession.pid, "SIGKILL");
@@ -212,8 +214,8 @@ describe("unverifiable daemon identity (platforms without /proc, unowned PIDs)",
   it("has nothing to observe or signal for a runtime that never launched", async () => {
     // Never launched: ordinary cleanup has nothing to observe.
     const f = await fixture(150);
-    await f.native.captureDaemon();
-    expect(f.native.daemon).toBeNull();
+    await f.native.daemon.capture();
+    expect(f.native.daemon.record).toBeNull();
     await expect(f.runtime.shutdown()).resolves.toBeUndefined();
   });
 });
@@ -230,11 +232,11 @@ describe.each(ownershipModes)(
     };
     it("fails closed, then recovers once the PID record is observable, when capture found no PID", async () => {
       const f = await fixture(150);
-      const daemon = await ownChild(f.native.ownerNonce);
+      const daemon = await ownChild(f.native.daemon.ownerNonce);
       own(daemon);
-      f.native.daemonLaunched = true; // launched, but the PID file is unreadable at capture
-      await f.native.captureDaemon();
-      expect(f.native.daemon).toBeNull();
+      f.native.daemon.launched = true; // launched, but the PID file is unreadable at capture
+      await f.native.daemon.capture();
+      expect(f.native.daemon.record).toBeNull();
       const kill = vi.spyOn(process, "kill");
       await expect(f.runtime.shutdown()).rejects.toThrow("not confirmed");
       await expect(f.runtime.shutdown(true)).rejects.toThrow("not confirmed");
@@ -252,10 +254,10 @@ describe.each(ownershipModes)(
 
     it("does not treat a later unreadable identity as exit and never signals on it", async () => {
       const f = await fixture(150);
-      const daemon = await ownChild(f.native.ownerNonce);
+      const daemon = await ownChild(f.native.daemon.ownerNonce);
       own(daemon);
       await f.recordPid(daemon.pid as number);
-      expect(f.native.daemon?.identity).toBeTruthy();
+      expect(f.native.daemon.record?.identity).toBeTruthy();
       probe.unreadable = true;
       const kill = vi.spyOn(process, "kill");
       await expect(f.runtime.shutdown()).rejects.toThrow("not confirmed");

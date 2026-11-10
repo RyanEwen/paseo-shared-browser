@@ -108,16 +108,20 @@ export class AgentDomRuntime {
     const parsed = domActionInputSchema.parse(input);
     const receipt = this.requireReceipt(page, generation, parsed.snapshotId);
     assertCurrent();
+    // This fixed entry point invokes application handlers and drains their queued
+    // jobs. A V8 execution deadline can terminate React's checkpoint and discard
+    // its queue even after the action computed a successful acknowledgement.
+    // Use native input's normal CDP response timeout instead: an uncertain reply
+    // must never stop the page's code or trigger an automatic replay.
     const result = await page.send<EvaluationReply>(
       "Runtime.evaluate",
       {
         contextId: receipt.contextId,
         expression: `(${ACTION_FUNCTION})(${JSON.stringify(parsed.snapshotId)}, ${JSON.stringify(parsed.action)})`,
-        timeout: EXECUTION_MS,
         returnByValue: true,
         userGesture: true,
       },
-      { mutation: true, timeoutMs: COMMAND_MS },
+      { mutation: true },
     );
     // A click may navigate. Never re-resolve or replay it in a replacement document.
     if (result.exceptionDetails)

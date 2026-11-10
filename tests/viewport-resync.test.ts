@@ -54,7 +54,7 @@ function fakeRuntime(
     session: "fake",
   });
   const connection = { isOpen: true };
-  Object.assign(runtime, {
+  Object.assign((runtime as unknown as { attachment: object }).attachment, {
     page,
     emulationAppliedPage: page,
     connection,
@@ -120,7 +120,9 @@ it("drops viewport recovery after a mutation supersedes capture", async () => {
   page.send = async (method: string) => {
     const result = await original(method);
     if (method === "Emulation.setDeviceMetricsOverride") {
-      (runtime as unknown as { invalidateScreencastFrame(): void }).invalidateScreencastFrame();
+      (
+        runtime as unknown as { capture: { invalidateScreencastFrame(): void } }
+      ).capture.invalidateScreencastFrame();
     }
     return result;
   };
@@ -130,7 +132,7 @@ it("drops viewport recovery after a mutation supersedes capture", async () => {
 
 it("captures the requested viewer quality instead of reusing a different-quality stream", async () => {
   const { runtime, calls, page } = fakeRuntime([800]);
-  Object.assign(runtime, {
+  Object.assign((runtime as unknown as { capture: object }).capture, {
     screencastFrame: {
       dataBase64: jpeg(1280, 800),
       byteLength: Buffer.byteLength(jpeg(1280, 800), "base64"),

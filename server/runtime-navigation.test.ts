@@ -69,7 +69,12 @@ function fixture() {
     ipcDirectory: "/tmp/uncreated-ipc",
     session: "navigation-budget-test",
   });
-  Object.assign(runtime, { page, connection, emulationAppliedPage: page, screencastActive: true });
+  Object.assign((runtime as unknown as { attachment: object }).attachment, {
+    page,
+    connection,
+    emulationAppliedPage: page,
+  });
+  Object.assign((runtime as unknown as { capture: object }).capture, { screencastActive: true });
   return { runtime, page, connection, commit, observe };
 }
 
@@ -91,7 +96,9 @@ afterEach(() => {
 
 it("buffers the exact root loader commit before ACK without DOM readiness or stream restart", async () => {
   const { runtime, page, connection } = fixture();
-  const barrier = vi.spyOn(runtime, "invalidateQueuedVideoFrames");
+  const capture = (runtime as unknown as { capture: { invalidateQueuedVideoFrames(): void } })
+    .capture;
+  const barrier = vi.spyOn(capture, "invalidateQueuedVideoFrames");
   await runtime.navigate("https://next.invalid/");
   expect(page.send).toHaveBeenCalledExactlyOnceWith(
     "Page.navigate",
@@ -263,7 +270,11 @@ it.each(["disconnect", "replacement"] as const)(
     const result = runtime.navigate("https://next.invalid/").catch((error: unknown) => error);
     await vi.waitFor(() => expect(page.send).toHaveBeenCalledTimes(1));
     if (kind === "disconnect") connection.emit("disconnect");
-    else Object.assign(runtime, { page: new EventEmitter(), attachmentGeneration: 1 });
+    else
+      Object.assign((runtime as unknown as { attachment: object }).attachment, {
+        page: new EventEmitter(),
+        attachmentGeneration: 1,
+      });
     commit();
     expect(await result).toBeInstanceOf(CdpUnknownOutcomeError);
     expectClean(page, connection);

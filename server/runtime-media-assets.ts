@@ -48,10 +48,14 @@ export interface RuntimeMediaAssets {
 /** Validate every declared file before exposing a native executable/module to a runtime.
  * Paths stay inside this immutable runtime, regular files reject symlink substitution,
  * and a bounded streaming hash avoids reading all native binaries into memory together.
- * Missing/invalid assets return unavailable; H.264/JPEG keep working unchanged. */
-export async function readRuntimeMediaAssets(home: string): Promise<RuntimeMediaAssets | null> {
+ * Missing/invalid assets return unavailable; H.264/JPEG keep working unchanged.
+ * `runtimeRoot` defaults to the current pointer; a running supervisor passes its own. */
+export async function readRuntimeMediaAssets(
+  home: string,
+  runtimeRoot: string = resolveBrowserRuntimeRoot(home),
+): Promise<RuntimeMediaAssets | null> {
   try {
-    const runtimePath = resolveBrowserRuntimeRoot(home);
+    const runtimePath = runtimeRoot;
     const rootInfo = await lstat(runtimePath);
     if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) return null;
     const root = await realpath(runtimePath),

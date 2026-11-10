@@ -21,7 +21,7 @@ interface PageIdentity {
 
 /** Observe only the disposable fixture's public browser identity and synthetic cookie. */
 async function inspectIdentity(runtime: AgentBrowserRuntime): Promise<PageIdentity> {
-  const page = (runtime as unknown as { page: CdpSession }).page;
+  const page = (runtime as unknown as { attachment: { page: CdpSession } }).attachment.page;
   const reply = await page.send<{ result: { value: PageIdentity } }>("Runtime.evaluate", {
     expression: `({
       userAgent: navigator.userAgent,

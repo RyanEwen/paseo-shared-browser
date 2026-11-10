@@ -18,7 +18,7 @@ export interface BrowserDisplayScaleSource {
 /** Prefer the live browser scale and local zoom; native/unsupported hosts use their RN scale. */
 export function readBrowserDisplayScale(
   fallback: number,
-  source: BrowserDisplayScaleSource = globalThis as BrowserDisplayScaleSource,
+  source: BrowserDisplayScaleSource,
 ): number {
   const deviceScale = positiveScale(source.devicePixelRatio) ?? positiveScale(fallback) ?? 1;
   const localZoom = positiveScale(source.visualViewport?.scale) ?? 1;
@@ -37,7 +37,7 @@ function positiveScale(value: number | undefined): number | null {
 export function observeBrowserDisplayScale(
   fallback: number,
   changed: (scale: number) => void,
-  source: BrowserDisplayScaleSource = globalThis as BrowserDisplayScaleSource,
+  source: BrowserDisplayScaleSource,
 ): () => void {
   let query: ResolutionQuery | undefined;
   let queryScale: number | null = null;

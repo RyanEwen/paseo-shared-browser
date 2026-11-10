@@ -42,16 +42,17 @@ function setup(nativeVideoAllowed?: () => boolean) {
     session: "fixture",
   });
   const internal = runtime as unknown as {
-    page: unknown;
-    connection: unknown;
-    viewport: unknown;
-    emulationAppliedPage: unknown;
-    attachmentGeneration: number;
-    documentGeneration: number;
     restoreConfiguredEmulation(page: unknown): Promise<void>;
-    assertVersion(): Promise<void>;
     connectCdp(): Promise<void>;
-    invoke(args: string[]): Promise<unknown>;
+    attachment: {
+      page: unknown;
+      connection: unknown;
+      viewport: unknown;
+      emulationAppliedPage: unknown;
+      attachmentGeneration: number;
+      documentGeneration: number;
+    };
+    cli: { assertVersion(): Promise<void>; invoke(args: string[]): Promise<unknown> };
   };
   const connection = Object.assign(new EventEmitter(), { isOpen: true, close: vi.fn() });
   const page = Object.assign(new EventEmitter(), {
@@ -71,10 +72,10 @@ function setup(nativeVideoAllowed?: () => boolean) {
       return {};
     }),
   });
-  internal.connection = connection;
-  internal.page = page;
-  internal.emulationAppliedPage = page;
-  internal.viewport = {
+  internal.attachment.connection = connection;
+  internal.attachment.page = page;
+  internal.attachment.emulationAppliedPage = page;
+  internal.attachment.viewport = {
     width: 412,
     height: 839,
     captureScale: 2,
@@ -151,7 +152,7 @@ describe("native video runtime fence", () => {
     const clock = vi.spyOn(performance, "now").mockImplementation(() => Date.now());
     const { runtime, internal } = setup();
     try {
-      internal.viewport = {
+      internal.attachment.viewport = {
         width: 412,
         height: 839,
         captureScale: 1,
@@ -164,7 +165,7 @@ describe("native video runtime fence", () => {
       fixture.captures[0]!.sourceFailure = "source-dimensions";
       expect((await runtime.readVideo({ quality: "high", waitMs: 0 })).status).toBe("unsupported");
       expect(fixture.captures[0]!.stop).toHaveBeenCalledOnce();
-      internal.documentGeneration++;
+      internal.attachment.documentGeneration++;
       await vi.advanceTimersByTimeAsync(60_000);
       for (let i = 0; i < 20; i++) {
         expect((await runtime.readVideo({ quality: "high", waitMs: 0 })).status).toBe(
@@ -176,7 +177,11 @@ describe("native video runtime fence", () => {
       expect((await runtime.readVideo({ quality: "high", waitMs: 0 })).status).toBe("ready");
       expect(fixture.captures).toHaveLength(2);
       expect(fixture.captures[1]!.options).toMatchObject({ width: 824, height: 1678 });
-      expect(internal.viewport).toMatchObject({ width: 412, height: 839, captureScale: 2 });
+      expect(internal.attachment.viewport).toMatchObject({
+        width: 412,
+        height: 839,
+        captureScale: 2,
+      });
     } finally {
       await runtime.stopVideo();
       clock.mockRestore();
@@ -337,7 +342,7 @@ describe("native video runtime fence", () => {
     );
     const pending = runtime.readVideo({ quality: "high", waitMs: 500 });
     await enteredRead.promise;
-    internal.documentGeneration++;
+    internal.attachment.documentGeneration++;
     resolveRead({ status: "ready", streamId: "old", packets: [{ dataBase64: "old" }] });
     expect(await pending).toMatchObject({ status: "reset", packets: [] });
     await runtime.stopVideo();
@@ -354,7 +359,7 @@ describe("native video runtime fence", () => {
     await runtime.readVideo({ quality: "high", waitMs: 0 });
     const owned = fixture.captures[0]!.options as { isCurrent(): boolean };
     expect(owned.isCurrent()).toBe(true);
-    internal.attachmentGeneration++;
+    internal.attachment.attachmentGeneration++;
     expect(owned.isCurrent()).toBe(false);
     await runtime.stopVideo();
   });
@@ -406,7 +411,7 @@ describe("native video runtime fence", () => {
     const { runtime, internal } = setup();
     await runtime.readVideo({ quality: "high", waitMs: 0 });
     const owner = fixture.captures[0]!.options as { isCurrent(): boolean };
-    internal.viewport = {
+    internal.attachment.viewport = {
       width: 1280,
       height: 800,
       captureScale: 1,
@@ -422,7 +427,7 @@ describe("native video runtime fence", () => {
     await runtime.readVideo({ quality: "high", waitMs: 0 });
     const deferred = Promise.withResolvers<void>();
     fixture.captures[0]!.stop.mockImplementationOnce(() => deferred.promise);
-    internal.emulationAppliedPage = null;
+    internal.attachment.emulationAppliedPage = null;
     const restoring = internal.restoreConfiguredEmulation(page);
     expect((await runtime.readVideo({ quality: "high", waitMs: 0 })).status).toBe("reset");
     expect(fixture.captures).toHaveLength(1);
@@ -449,11 +454,11 @@ describe("native video runtime fence", () => {
   it("blocks capture while reconnect is restoring the saved page", async () => {
     const { runtime, internal, page, connection } = setup();
     const readiness = Promise.withResolvers<void>();
-    internal.assertVersion = () => readiness.promise;
+    internal.cli.assertVersion = () => readiness.promise;
     internal.connectCdp = async () => {
-      internal.connection = connection;
-      internal.page = page;
-      internal.emulationAppliedPage = page;
+      internal.attachment.connection = connection;
+      internal.attachment.page = page;
+      internal.attachment.emulationAppliedPage = page;
     };
     const reconnecting = runtime.reconnect();
     expect((await runtime.readVideo({ quality: "high", waitMs: 0 })).status).toBe("reset");
@@ -467,7 +472,7 @@ describe("native video runtime fence", () => {
   it("never starts a source during or after shutdown while native close is pending", async () => {
     const { runtime, internal } = setup();
     const closing = Promise.withResolvers<void>();
-    internal.invoke = () => closing.promise;
+    internal.cli.invoke = () => closing.promise;
     const shutdown = runtime.shutdown();
     expect((await runtime.readVideo({ quality: "high", waitMs: 0 })).status).toBe("reset");
     expect(fixture.captures).toHaveLength(0);

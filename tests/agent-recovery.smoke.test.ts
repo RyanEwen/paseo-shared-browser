@@ -4,8 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, it, vi } from "vitest";
 import { createRuntimeOwner } from "../server/runtime-owner";
-import { resolveSupervisorPaths, startSupervisorServer } from "../server/supervisor";
 import { AgentSupervisorClient, SupervisorClient } from "../server/supervisor-client";
+import { resolveSupervisorPaths } from "../server/supervisor-paths";
+import { startSupervisorServer } from "../server/supervisor-server";
 import type { BrowserState } from "../shared/browser";
 
 it("preserves a real two-tab browser draft and human lease across agent reconnect", async () => {

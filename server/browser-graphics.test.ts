@@ -94,8 +94,8 @@ describe("explicit browser graphics policy", () => {
         session: "graphics-policy",
         launchEnvironment: { DISPLAY: ":24001", XAUTHORITY: "/tmp/private-auth" },
       });
-      const native = runtime as unknown as { environment: NodeJS.ProcessEnv };
-      expect(native.environment).toMatchObject({
+      const native = runtime as unknown as { cli: { environment: NodeJS.ProcessEnv } };
+      expect(native.cli.environment).toMatchObject({
         GALLIUM_DRIVER: "d3d12",
         LD_LIBRARY_PATH: "/usr/lib/wsl/lib",
         DISPLAY: ":24001",

@@ -24,17 +24,15 @@ async function fixture(agent = false) {
     },
   };
   const native = runtime as unknown as {
-    page: typeof page;
     requirePage: () => Promise<typeof page>;
-    attachmentGeneration: number;
-    documentGeneration: number;
+    attachment: { page: typeof page; attachmentGeneration: number; documentGeneration: number };
   };
-  Object.assign(runtime, {
+  Object.assign((runtime as unknown as { attachment: object }).attachment, {
     page,
     emulationAppliedPage: page,
     viewport: { width: 1280, height: 800, deviceScaleFactor: 1, mobile: false, touch: false },
   });
-  native.requirePage = async () => native.page;
+  native.requirePage = async () => native.attachment.page;
   let stateDelay = 0;
   let afterDownDelay = 0;
   let ids = 0;
@@ -59,7 +57,7 @@ async function fixture(agent = false) {
           return {
             url: "https://fixture.invalid/",
             title: "Fixture",
-            inputGeneration: `${native.attachmentGeneration}:${native.documentGeneration}`,
+            inputGeneration: `${native.attachment.attachmentGeneration}:${native.attachment.documentGeneration}`,
             canGoBack: false,
             canGoForward: false,
           };

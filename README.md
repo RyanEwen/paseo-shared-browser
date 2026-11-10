@@ -10,7 +10,7 @@ paseo plugin install github:RyanEwen/paseo-shared-browser --ref main
 
 Run on the Paseo host with plugins enabled, Node.js 24+ and npm installed. Requires a compatible Paseo 0.11 app and daemon. Open **Shared Browser** from a workspace or the Command Center.
 
-Paseo++ previews 0.12.0-preview.33, preview.34, and preview.35 are also supported explicitly. Other prereleases require separate compatibility verification.
+Paseo++ previews 0.12.0-preview.33 through preview.36 are also supported, as is the whole 0.15 line, including its previews. Within 0.15, compatibility was verified against 0.15.3-preview.45. Prereleases outside these ranges require separate compatibility verification.
 
 For a local checkout, prepare its locked production dependencies and runtime before registering it. Local-directory installation does not run the manifest's build commands:
 

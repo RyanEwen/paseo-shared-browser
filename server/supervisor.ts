@@ -1,74 +1,55 @@
-import { AsyncLocalStorage } from "node:async_hooks";
-import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { chmod, mkdir, open, readFile, rm, writeFile } from "node:fs/promises";
-import { createServer, type Socket } from "node:net";
-import { homedir, tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-import type { ZodType } from "zod";
-import type { BrowserFrame, BrowserState } from "../shared/browser";
+/**
+ * The runtime supervisor: one active plugin bridge lease, one runtime per workspace with a
+ * serialized operation tail, and the browser session policy over them. Agent tickets and
+ * requests live in `supervisor-agents.ts`; the socket server and startup lock live in
+ * `supervisor-server.ts`.
+ */
 import {
-  applyDevicePresetRpc,
   beginBrowserGestureRpc,
-  browserTabCloseScopeSchema,
   captureBrowserRpc,
   closeBrowserRpc,
   closeBrowserTabRpc,
   endBrowserGestureRpc,
   MAX_BROWSER_PAGE_TARGETS,
-  navigateBrowserRpc,
-  printBrowserRpc,
-  resizeBrowserRpc,
-  sendBrowserInputRpc,
   setCaptureDensityRpc,
   updateBrowserGestureRpc,
 } from "../shared/browser";
 import { browserDisplayDemandRpc } from "../shared/browser-display-demand";
-import { readBrowserVideoRpc, runtimeVideoReadInputSchema } from "../shared/browser-video";
-import { DEFAULT_CAPTURE_QUALITY } from "../shared/capture-settings";
-import { AgentBindingStore } from "./agent-binding-store";
+import { readBrowserVideoRpc } from "../shared/browser-video";
+import type { AgentBindingStore } from "./agent-binding-store";
 import { type BrowserRuntimeMutationGuard, SessionManager } from "./browser-policy";
-import { AGENT_VIEWER_POLICY } from "./browser-viewer-policy";
 import { CdpUnknownOutcomeError } from "./cdp";
+import { withLegacyEmptyWorkspaceHint } from "./empty-workspace";
 import {
   type BridgeLease,
   DEFAULT_BRIDGE_HEARTBEAT_MS,
   DEFAULT_BRIDGE_TIMEOUT_MS,
   DEFAULT_ORPHAN_GRACE_MS,
   type JsonValue,
-  parseRuntimeRequest,
-  RUNTIME_PROTOCOL_VERSION,
   type RuntimeDescriptor,
   RuntimeLostError,
   RuntimeProtocolError,
   type RuntimeRequest,
-  type RuntimeResponse,
   type RuntimeResult,
 } from "./runtime-protocol";
+import { AgentAuthority, AgentRuntimeOperation } from "./supervisor-agents";
+import { asObject, requireText, stateFromPolicyResult } from "./supervisor-input";
 
-const DIRECTORY_MODE = 0o700;
-const FILE_MODE = 0o600;
-const SOCKET_MODE = 0o600;
-const MAX_MESSAGE_BYTES = 1024 * 1024;
 const MAX_SUPERVISOR_WORKSPACES = 8;
-const MAX_SOCKET_IN_FLIGHT = 16;
-const MAX_GLOBAL_IN_FLIGHT = 64;
-// Optional pixels must leave bounded headroom for ordered input and cleanup.
-// JPEG fallback shares the media budget instead of filling those same slots.
-const MAX_SOCKET_MEDIA_IN_FLIGHT = 12;
-const MAX_GLOBAL_MEDIA_IN_FLIGHT = 48;
-// The one active bridge needs maintenance capacity even when normal reads fill
-// both limits. Duplicate maintenance remains bounded independently of work.
-const MAX_HEARTBEATS_IN_FLIGHT = 1;
-const AGENT_TICKET_TTL_MS = 10 * 60_000;
-const MAX_UNBOUND_AGENT_TICKETS = 256;
 type SupervisorTimer = NodeJS.Timeout;
 
 export interface RuntimeInstance {
   runtimeId: string;
 }
 
+/** Per-launch options that must not outlive the launch that received them. */
+export interface RuntimeLaunchOptions {
+  /** Recheck the explicit opener after launch preparation, immediately before native publication. */
+  beforeLaunch?: () => void;
+}
+
 export interface RuntimeOwner<Runtime extends RuntimeInstance = RuntimeInstance> {
-  create(workspaceId: string): Promise<Runtime>;
+  create(workspaceId: string, launch?: RuntimeLaunchOptions): Promise<Runtime>;
   /** Invoke beforeMutation after awaited preparation and immediately before publishing a guarded mutation. */
   request(
     runtime: Runtime,
@@ -104,28 +85,6 @@ interface ActiveBridge {
   ready: Promise<void>;
 }
 
-interface AgentBinding {
-  issuedAt: number;
-  ticket: string;
-  agentId: string | null;
-  workspaceId: string | null;
-  tabId: string | null;
-  selectionRevision: number;
-  viewerToken: string | null;
-  controlToken: string | null;
-  lastState: BrowserState | null;
-  lastFrame: BrowserFrame | null;
-}
-
-/** Pair cleanup with a down acknowledged in this exact request/runtime. */
-interface AgentPublicationContext {
-  binding: AgentBinding;
-  selectionRevision: number;
-  keys: Map<string, RuntimeInstance>;
-  buttons: Map<string, RuntimeInstance>;
-  channels: Map<string, RuntimeInstance>;
-}
-
 export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance> {
   private readonly owner: RuntimeOwner<Runtime>;
   private readonly agentBindingStore: AgentBindingStore | undefined;
@@ -141,9 +100,7 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
   private readonly workspaceOperations = new Map<string, Promise<void>>();
   private readonly archived = new Set<string>();
   private readonly browserPolicy: SessionManager;
-  private readonly agentRequestContext = new AsyncLocalStorage<AgentPublicationContext>();
-  private readonly agentBindings = new Map<string, AgentBinding>();
-  private readonly agentTickets = new Map<string, Set<string>>();
+  private readonly agents: AgentAuthority;
   private activeBridge: ActiveBridge | null = null;
   private nextEpoch = 0;
   private bridgeTimer: SupervisorTimer | null = null;
@@ -182,6 +139,24 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
       // independent page sessions with separate viewers and control leases.
       maxSessions: this.maxWorkspaces * MAX_BROWSER_PAGE_TARGETS,
     });
+    this.agents = new AgentAuthority(
+      {
+        now: () => this.now(),
+        assertActiveBridge: (bridgeId, epoch) => {
+          this.assertActiveBridge(bridgeId, epoch);
+        },
+        activeBridge: () => this.activeBridge,
+        assertPluginAvailable: () => {
+          if (!this.activeBridge || this.activeBridge.expiresAt <= this.now())
+            throw new RuntimeProtocolError("BRIDGE_FENCED", "Shared Browser plugin is unavailable");
+        },
+        assertWorkspaceOpen: (workspaceId) => {
+          if (this.archived.has(workspaceId)) this.workspaceArchived(workspaceId);
+        },
+      },
+      this.browserPolicy,
+      options.agentBindingStore,
+    );
   }
 
   claimBridge(bridgeId: string, takeover = false): BridgeLease {
@@ -338,7 +313,7 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
   ): Promise<JsonValue> {
     // Capture the caller before entering the workspace tail. Revocation must
     // fence queued native publication, not only the initial ticket lookup.
-    const agent = this.agentRequestContext.getStore();
+    const agent = this.agents.currentPublication();
     const execute = async () => {
       if (this.archived.has(workspaceId)) this.workspaceArchived(workspaceId);
       const entry = this.workspaces.get(workspaceId);
@@ -347,28 +322,10 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
           "WORKSPACE_NOT_FOUND",
           `Workspace runtime not found: ${workspaceId}`,
         );
-      const data = input && typeof input === "object" && !Array.isArray(input) ? input : {};
-      const key = typeof data.key === "string" ? data.key : "";
-      const button = typeof data.button === "string" ? data.button : "";
-      const channelId = typeof data.gestureId === "string" ? data.gestureId : "";
-      const pairedRelease =
-        agent &&
-        ((operation === "key.up" && agent.keys.get(key) === entry.runtime) ||
-          (operation === "mouse.up" && agent.buttons.get(button) === entry.runtime) ||
-          (operation === "input.end" && agent.channels.get(channelId) === entry.runtime));
-      if (agent && !pairedRelease) {
-        this.assertAgentBindingCurrent(agent.binding);
-        if (agent.binding.selectionRevision !== agent.selectionRevision) {
-          throw new RuntimeProtocolError("AUTHENTICATION_FAILED", "Agent tab selection changed");
-        }
-      }
-      // A lost down/begin ACK still requires cleanup. Record intent only after
-      // the current binding fence, immediately before native publication.
-      if (agent) {
-        if (operation === "key.down") agent.keys.set(key, entry.runtime);
-        if (operation === "mouse.down") agent.buttons.set(button, entry.runtime);
-        if (operation === "input.begin") agent.channels.set(channelId, entry.runtime);
-      }
+      const publication = agent
+        ? new AgentRuntimeOperation(this.agents, agent, operation, input, entry.runtime)
+        : null;
+      publication?.admit();
       try {
         const beforeMutation = () => {
           if (guard) {
@@ -379,14 +336,7 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
               throw new RuntimeProtocolError("RUNTIME_FAILURE", "Browser runtime was replaced");
             guard.assertCurrent();
           }
-          if (agent) {
-            this.assertAgentBindingCurrent(agent.binding);
-            if (agent.binding.selectionRevision !== agent.selectionRevision)
-              throw new RuntimeProtocolError(
-                "AUTHENTICATION_FAILED",
-                "Agent tab selection changed",
-              );
-          }
+          publication?.assertPublication();
         };
         if (guard) beforeMutation();
         const result = await this.owner.request(
@@ -395,13 +345,7 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
           input,
           guard ? beforeMutation : undefined,
         );
-        // Revocation blocks new publication, but never strands a possibly published press.
-        // These records allow only its policy-generated paired release, on the
-        // original runtime, before the outer request refuses its revoked result.
-        if (agent) {
-          if (operation === "key.up") agent.keys.delete(key);
-          if (operation === "mouse.up") agent.buttons.delete(button);
-        }
+        publication?.settle();
         if (this.archived.has(workspaceId)) this.workspaceArchived(workspaceId);
         if (this.workspaces.get(workspaceId) !== entry)
           throw new RuntimeProtocolError("RUNTIME_FAILURE", "Video runtime was replaced");
@@ -422,7 +366,7 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
           `Workspace runtime ${operation} failed: ${error instanceof Error ? error.message : String(error)}`,
         );
       } finally {
-        if (agent && operation === "input.end") agent.channels.delete(channelId);
+        publication?.finish();
       }
     };
     return operation === "video.read"
@@ -451,7 +395,7 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
     runtimeId: string,
     finalTab?: { tabId: string; onClosing(): void },
   ): Promise<void> {
-    const agent = this.agentRequestContext.getStore();
+    const agent = this.agents.currentPublication();
     return this.runWorkspaceOperation(workspaceId, async () => {
       const entry = this.workspaces.get(workspaceId);
       if (!entry || entry.runtime.runtimeId !== runtimeId)
@@ -472,14 +416,10 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
             "Browser tabs changed; refresh the tab list and confirm closing again",
           );
       }
-      if (agent) {
-        this.assertAgentBindingCurrent(agent.binding);
-        if (agent.binding.selectionRevision !== agent.selectionRevision)
-          throw new RuntimeProtocolError("AUTHENTICATION_FAILED", "Agent tab selection changed");
-      }
+      if (agent) this.agents.assertAgentPublication(agent);
       finalTab?.onClosing();
-      this.invalidateAgentObservations(workspaceId);
-      this.revokeAgentControl(workspaceId);
+      this.agents.invalidateAgentObservations(workspaceId);
+      this.agents.revokeAgentControl(workspaceId);
       await this.owner.stop(entry.runtime);
       if (this.workspaces.get(workspaceId) === entry) this.workspaces.delete(workspaceId);
     });
@@ -538,7 +478,7 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
           data.takeover === true,
         );
         const state = stateFromPolicyResult(result);
-        if (data.takeover === true) this.revokeAgentControl(state.workspaceId, state.tabId);
+        if (data.takeover === true) this.agents.revokeAgentControl(state.workspaceId, state.tabId);
         break;
       }
       case "release-control":
@@ -549,34 +489,34 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
         break;
       case "navigate":
         result = await this.browserPolicy.navigate(data as never);
-        this.invalidateAgentObservationsForState(result);
+        this.agents.invalidateAgentObservationsForState(result);
         break;
       case "print":
         result = await this.browserPolicy.print(data as never);
-        this.invalidateAgentObservationsForState(result);
+        this.agents.invalidateAgentObservationsForState(result);
         break;
       case "viewport":
         result = await this.browserPolicy.resize(data as never);
-        this.invalidateAgentObservationsForState(result);
+        this.agents.invalidateAgentObservationsForState(result);
         break;
       case "device":
         result = await this.browserPolicy.applyDevicePreset(data as never);
-        this.invalidateAgentObservationsForState(result);
+        this.agents.invalidateAgentObservationsForState(result);
         break;
       case "input":
         result = await this.browserPolicy.sendInput(data as never);
-        this.invalidateAgentObservationsForState(result);
+        this.agents.invalidateAgentObservationsForState(result);
         break;
       case "gesture.begin":
         result = await this.browserPolicy.beginGesture(beginBrowserGestureRpc.input.parse(data));
         break;
       case "gesture.update":
         result = await this.browserPolicy.updateGesture(updateBrowserGestureRpc.input.parse(data));
-        this.invalidateAgentObservationsForState(result);
+        this.agents.invalidateAgentObservationsForState(result);
         break;
       case "gesture.end":
         result = await this.browserPolicy.endGesture(endBrowserGestureRpc.input.parse(data));
-        this.invalidateAgentObservationsForState(result);
+        this.agents.invalidateAgentObservationsForState(result);
         break;
       case "list":
         result = {
@@ -600,7 +540,7 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
         break;
       case "archive": {
         const workspaceId = requireText(data, "workspaceId");
-        await this.revokeWorkspace(workspaceId);
+        await this.agents.revokeWorkspace(workspaceId);
         await this.browserPolicy.archiveWorkspace(workspaceId);
         result = { archived: true };
         break;
@@ -615,590 +555,6 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
     return result as JsonValue;
   }
 
-  private issueAgentTicket(bridgeId: string, epoch: number, ticket: string): JsonValue {
-    this.assertActiveBridge(bridgeId, epoch);
-    this.expireUnboundTickets();
-    assertOpaqueToken(ticket, "ticket");
-    if (this.agentBindings.has(ticket))
-      throw new RuntimeProtocolError("INVALID_REQUEST", "Agent ticket is already registered");
-    if (
-      [...this.agentBindings.values()].filter((binding) => binding.agentId === null).length >=
-      MAX_UNBOUND_AGENT_TICKETS
-    )
-      throw new RuntimeProtocolError(
-        "RUNTIME_BUSY",
-        "Shared Browser ticket capacity is temporarily full",
-      );
-    this.agentBindings.set(ticket, {
-      ticket,
-      issuedAt: this.now(),
-      agentId: null,
-      workspaceId: null,
-      tabId: null,
-      selectionRevision: 0,
-      viewerToken: null,
-      controlToken: null,
-      lastState: null,
-      lastFrame: null,
-    });
-    return { issued: true };
-  }
-
-  private bindAgentTicket(
-    bridgeId: string,
-    epoch: number,
-    ticket: string,
-    agentId: string,
-    workspaceId: string,
-  ): JsonValue {
-    this.assertActiveBridge(bridgeId, epoch);
-    this.expireUnboundTickets();
-    const binding = this.agentBindings.get(ticket);
-    if (!binding) throw new RuntimeProtocolError("AUTHENTICATION_FAILED", "Unknown agent ticket");
-    if (this.archived.has(workspaceId)) this.workspaceArchived(workspaceId);
-    if (binding.agentId && (binding.agentId !== agentId || binding.workspaceId !== workspaceId))
-      throw new RuntimeProtocolError("AUTHENTICATION_FAILED", "Agent ticket is already bound");
-    const saved = this.agentBindingStore?.get(ticket);
-    if (saved && (saved.agentId !== agentId || saved.workspaceId !== workspaceId)) {
-      throw new RuntimeProtocolError("AUTHENTICATION_FAILED", "Agent ticket is already bound");
-    }
-    // A resumed trusted launch renews identity without forgetting its saved tab.
-    if (!binding.agentId && saved) binding.tabId = saved.tabId;
-    this.agentBindingStore?.set(ticket, {
-      agentId,
-      workspaceId,
-      tabId: binding.tabId,
-    });
-    binding.agentId = agentId;
-    binding.workspaceId = workspaceId;
-    let tickets = this.agentTickets.get(agentId);
-    if (!tickets) {
-      tickets = new Set();
-      this.agentTickets.set(agentId, tickets);
-    }
-    tickets.add(ticket);
-    return { bound: true };
-  }
-
-  private async revokeAgent(bridgeId: string, epoch: number, agentId: string): Promise<JsonValue> {
-    this.assertActiveBridge(bridgeId, epoch);
-    this.agentBindingStore?.revokeAgent(agentId);
-    const tickets = this.agentTickets.get(agentId);
-    if (!tickets) return { revoked: 0 };
-    const viewers: string[] = [];
-    let revoked = 0;
-    // Remove every credential synchronously before waiting on viewer cleanup.
-    for (const ticket of tickets) {
-      const binding = this.agentBindings.get(ticket);
-      if (!binding) continue;
-      this.agentBindings.delete(ticket);
-      revoked += 1;
-      if (binding.viewerToken) viewers.push(binding.viewerToken);
-    }
-    this.agentTickets.delete(agentId);
-    await Promise.allSettled(viewers.map((viewerToken) => this.browserPolicy.detach(viewerToken)));
-    return { revoked };
-  }
-
-  /** Carry exact ticket identity through awaited policy and native publication. */
-  private async requestAgent(
-    ticket: string,
-    operation: string,
-    input: JsonValue,
-  ): Promise<JsonValue> {
-    this.assertPluginAvailable();
-    if (operation === "reconnect" || operation === "open") {
-      return this.agentReply(await this.reconnectAgent(ticket, operation === "open"));
-    }
-    const binding = this.requireAgentBinding(ticket);
-    const execute = async () =>
-      this.agentReply(await this.executeAgentRequest(binding, operation, input));
-    // Attachment constructs shared session state; its late viewer is removed
-    // explicitly. Only actionable requests carry a native publication fence.
-    if (
-      operation === "status" ||
-      operation === "capture" ||
-      operation === "acquire-control" ||
-      operation === "tabs.list"
-    ) {
-      return execute();
-    }
-    return this.agentRequestContext.run(
-      {
-        binding,
-        selectionRevision: binding.selectionRevision,
-        keys: new Map(),
-        buttons: new Map(),
-        channels: new Map(),
-      },
-      execute,
-    );
-  }
-
-  /** Report the enforcing runtime's effective policy even to an already-running MCP process. */
-  private agentReply(result: JsonValue): JsonValue {
-    const reply = asObject(result);
-    const agentPolicy = { ...AGENT_VIEWER_POLICY, humanTakeover: "immediate" };
-    const state = reply.state;
-    return {
-      ...reply,
-      agentPolicy,
-      ...(state && typeof state === "object" && !Array.isArray(state)
-        ? {
-            state: {
-              ...state,
-              agentPolicy,
-              ...(typeof reply.frameExpiresAt === "string"
-                ? { frameExpiresAt: reply.frameExpiresAt }
-                : {}),
-            },
-          }
-        : {}),
-    };
-  }
-
-  /** Explicit recovery never replays inputs or inherits a control lease/frame. */
-  private async reconnectAgent(ticket: string, openBrowser: boolean): Promise<JsonValue> {
-    this.assertPluginAvailable();
-    let binding = this.agentBindings.get(ticket);
-    if (!binding?.agentId || !binding.workspaceId) {
-      const saved = this.agentBindingStore?.get(ticket);
-      if (!saved) {
-        throw new RuntimeProtocolError(
-          "AUTHENTICATION_FAILED",
-          "Agent ticket is invalid or unbound and has no recovery registration. Resume through a trusted launch or create a fresh agent.",
-        );
-      }
-      const bridge = this.activeBridge!;
-      if (!binding) this.issueAgentTicket(bridge.bridgeId, bridge.epoch, ticket);
-      this.bindAgentTicket(bridge.bridgeId, bridge.epoch, ticket, saved.agentId, saved.workspaceId);
-      binding = this.requireAgentBinding(ticket);
-      binding.tabId = saved.tabId;
-      this.saveAgentSelection(binding);
-    }
-    this.assertAgentBindingCurrent(binding);
-    const viewerToken = binding.viewerToken;
-    // Fence any outstanding input before asynchronous viewer cleanup.
-    binding.selectionRevision += 1;
-    binding.viewerToken = null;
-    binding.controlToken = null;
-    binding.lastFrame = null;
-    binding.lastState = null;
-    if (viewerToken) await this.browserPolicy.detach(viewerToken);
-    this.assertAgentBindingCurrent(binding);
-    if (openBrowser) {
-      await this.browserPolicy.reopenBrowser(binding.workspaceId!);
-      this.assertAgentBindingCurrent(binding);
-      // Explicit reopen may create a new Chromium runtime whose tab IDs are different.
-      // Preserve a surviving selection, otherwise attach to its new launch page.
-      if (
-        binding.tabId &&
-        !(await this.browserPolicy.listTabs(binding.workspaceId!)).tabs.some(
-          (tab) => tab.id === binding.tabId,
-        )
-      ) {
-        this.assertAgentBindingCurrent(binding);
-        binding.tabId = null;
-        this.saveAgentSelection(binding);
-      }
-    }
-    return (await this.requestAgentObservation(binding, "status", {})) as unknown as JsonValue;
-  }
-
-  private async executeAgentRequest(
-    binding: AgentBinding,
-    operation: string,
-    input: JsonValue,
-  ): Promise<JsonValue> {
-    this.assertAgentBindingCurrent(binding);
-    const data = asObject(input);
-    if (operation === "status" || operation === "capture")
-      return (await this.requestAgentObservation(binding, operation, data)) as unknown as JsonValue;
-    if (operation === "dom.snapshot") {
-      const revision = binding.selectionRevision;
-      await this.requestAgentObservation(binding, "status", {});
-      const result = await this.browserPolicy.domSnapshot(await this.ensureAgentViewer(binding));
-      this.assertAgentBindingCurrent(binding);
-      if (binding.selectionRevision !== revision)
-        throw new RuntimeProtocolError("INVALID_REQUEST", "Agent tab changed during snapshot");
-      binding.lastState = result.state;
-      return result as unknown as JsonValue;
-    }
-    if (operation === "tabs.list") {
-      const listed = await this.browserPolicy.listTabs(binding.workspaceId!);
-      return { ...listed, selectedTabId: binding.tabId };
-    }
-    if (operation === "tabs.select") {
-      const tabId = requireText(data, "tabId");
-      return {
-        state: await this.selectAgentTab(binding, tabId),
-      } as unknown as JsonValue;
-    }
-    if (operation === "tabs.create") {
-      const create = async () =>
-        this.browserPolicy.createTab(await this.ensureAgentViewer(binding));
-      let created: { tabId: string };
-      try {
-        created = await create();
-      } catch (error) {
-        // Only a refusal before dispatch is recoverable: the lapsed agent viewer is replaced
-        // once. A lease that ends after the page was created is a distinct, non-retried error.
-        if (!isInvalidViewer(error)) throw error;
-        binding.viewerToken = null;
-        binding.controlToken = null;
-        created = await create();
-      }
-      return {
-        tabId: created.tabId,
-        state: await this.selectAgentTab(binding, created.tabId),
-      } as unknown as JsonValue;
-    }
-    if (operation === "tabs.close") {
-      const viewerToken = binding.viewerToken;
-      const controlToken = binding.controlToken;
-      const tabId = binding.tabId;
-      if (!viewerToken || !tabId) {
-        throw new RuntimeProtocolError(
-          "AUTHENTICATION_FAILED",
-          "Observe the selected browser tab first",
-        );
-      }
-      const current = binding.lastState;
-      if (!current?.runtimeId)
-        throw new RuntimeProtocolError("INVALID_REQUEST", "Observe the selected browser tab first");
-      const result = await this.browserPolicy.closeTab({
-        viewerToken,
-        ...(controlToken ? { controlToken } : {}),
-        tabId,
-        sessionId: current.sessionId,
-        runtimeId: current.runtimeId,
-        scope: browserTabCloseScopeSchema.parse(data.scope ?? "tab"),
-      });
-      binding.viewerToken = null;
-      binding.tabId = null;
-      binding.controlToken = null;
-      binding.lastState = null;
-      binding.lastFrame = null;
-      if (result.browserClosed) return result;
-      const { tabs } = await this.browserPolicy.listTabs(binding.workspaceId!);
-      const next = tabs[0];
-      if (!next) throw new RuntimeProtocolError("RUNTIME_FAILURE", "Browser has no remaining tab");
-      return {
-        state: await this.selectAgentTab(binding, next.id),
-      } as unknown as JsonValue;
-    }
-    try {
-      if (operation === "acquire-control") {
-        const selectionRevision = binding.selectionRevision;
-        await this.requestAgentObservation(binding, "status", {});
-        this.assertAgentBindingCurrent(binding);
-        if (binding.selectionRevision !== selectionRevision) {
-          throw new RuntimeProtocolError(
-            "INVALID_REQUEST",
-            "Agent tab changed during control acquisition",
-          );
-        }
-        const viewerToken = binding.viewerToken!;
-        const result = await this.browserPolicy.acquireControl(viewerToken, false);
-        this.assertAgentBindingCurrent(binding);
-        if (binding.selectionRevision !== selectionRevision) {
-          await this.browserPolicy
-            .releaseControl(viewerToken, result.controlToken)
-            .catch(() => undefined);
-          throw new RuntimeProtocolError(
-            "INVALID_REQUEST",
-            "Agent tab changed during control acquisition",
-          );
-        }
-        binding.controlToken = result.controlToken;
-        binding.lastState = result.state;
-        return { state: result.state } as unknown as JsonValue;
-      }
-      const viewerToken = binding.viewerToken;
-      const controlToken = binding.controlToken;
-      if (!viewerToken || !controlToken)
-        throw new RuntimeProtocolError(
-          "AUTHENTICATION_FAILED",
-          "Agent does not hold browser control",
-        );
-      if (operation === "release-control") {
-        try {
-          const result = await this.browserPolicy.releaseControl(viewerToken, controlToken);
-          binding.lastState = result.state;
-          return result as unknown as JsonValue;
-        } finally {
-          binding.controlToken = null;
-        }
-      }
-      this.assertAgentBindingCurrent(binding);
-      const selectionRevision = binding.selectionRevision;
-      const expected = expectedState(binding);
-      let result: { state: BrowserState };
-      if (operation === "dom.action" || operation === "dom.evaluate") {
-        result = await this.browserPolicy.domOperation(viewerToken, controlToken, operation, input);
-      } else if (operation === "print") {
-        result = await this.browserPolicy.print(
-          parseAgentInput(printBrowserRpc.input, { viewerToken, controlToken, expected }),
-        );
-      } else if (operation === "navigate") {
-        result = await this.browserPolicy.navigate(
-          parseAgentInput(navigateBrowserRpc.input, {
-            viewerToken,
-            controlToken,
-            expected,
-            action: data.action,
-          }),
-        );
-      } else if (operation === "viewport") {
-        const resize = parseAgentInput(resizeBrowserRpc.input, {
-          viewerToken,
-          controlToken,
-          expected,
-          viewport: data.viewport,
-        });
-        // The fork keeps the shared viewport range so its agent device and
-        // high-resolution capture workflows remain available. Schema validation
-        // still rejects out-of-range requests before native mutation.
-        result = await this.browserPolicy.resize(resize);
-      } else if (operation === "device") {
-        result = await this.browserPolicy.applyDevicePreset(
-          parseAgentInput(applyDevicePresetRpc.input, {
-            viewerToken,
-            controlToken,
-            expected,
-            presetId: data.presetId,
-          }),
-        );
-      } else if (operation === "input") {
-        if (!binding.lastFrame)
-          throw new RuntimeProtocolError("INVALID_REQUEST", "Capture a frame before sending input");
-        result = await this.browserPolicy.sendInput(
-          parseAgentInput(sendBrowserInputRpc.input, {
-            viewerToken,
-            controlToken,
-            expected,
-            target: binding.lastFrame,
-            event: data.event,
-          }),
-        );
-      } else {
-        throw new RuntimeProtocolError("INVALID_REQUEST", `Unknown agent operation: ${operation}`);
-      }
-      this.assertAgentBindingCurrent(binding);
-      if (binding.selectionRevision !== selectionRevision) {
-        throw new RuntimeProtocolError("INVALID_REQUEST", "Agent tab changed during action");
-      }
-      binding.lastState = result.state;
-      binding.lastFrame = null;
-      return result as unknown as JsonValue;
-    } catch (error) {
-      if (error instanceof RuntimeProtocolError && error.code === "UNKNOWN_OUTCOME")
-        this.invalidateAgentObservations(binding.workspaceId!);
-      throw error;
-    }
-  }
-
-  private async requestAgentObservation(
-    binding: AgentBinding,
-    operation: "status" | "capture",
-    input: Record<string, JsonValue>,
-  ): Promise<{ state: BrowserState; frame?: BrowserFrame | null }> {
-    const selectionRevision = binding.selectionRevision;
-    const run = async (viewerToken: string) =>
-      operation === "status"
-        ? await this.browserPolicy.status(viewerToken)
-        : await this.browserPolicy.capture(
-            viewerToken,
-            input.quality === "low" || input.quality === "medium" || input.quality === "high"
-              ? input.quality
-              : DEFAULT_CAPTURE_QUALITY,
-            null,
-          );
-    let result: { state: BrowserState; frame?: BrowserFrame | null };
-    try {
-      result = await run(await this.ensureAgentViewer(binding));
-    } catch (error) {
-      if (!isInvalidViewer(error)) throw error;
-      binding.viewerToken = null;
-      binding.controlToken = null;
-      result = await run(await this.ensureAgentViewer(binding));
-    }
-    this.assertAgentBindingCurrent(binding);
-    if (binding.selectionRevision !== selectionRevision) {
-      throw new RuntimeProtocolError("INVALID_REQUEST", "Agent tab changed during observation");
-    }
-    binding.lastState = result.state;
-    binding.tabId = result.state.tabId ?? null;
-    this.saveAgentSelection(binding);
-    if (operation === "capture") binding.lastFrame = result.frame ?? null;
-    return result;
-  }
-
-  /** Move only this agent's viewer to a page, preserving every other viewer's selection. */
-  private async selectAgentTab(binding: AgentBinding, tabId: string): Promise<BrowserState> {
-    this.assertAgentBindingCurrent(binding);
-    if (binding.tabId === tabId && binding.viewerToken) {
-      // Same-tab selection needs the same expiry recovery as status/capture.
-      const current = await this.requestAgentObservation(binding, "status", {});
-      if (binding.tabId !== tabId) {
-        throw new RuntimeProtocolError("INVALID_REQUEST", "Agent tab changed during selection");
-      }
-      binding.lastState = current.state;
-      return current.state;
-    }
-    const revision = ++binding.selectionRevision;
-    const requestContext = this.agentRequestContext.getStore();
-    if (requestContext?.binding === binding) requestContext.selectionRevision = revision;
-    const previousViewer = binding.viewerToken;
-    binding.controlToken = null;
-    binding.lastState = null;
-    binding.lastFrame = null;
-    const attached = await this.browserPolicy.attachAgent(
-      binding.workspaceId!,
-      `Agent ${binding.agentId!.slice(0, 48)}`,
-      tabId,
-    );
-    try {
-      this.assertAgentBindingCurrent(binding);
-      if (binding.selectionRevision !== revision) {
-        throw new RuntimeProtocolError("INVALID_REQUEST", "Agent tab selection was replaced");
-      }
-      if (previousViewer) {
-        try {
-          await this.browserPolicy.detach(previousViewer);
-        } catch (error) {
-          // Another viewer may have closed the preview. Its retired lease must
-          // not prevent this explicit selection of an independently valid page.
-          if (
-            !isInvalidViewer(error) &&
-            !(error instanceof Error && error.message === "Browser tab is closed")
-          )
-            throw error;
-        }
-      }
-      this.assertAgentBindingCurrent(binding);
-      binding.viewerToken = attached.viewerToken;
-      binding.tabId = attached.state.tabId ?? tabId;
-      this.saveAgentSelection(binding);
-      binding.controlToken = null;
-      binding.lastState = attached.state;
-      binding.lastFrame = null;
-      return attached.state;
-    } catch (error) {
-      await this.browserPolicy.detach(attached.viewerToken).catch(() => undefined);
-      throw error;
-    }
-  }
-
-  /** Publish an attached viewer only while its original credential still exists. */
-  private async ensureAgentViewer(binding: AgentBinding): Promise<string> {
-    this.assertAgentBindingCurrent(binding);
-    if (binding.viewerToken) return binding.viewerToken;
-    const selectionRevision = binding.selectionRevision;
-    const attached = await this.browserPolicy.attachAgent(
-      binding.workspaceId!,
-      `Agent ${binding.agentId!.slice(0, 48)}`,
-      binding.tabId ?? undefined,
-    );
-    try {
-      this.assertAgentBindingCurrent(binding);
-      if (binding.selectionRevision !== selectionRevision) {
-        throw new RuntimeProtocolError("INVALID_REQUEST", "Agent tab changed during attachment");
-      }
-    } catch (error) {
-      // Cleanup must run outside the revoked caller's publication fence.
-      await this.agentRequestContext
-        .exit(() => this.browserPolicy.detach(attached.viewerToken))
-        .catch(() => undefined);
-      throw error;
-    }
-    if (binding.viewerToken) {
-      // Parallel observations may both attach. Keep the first published viewer.
-      await this.agentRequestContext.exit(() => this.browserPolicy.detach(attached.viewerToken));
-      this.assertAgentBindingCurrent(binding);
-      return binding.viewerToken;
-    }
-    binding.viewerToken = attached.viewerToken;
-    binding.lastState = attached.state;
-    binding.tabId = attached.state.tabId ?? null;
-    this.saveAgentSelection(binding);
-    return attached.viewerToken;
-  }
-
-  /** Persist selection only when it changes; runtime content and leases stay volatile. */
-  private saveAgentSelection(binding: AgentBinding): void {
-    if (!this.agentBindingStore || !binding.agentId || !binding.workspaceId) return;
-    const previous = this.agentBindingStore.get(binding.ticket);
-    if (previous?.tabId === binding.tabId) return;
-    this.agentBindingStore.set(binding.ticket, {
-      agentId: binding.agentId,
-      workspaceId: binding.workspaceId,
-      tabId: binding.tabId,
-    });
-  }
-
-  /** A deleted or replaced ticket cannot regain authority after an awaited step. */
-  private assertAgentBindingCurrent(binding: AgentBinding): void {
-    this.assertPluginAvailable();
-    if (this.agentBindings.get(binding.ticket) !== binding) {
-      throw new RuntimeProtocolError("AUTHENTICATION_FAILED", "Agent ticket was revoked");
-    }
-    if (this.archived.has(binding.workspaceId!)) this.workspaceArchived(binding.workspaceId!);
-  }
-
-  private requireAgentBinding(ticket: string): AgentBinding {
-    const binding = this.agentBindings.get(ticket);
-    if (!binding?.agentId || !binding.workspaceId)
-      throw new RuntimeProtocolError("AUTHENTICATION_FAILED", "Agent ticket is invalid or unbound");
-    if (this.archived.has(binding.workspaceId)) this.workspaceArchived(binding.workspaceId);
-    return binding;
-  }
-
-  private assertPluginAvailable(): void {
-    if (!this.activeBridge || this.activeBridge.expiresAt <= this.now())
-      throw new RuntimeProtocolError("BRIDGE_FENCED", "Shared Browser plugin is unavailable");
-  }
-
-  private revokeAgentControl(workspaceId: string, tabId?: string): void {
-    for (const binding of this.agentBindings.values()) {
-      if (binding.workspaceId !== workspaceId) continue;
-      if (tabId && binding.tabId !== tabId) continue;
-      binding.controlToken = null;
-      binding.lastState = null;
-      binding.lastFrame = null;
-    }
-  }
-
-  private invalidateAgentObservationsForState(result: unknown): void {
-    const state = stateFromPolicyResult(result);
-    this.invalidateAgentObservations(state.workspaceId, state.tabId);
-  }
-
-  private invalidateAgentObservations(workspaceId: string, tabId?: string): void {
-    for (const binding of this.agentBindings.values()) {
-      if (binding.workspaceId !== workspaceId) continue;
-      if (tabId && binding.tabId !== tabId) continue;
-      binding.lastState = null;
-      binding.lastFrame = null;
-    }
-  }
-
-  private async revokeWorkspace(workspaceId: string): Promise<void> {
-    this.agentBindingStore?.revokeWorkspace(workspaceId);
-    const viewers: string[] = [];
-    for (const [ticket, binding] of this.agentBindings) {
-      if (binding.workspaceId !== workspaceId) continue;
-      this.agentBindings.delete(ticket);
-      if (binding.viewerToken) viewers.push(binding.viewerToken);
-      if (binding.agentId) {
-        const tickets = this.agentTickets.get(binding.agentId);
-        tickets?.delete(ticket);
-        if (tickets?.size === 0) this.agentTickets.delete(binding.agentId);
-      }
-    }
-    await Promise.allSettled(viewers.map((viewerToken) => this.browserPolicy.detach(viewerToken)));
-  }
-
   async stopAll(): Promise<void> {
     if (this.stopping) return this.stopping;
     const operation = (async () => {
@@ -1206,12 +562,7 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
       this.clearBridgeTimer();
       this.cancelOrphanStop();
       this.browserPolicy.reset();
-      for (const binding of this.agentBindings.values()) {
-        binding.viewerToken = null;
-        binding.controlToken = null;
-        binding.lastState = null;
-        binding.lastFrame = null;
-      }
+      this.agents.clearLeases();
       await Promise.allSettled(this.workspaceOperations.values());
       await Promise.allSettled(this.creations.values());
       const entries = [...this.workspaces.values()];
@@ -1269,9 +620,9 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
           request.input,
         );
       case "ticket.issue":
-        return this.issueAgentTicket(request.bridgeId, request.epoch, request.ticket);
+        return this.agents.issueAgentTicket(request.bridgeId, request.epoch, request.ticket);
       case "ticket.bind":
-        return this.bindAgentTicket(
+        return this.agents.bindAgentTicket(
           request.bridgeId,
           request.epoch,
           request.ticket,
@@ -1279,9 +630,15 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
           request.workspaceId,
         );
       case "agent.revoke":
-        return this.revokeAgent(request.bridgeId, request.epoch, request.agentId);
-      case "agent.request":
-        return this.requestAgent(request.ticket, request.operation, request.input);
+        return this.agents.revokeAgent(request.bridgeId, request.epoch, request.agentId);
+      case "agent.request": {
+        const reply = await this.agents.requestAgent(
+          request.ticket,
+          request.operation,
+          request.input,
+        );
+        return request.legacyAdapter ? withLegacyEmptyWorkspaceHint(reply) : reply;
+      }
     }
   }
 
@@ -1344,13 +701,6 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
     throw new RuntimeProtocolError("WORKSPACE_ARCHIVED", `Workspace is archived: ${workspaceId}`);
   }
 
-  private expireUnboundTickets(): void {
-    const deadline = this.now() - AGENT_TICKET_TTL_MS;
-    for (const [ticket, binding] of this.agentBindings)
-      if (binding.agentId === null && binding.issuedAt <= deadline)
-        this.agentBindings.delete(ticket);
-  }
-
   private armBridgeTimeout(bridge: ActiveBridge): void {
     this.clearBridgeTimer();
     const delay = Math.max(0, bridge.expiresAt - this.now());
@@ -1385,460 +735,4 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
     this.cancel(this.orphanTimer);
     this.orphanTimer = null;
   }
-}
-
-/** Raw agent sockets reuse the public mutation contract. Never expose parser
- * issues or submitted values in errors from this trusted-ticket boundary. */
-function parseAgentInput<Value>(schema: ZodType<Value>, value: unknown): Value {
-  const parsed = schema.safeParse(value);
-  if (!parsed.success) {
-    throw new RuntimeProtocolError("INVALID_REQUEST", "Invalid agent browser request");
-  }
-  return parsed.data;
-}
-
-function asObject(value: JsonValue): Record<string, JsonValue> {
-  if (!value || typeof value !== "object" || Array.isArray(value))
-    throw new RuntimeProtocolError("INVALID_REQUEST", "Browser input must be an object");
-  return value;
-}
-
-function requireText(value: Record<string, JsonValue>, key: string): string {
-  const text = value[key];
-  if (typeof text !== "string" || text.length === 0)
-    throw new RuntimeProtocolError("INVALID_REQUEST", `${key} must be a non-empty string`);
-  return text;
-}
-
-function assertOpaqueToken(value: string, label: string): void {
-  if (value.length < 32 || value.length > 128 || !/^[A-Za-z0-9_-]+$/.test(value))
-    throw new RuntimeProtocolError("INVALID_REQUEST", `${label} is invalid`);
-}
-
-function expectedState(binding: AgentBinding): {
-  sessionId: string;
-  navigationGeneration: number;
-  viewportGeneration: number;
-  runtimeId: string;
-  bridgeEpoch: number;
-} {
-  const state = binding.lastState;
-  if (!state)
-    throw new RuntimeProtocolError("INVALID_REQUEST", "Observe the browser before mutating it");
-  if (!state.runtimeId || state.bridgeEpoch === undefined)
-    throw new RuntimeProtocolError("RUNTIME_FAILURE", "Browser observation lacks runtime identity");
-  return {
-    sessionId: state.sessionId,
-    navigationGeneration: state.navigationGeneration,
-    viewportGeneration: state.viewportGeneration,
-    runtimeId: state.runtimeId,
-    bridgeEpoch: state.bridgeEpoch,
-  };
-}
-
-function stateFromPolicyResult(result: unknown): BrowserState {
-  if (!result || typeof result !== "object" || !("state" in result))
-    throw new RuntimeProtocolError("RUNTIME_FAILURE", "Browser policy returned no state");
-  return result.state as BrowserState;
-}
-
-function isInvalidViewer(error: unknown): boolean {
-  return error instanceof Error && error.message.includes("Viewer token is invalid or expired");
-}
-
-export interface SupervisorPaths {
-  root: string;
-  socket: string;
-  token: string;
-  endpoint: string;
-  lock: string;
-}
-
-export function resolveSupervisorPaths(
-  paseoHome = process.env.PASEO_HOME ?? join(homedir(), ".paseo"),
-): SupervisorPaths {
-  const root = join(
-    paseoHome,
-    "plugin-data",
-    "shared-browser",
-    `supervisor-v${RUNTIME_PROTOCOL_VERSION}`,
-  );
-  const socketId = createHash("sha256").update(root).digest("hex");
-  const socket =
-    process.platform === "win32"
-      ? String.raw`\\.\pipe\paseo-shared-browser-${socketId}`
-      : join(tmpdir(), `psb-${socketId.slice(0, 16)}.sock`);
-  return {
-    root,
-    socket,
-    token: join(root, "runtime.token"),
-    endpoint: join(root, "runtime.json"),
-    lock: join(root, "startup.lock"),
-  };
-}
-
-async function removeSupervisorSocket(path: string): Promise<void> {
-  if (process.platform !== "win32") await rm(path, { force: true });
-}
-
-export async function acquireStartupLock(path: string): Promise<() => Promise<void>> {
-  await mkdir(dirname(path), { recursive: true, mode: DIRECTORY_MODE });
-  await chmod(dirname(path), DIRECTORY_MODE);
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    try {
-      await mkdir(path, { mode: DIRECTORY_MODE });
-      await writeFile(join(path, "pid"), String(process.pid), {
-        mode: FILE_MODE,
-      });
-      return async () => rm(path, { recursive: true, force: true });
-    } catch (error) {
-      if (!isNodeError(error) || error.code !== "EEXIST") throw error;
-      const pid = Number.parseInt(await readFile(join(path, "pid"), "utf8").catch(() => ""), 10);
-      if (Number.isSafeInteger(pid) && processIsRunning(pid)) {
-        throw new Error(`Runtime supervisor already holds startup lock (${pid})`);
-      }
-      await rm(path, { recursive: true, force: true });
-    }
-  }
-  throw new Error("Could not acquire runtime supervisor startup lock");
-}
-
-export async function startSupervisorServer<Runtime extends RuntimeInstance>(
-  owner: RuntimeOwner<Runtime>,
-  paths = resolveSupervisorPaths(),
-): Promise<{
-  close: () => Promise<void>;
-  supervisor: RuntimeSupervisor<Runtime>;
-}> {
-  const releaseLock = await acquireStartupLock(paths.lock);
-  const supervisor = new RuntimeSupervisor({
-    owner,
-    agentBindingStore: new AgentBindingStore(join(paths.root, "agent-bindings.json")),
-  });
-  const sockets = new Set<Socket>();
-  let globalInFlight = 0;
-  let globalMediaInFlight = 0;
-  let globalHeartbeatsInFlight = 0;
-  const token = randomBytes(32).toString("base64url");
-  const server = createServer((socket) => {
-    sockets.add(socket);
-    let buffer = "";
-    let claimed: { bridgeId: string; epoch: number } | null = null;
-    let socketInFlight = 0;
-    let socketMediaInFlight = 0;
-    let socketHeartbeatsInFlight = 0;
-    let processing = Promise.resolve();
-    let busyResponsePending = false;
-    socket.setEncoding("utf8");
-
-    const rejectBusy = (line: string): boolean => {
-      let id: string;
-      try {
-        const request = JSON.parse(line) as { id?: unknown };
-        if (typeof request.id !== "string") throw new Error("Missing request id");
-        id = request.id;
-      } catch {
-        socket.destroy();
-        return false;
-      }
-      busyResponsePending = true;
-      socket.pause();
-      socket.write(
-        `${JSON.stringify({
-          id,
-          ok: false,
-          error: {
-            code: "RUNTIME_BUSY",
-            message: "Shared Browser supervisor is busy; retry the request",
-          },
-        })}\n`,
-        (error) => {
-          busyResponsePending = false;
-          if (error) socket.destroy();
-          else drainBufferedLines();
-        },
-      );
-      return false;
-    };
-
-    const enqueue = (line: string): boolean => {
-      const concurrent = classifyConcurrentRequest(line, token);
-      const maintenance = concurrent === "heartbeat" && isCurrentHeartbeat(line, supervisor);
-      const media = !maintenance && isMediaRequest(line, token);
-      if (maintenance) {
-        if (
-          socketHeartbeatsInFlight >= MAX_HEARTBEATS_IN_FLIGHT ||
-          globalHeartbeatsInFlight >= MAX_HEARTBEATS_IN_FLIGHT
-        )
-          return rejectBusy(line);
-        socketHeartbeatsInFlight += 1;
-        globalHeartbeatsInFlight += 1;
-      } else {
-        if (socketInFlight >= MAX_SOCKET_IN_FLIGHT || globalInFlight >= MAX_GLOBAL_IN_FLIGHT)
-          return rejectBusy(line);
-        if (
-          media &&
-          (socketMediaInFlight >= MAX_SOCKET_MEDIA_IN_FLIGHT ||
-            globalMediaInFlight >= MAX_GLOBAL_MEDIA_IN_FLIGHT)
-        )
-          return rejectBusy(line);
-        socketInFlight += 1;
-        globalInFlight += 1;
-        if (media) {
-          socketMediaInFlight += 1;
-          globalMediaInFlight += 1;
-        }
-      }
-      // Video admission/result fencing already belongs to each workspace's
-      // policy queue. Another workspace's teardown must not block that lane.
-      const before = concurrent === null ? processing : Promise.resolve();
-      const execution = before
-        .then(async () => {
-          const { response, lease } = await handleLine(line, token, supervisor);
-          if (lease) claimed = lease;
-          if (!socket.destroyed) {
-            await new Promise<void>((resolve, reject) => {
-              socket.write(`${JSON.stringify(response)}\n`, (error) =>
-                error ? reject(error) : resolve(),
-              );
-            });
-          }
-        })
-        .catch(() => undefined)
-        .finally(() => {
-          if (maintenance) {
-            socketHeartbeatsInFlight -= 1;
-            globalHeartbeatsInFlight -= 1;
-          } else {
-            socketInFlight -= 1;
-            globalInFlight -= 1;
-            if (media) {
-              socketMediaInFlight -= 1;
-              globalMediaInFlight -= 1;
-            }
-          }
-          drainBufferedLines();
-        });
-      // Heartbeats must pass slow page operations, otherwise a healthy bridge
-      // expires and its browser is stopped. Video waits also leave the command
-      // tail. Only the authenticated current lease uses the separately bounded
-      // maintenance lane. Auth, epoch checks and whole ID-keyed writes still apply.
-      if (concurrent === null) processing = execution;
-      return true;
-    };
-
-    // Pausing transport does not consume lines already delivered in its current
-    // chunk. Drain those after each bounded busy response, without replaying a
-    // refused line or creating an unbounded queue of busy-response writes.
-    function drainBufferedLines(): void {
-      if (socket.destroyed || busyResponsePending) return;
-      let newline = buffer.indexOf("\n");
-      while (newline >= 0) {
-        const line = buffer.slice(0, newline);
-        buffer = buffer.slice(newline + 1);
-        if (line.length > 0 && !enqueue(line)) return;
-        newline = buffer.indexOf("\n");
-      }
-      socket.resume();
-    }
-
-    socket.on("data", (chunk: string) => {
-      buffer += chunk;
-      if (Buffer.byteLength(buffer) > MAX_MESSAGE_BYTES) {
-        socket.destroy();
-        return;
-      }
-      drainBufferedLines();
-    });
-    socket.once("close", () => {
-      sockets.delete(socket);
-      if (claimed) supervisor.bridgeDisconnected(claimed.bridgeId, claimed.epoch);
-    });
-  });
-
-  try {
-    await mkdir(paths.root, { recursive: true, mode: DIRECTORY_MODE });
-    await chmod(paths.root, DIRECTORY_MODE);
-    const tokenHandle = await open(paths.token, "w", FILE_MODE);
-    try {
-      await tokenHandle.writeFile(token);
-    } finally {
-      await tokenHandle.close();
-    }
-    await chmod(paths.token, FILE_MODE);
-    await removeSupervisorSocket(paths.socket);
-    await new Promise<void>((resolve, reject) => {
-      server.once("error", reject);
-      server.listen(paths.socket, () => {
-        server.off("error", reject);
-        resolve();
-      });
-    });
-    if (process.platform !== "win32") await chmod(paths.socket, SOCKET_MODE);
-    await writeFile(
-      paths.endpoint,
-      JSON.stringify({
-        version: RUNTIME_PROTOCOL_VERSION,
-        socket: paths.socket,
-      }),
-      { mode: FILE_MODE },
-    );
-    await chmod(paths.endpoint, FILE_MODE);
-  } catch (error) {
-    server.close();
-    await Promise.allSettled([
-      removeSupervisorSocket(paths.socket),
-      rm(paths.endpoint, { force: true }),
-      rm(paths.token, { force: true }),
-      releaseLock(),
-    ]);
-    throw error;
-  }
-
-  let closed = false;
-  return {
-    supervisor,
-    close: async () => {
-      if (closed) return;
-      closed = true;
-      for (const socket of sockets) socket.destroy();
-      const results = await Promise.allSettled([
-        new Promise<void>((resolve, reject) =>
-          server.close((error) => (error ? reject(error) : resolve())),
-        ),
-        supervisor.stopAll(),
-      ]);
-      try {
-        const shutdownFailures = results.filter(
-          (result): result is PromiseRejectedResult => result.status === "rejected",
-        );
-        if (shutdownFailures.length > 0)
-          throw new AggregateError(
-            shutdownFailures.map((result) => result.reason),
-            "Runtime supervisor shutdown failed",
-          );
-      } finally {
-        await Promise.allSettled([
-          removeSupervisorSocket(paths.socket),
-          rm(paths.endpoint, { force: true }),
-          rm(paths.token, { force: true }),
-          releaseLock(),
-        ]);
-      }
-    },
-  };
-}
-/** Classification already verified the token; stale leases cannot consume reserved capacity. */
-function isCurrentHeartbeat(line: string, supervisor: RuntimeSupervisor): boolean {
-  const request = parseRuntimeRequest(JSON.parse(line));
-  return (
-    request.method === "bridge.heartbeat" &&
-    supervisor.isCurrentBridgeLease(request.bridgeId, request.epoch)
-  );
-}
-/** Capacity-only classification, never an authorization or command-tail bypass. */
-function isMediaRequest(line: string, token: string): boolean {
-  try {
-    const request = parseRuntimeRequest(JSON.parse(line));
-    if (request.method === "agent.request") return request.operation === "capture";
-    if (!tokensEqual(request.token, token)) return false;
-    if (request.method !== "browser.request" && request.method !== "workspace.request")
-      return false;
-    return (
-      request.operation === "video.read" ||
-      request.operation === (request.method === "browser.request" ? "capture" : "frame")
-    );
-  } catch {
-    return false;
-  }
-}
-/** Classify authenticated maintenance/media calls without weakening command ordering. */
-function classifyConcurrentRequest(line: string, token: string): "heartbeat" | "video" | null {
-  try {
-    const request = parseRuntimeRequest(JSON.parse(line));
-    if (request.method === "agent.request" || !tokensEqual(request.token, token)) return null;
-    if (request.method === "bridge.heartbeat") return "heartbeat";
-    if (request.method !== "browser.request" && request.method !== "workspace.request") return null;
-    if (request.operation !== "video.read") return null;
-    const schema =
-      request.method === "browser.request"
-        ? readBrowserVideoRpc.input
-        : runtimeVideoReadInputSchema;
-    return schema.safeParse(request.input).success ? "video" : null;
-  } catch {
-    return null;
-  }
-}
-
-async function handleLine<Runtime extends RuntimeInstance>(
-  line: string,
-  token: string,
-  supervisor: RuntimeSupervisor<Runtime>,
-): Promise<{
-  response: RuntimeResponse;
-  lease: { bridgeId: string; epoch: number } | null;
-}> {
-  let id = "unknown";
-  try {
-    const raw: unknown = JSON.parse(line);
-    // Preserve correlation even when schema validation rejects the operation.
-    // Otherwise the caller waits forever for a response carrying its own ID.
-    if (raw && typeof raw === "object" && "id" in raw && typeof raw.id === "string") {
-      id = raw.id;
-    }
-    const request = parseRuntimeRequest(raw);
-    id = request.id;
-    if (request.method !== "agent.request" && !tokensEqual(request.token, token))
-      throw new RuntimeProtocolError("AUTHENTICATION_FAILED", "Invalid supervisor token");
-    const result = await supervisor.dispatch(request);
-    let lease: { bridgeId: string; epoch: number } | null = null;
-    if (request.method === "bridge.claim") {
-      if (!result || typeof result !== "object" || !("epoch" in result))
-        throw new RuntimeProtocolError("RUNTIME_FAILURE", "Bridge claim returned no epoch");
-      lease = { bridgeId: request.bridgeId, epoch: Number(result.epoch) };
-    }
-    return { response: { id, ok: true, result }, lease };
-  } catch (error) {
-    const protocolError =
-      error instanceof RuntimeProtocolError
-        ? error
-        : new RuntimeProtocolError(
-            "RUNTIME_FAILURE",
-            error instanceof Error ? error.message : "Runtime operation failed",
-          );
-    return {
-      response: {
-        id,
-        ok: false,
-        error: { code: protocolError.code, message: protocolError.message },
-      },
-      lease: null,
-    };
-  }
-}
-
-function tokensEqual(left: string, right: string): boolean {
-  const leftBytes = Buffer.from(left);
-  const rightBytes = Buffer.from(right);
-  return leftBytes.length === rightBytes.length && timingSafeEqual(leftBytes, rightBytes);
-}
-
-function isNodeError(error: unknown): error is NodeJS.ErrnoException {
-  return error instanceof Error && "code" in error;
-}
-
-function processIsRunning(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return isNodeError(error) && error.code === "EPERM";
-  }
-}
-
-export async function runStandaloneSupervisor(owner: RuntimeOwner): Promise<void> {
-  const running = await startSupervisorServer(owner);
-  const shutdown = () => void running.close().finally(() => process.exit(0));
-  process.once("SIGINT", shutdown);
-  process.once("SIGTERM", shutdown);
 }

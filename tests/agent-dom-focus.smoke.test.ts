@@ -8,8 +8,9 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { build } from "esbuild";
 import { expect, it, vi } from "vitest";
 import { createRuntimeOwner } from "../server/runtime-owner";
-import { resolveSupervisorPaths, startSupervisorServer } from "../server/supervisor";
 import { SupervisorClient } from "../server/supervisor-client";
+import { resolveSupervisorPaths } from "../server/supervisor-paths";
+import { startSupervisorServer } from "../server/supervisor-server";
 
 // React-like controlled numeric fields: a dirty local draft stays visible until blur,
 // while input updates model history. Undo only synchronizes fields whose draft is clean.
@@ -24,6 +25,11 @@ const fixtureHtml = `<!doctype html><title>Focus and draft fixture</title>
 <label>Disable on focus<input id=disable value=original></label>
 <label>Redirect on focus<input id=redirect value=original></label>
 <label>Replace document on focus<input id=document></label>
+<label>Keyboard anchor<input id=keyboard-anchor></label>
+<button id=keyboard-enabled type=button>Keyboard action</button>
+<button id=keyboard-disabled type=button disabled>Disabled keyboard action</button>
+<label>After disabled action<input id=keyboard-after></label>
+<output id=keyboard-clicks>[]</output><output id=keyboard-events>[]</output>
 <div id=shadow></div><output id=model></output><output id=events></output>
 <script>
 const fields=[document.getElementById('x'),document.getElementById('y')];
@@ -41,10 +47,14 @@ document.getElementById('disable').onfocus=event=>{event.target.disabled=true};
 document.getElementById('redirect').onfocus=()=>document.getElementById('notes').focus();
 document.getElementById('document').onfocus=()=>{document.open();document.write('<title>Replaced</title><h1>Replacement</h1>');document.close()};
 document.getElementById('shadow').attachShadow({mode:'open'}).innerHTML='<label>Shadow<input id=shadow-input></label>';
+const keyboardClicks=[],keyboardEvents=[];
+for(const id of ['keyboard-enabled','keyboard-disabled'])document.getElementById(id).onclick=event=>{keyboardClicks.push({id,active:document.activeElement.id,trusted:event.isTrusted});document.getElementById('keyboard-clicks').textContent=JSON.stringify(keyboardClicks)};
+for(const type of ['keydown','keyup'])document.getElementById('keyboard-enabled').addEventListener(type,event=>{keyboardEvents.push({type,key:event.key,code:event.code,trusted:event.isTrusted});document.getElementById('keyboard-events').textContent=JSON.stringify(keyboardEvents)});
 render();
 </script>`;
 
-it("focuses DOM edits and clicks, commits blur drafts before undo, and rejects focus-time replacement", async () => {
+/** Own a disposable real MCP/supervisor/browser fixture for DOM focus or one native activation key. */
+async function runFocusSmoke(activationKey: "Enter" | "Space" | null = null) {
   if (
     !process.env.PASEO_SHARED_BROWSER_AGENT_BROWSER_BINARY ||
     !process.env.PASEO_SHARED_BROWSER_CHROMIUM_EXECUTABLE
@@ -94,7 +104,11 @@ it("focuses DOM edits and clicks, commits blur drafts before undo, and rejects f
       new StdioClientTransport({
         command: process.execPath,
         args: [bundle],
-        env: { PASEO_HOME: home, PASEO_SHARED_BROWSER_TICKET: ticket },
+        env: {
+          PASEO_HOME: home,
+          PASEO_SHARED_BROWSER_TICKET: ticket,
+          ...(process.env.NODE_OPTIONS ? { NODE_OPTIONS: process.env.NODE_OPTIONS } : {}),
+        },
         stderr: "pipe",
       }),
     );
@@ -121,6 +135,40 @@ it("focuses DOM edits and clicks, commits blur drafts before undo, and rejects f
       model: await inspect("document.querySelector('#model').textContent"),
       events: JSON.parse(await inspect("document.querySelector('#events').textContent")),
     });
+    if (activationKey) {
+      await call("acquire_control");
+      snapshot = await call("snapshot");
+      await action("click", "Keyboard anchor");
+      await call("capture");
+      await call("input", { event: { kind: "key", key: "Tab" } });
+      expect(await inspect("document.activeElement.id")).toBe("keyboard-enabled");
+      expect(await inspect("document.querySelector('#keyboard-enabled').disabled")).toBe(false);
+      await call("capture");
+      await call("input", { event: { kind: "key", key: activationKey } });
+      expect(await inspect("document.activeElement.id")).toBe("keyboard-enabled");
+      expect(
+        JSON.parse(await inspect("document.querySelector('#keyboard-clicks').textContent")),
+      ).toEqual([{ id: "keyboard-enabled", active: "keyboard-enabled", trusted: true }]);
+      const key = activationKey === "Space" ? " " : "Enter";
+      const edges = JSON.parse(
+        await inspect("document.querySelector('#keyboard-events').textContent"),
+      );
+      expect(edges.filter((event: { code: string }) => event.code !== "Tab")).toEqual([
+        { type: "keydown", key, code: activationKey, trusted: true },
+        { type: "keyup", key, code: activationKey, trusted: true },
+      ]);
+      // Native focus traversal skips disabled buttons; the same key cannot activate one.
+      await call("capture");
+      await call("input", { event: { kind: "key", key: "Tab" } });
+      expect(await inspect("document.activeElement.id")).toBe("keyboard-after");
+      expect(await inspect("document.querySelector('#keyboard-disabled').disabled")).toBe(true);
+      await call("capture");
+      await call("input", { event: { kind: "key", key: activationKey } });
+      expect(
+        JSON.parse(await inspect("document.querySelector('#keyboard-clicks').textContent")),
+      ).toEqual([{ id: "keyboard-enabled", active: "keyboard-enabled", trusted: true }]);
+      return;
+    }
     await expect(action("fill", "X", { text: "160" })).rejects.toThrow();
     await call("acquire_control");
     snapshot = await call("snapshot");
@@ -189,4 +237,16 @@ it("focuses DOM edits and clicks, commits blur drafts before undo, and rejects f
     await rm(home, { recursive: true, force: true });
     vi.unstubAllEnvs();
   }
-}, 60_000);
+}
+
+it(
+  "focuses DOM edits and clicks, commits blur drafts before undo, and rejects focus-time replacement",
+  () => runFocusSmoke(),
+  60_000,
+);
+
+it.each(["Enter", "Space"] as const)(
+  "discrete activation %s activates one enabled native button",
+  (key) => runFocusSmoke(key),
+  60_000,
+);

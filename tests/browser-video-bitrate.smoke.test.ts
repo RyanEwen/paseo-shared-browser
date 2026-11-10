@@ -30,7 +30,8 @@ it("decodes 48 and 96 Mbps cohorts at the desktop size without replacing its sou
       });
       // Commit restored emulation after navigation before opening a fenced track.
       await owner.request(source, "state", null);
-      const page = (source.runtime as unknown as { page: CdpSession }).page;
+      const page = (source.runtime as unknown as { attachment: { page: CdpSession } }).attachment
+        .page;
       const targetId = page.targetId;
       for (const bitrate of [48_000_000, 96_000_000]) {
         let packet: NativeVideoPacket | undefined;

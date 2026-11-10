@@ -2,6 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { createLazyRuntimeOwner } from "./lazy-runtime-owner";
 import { createRuntimeGraphicsSettings } from "./runtime-graphics-settings";
 import { createRuntimeOwner } from "./runtime-owner";
 import { RuntimeLostError } from "./runtime-protocol";
@@ -206,6 +207,66 @@ it("supplies private display environment only to opted-in hidden runtime creatio
   expect(fake.shutdown).toHaveBeenCalledTimes(1);
   expect(fake.stop).toHaveBeenCalledTimes(1);
 });
+
+it("releases its private display when first-page authority expires during preparation", async () => {
+  vi.stubEnv("PASEO_SHARED_BROWSER_XVFB", "1");
+  const beforeLaunch = vi.fn(() => {
+    throw new Error("Viewer expired before launch");
+  });
+  fake.launch.mockImplementation(async () => {
+    const options = fake.runtime.mock.calls.at(-1)![0] as { beforeLaunch(): void };
+    options.beforeLaunch();
+  });
+  const owner = await createRuntimeOwner({ nativeVideo: false });
+  await expect(owner.create("expired-launch", { beforeLaunch })).rejects.toThrow(
+    "Viewer expired before launch",
+  );
+  expect(beforeLaunch).toHaveBeenCalledTimes(1);
+  expect(fake.shutdown).toHaveBeenCalledTimes(1);
+  expect(fake.stop).toHaveBeenCalledTimes(1);
+});
+
+it.each([false, true])(
+  "retains failed display cleanup and refuses lazy replacement (browser cleanup fails: %s)",
+  async (browserCleanupFails) => {
+    vi.stubEnv("PASEO_SHARED_BROWSER_XVFB", "1");
+    const launchFailure = new Error("fixture launch failure");
+    const displayFailure = new Error("fixture display cleanup failure");
+    const browserFailure = new Error("fixture browser cleanup failure");
+    fake.launch.mockRejectedValue(launchFailure);
+    fake.stop.mockRejectedValue(displayFailure);
+    if (browserCleanupFails) fake.shutdown.mockRejectedValue(browserFailure);
+    let startupFailure: unknown;
+    const owner = createLazyRuntimeOwner(async (workspaceId) => {
+      const processOwner = await createRuntimeOwner({ nativeVideo: false });
+      try {
+        return { owner: processOwner, runtime: await processOwner.create(workspaceId) };
+      } catch (error) {
+        startupFailure = error;
+        throw error;
+      }
+    });
+    const reservation = await owner.create("failed-display-cleanup");
+    await expect(owner.request(reservation, "tabs.create", null)).rejects.toThrow(
+      "Browser startup failed",
+    );
+    expect(startupFailure).toBeInstanceOf(AggregateError);
+    expect(startupFailure).toMatchObject({
+      errors: [launchFailure, ...(browserCleanupFails ? [browserFailure] : []), displayFailure],
+    });
+    // stop() retries the exact cleanup; replacement stays refused while it still fails.
+    await expect(owner.stop(reservation)).rejects.toThrow("replacement is refused");
+    expect(fake.runtime).toHaveBeenCalledTimes(1);
+    expect(fake.shutdown).toHaveBeenCalledTimes(2);
+    // Every cleanup step is attempted again, even when browser shutdown still fails.
+    expect(fake.stop).toHaveBeenCalledTimes(2);
+
+    // Once a retry confirms cleanup, the reservation stops normally.
+    fake.shutdown.mockResolvedValue(undefined);
+    fake.stop.mockResolvedValue(undefined);
+    await expect(owner.stop(reservation)).resolves.toBeUndefined();
+  },
+);
 
 it("prepares video while Off and applies the durable choice without creating another runtime", async () => {
   const home = await mkdtemp(join(tmpdir(), "shared-browser-owner-video-"));

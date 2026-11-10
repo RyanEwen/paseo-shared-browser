@@ -32,8 +32,8 @@ import type { BrowserVideoReadInput, BrowserVideoReadReply } from "../shared/bro
 import { createBrowserOperationDiagnostics } from "./browser-operation-diagnostics";
 import { resolveBrowserRuntimeRoot } from "./runtime-path";
 import type { JsonValue } from "./runtime-protocol";
-import { resolveSupervisorPaths } from "./supervisor";
 import { SupervisorClient } from "./supervisor-client";
+import { resolveSupervisorPaths } from "./supervisor-paths";
 
 export type {
   BrowserRuntimeClient,

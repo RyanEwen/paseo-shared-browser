@@ -30,7 +30,8 @@ it.each(["headless", "xvfb", "wayland"] as const)(
       await withIsolatedBrowser(
         async (owner, owned) => {
           const rootId = owned.rootTargetId!;
-          const page = () => (owned.runtime as unknown as { page: CdpSession }).page;
+          const page = () =>
+            (owned.runtime as unknown as { attachment: { page: CdpSession } }).attachment.page;
           const inspect = async <T>(session: CdpSession, expression: string): Promise<T> => {
             const result = await session.send<{ result: { value: T }; exceptionDetails?: unknown }>(
               "Runtime.evaluate",
@@ -60,7 +61,8 @@ it.each(["headless", "xvfb", "wayland"] as const)(
           await owner.request(owned, "navigate", { targetId: created.targetId, url });
           await emulate(created.targetId);
           const second = await owned.tabs.get(created.targetId)!;
-          const secondPage = (second as unknown as { page: CdpSession }).page;
+          const secondPage = (second as unknown as { attachment: { page: CdpSession } }).attachment
+            .page;
           expect(
             await inspect(
               secondPage,
@@ -90,7 +92,8 @@ it.each(["headless", "xvfb", "wayland"] as const)(
           });
           await owner.request(owned, "identity", { targetId: popupId });
           const popup = await owned.tabs.get(popupId)!;
-          const popupPage = (popup as unknown as { page: CdpSession }).page;
+          const popupPage = (popup as unknown as { attachment: { page: CdpSession } }).attachment
+            .page;
           expect(
             await inspect(
               popupPage,
@@ -221,8 +224,9 @@ it.each(["headless", "xvfb", "wayland"] as const)(
           // recover management after the pinned launch page has already been closed.
           await owner.request(owned, "tabs.close", { targetId: rootId });
           expect(owned.rootTargetId).toBeNull();
-          const management = (owned.runtime as unknown as { connection: { close(): void } })
-            .connection;
+          const management = (
+            owned.runtime as unknown as { attachment: { connection: { close(): void } } }
+          ).attachment.connection;
           management.close();
           const transport = vi.spyOn(CdpConnection.prototype, "send");
           await expect(
@@ -231,8 +235,13 @@ it.each(["headless", "xvfb", "wayland"] as const)(
           await expect(
             owner.request(owned, "state", { targetId: created.targetId }),
           ).resolves.toMatchObject({ url });
-          expect((owned.runtime as unknown as { page: CdpSession | null }).page).toBeNull();
-          expect((owned.runtime as unknown as { targetId: string }).targetId).toBe(rootId);
+          expect(
+            (owned.runtime as unknown as { attachment: { page: CdpSession | null } }).attachment
+              .page,
+          ).toBeNull();
+          expect(
+            (owned.runtime as unknown as { attachment: { targetId: string } }).attachment.targetId,
+          ).toBe(rootId);
           expect(
             transport.mock.calls.some(
               ([method]) => method === "Target.activateTarget" || method === "Page.navigate",

@@ -34,23 +34,20 @@ function fixture() {
     }),
   };
   const control = runtime as unknown as {
-    invoke(args: string[]): Promise<unknown>;
-    assertVersion(): Promise<void>;
     connectCdp(): Promise<void>;
-    captureScreenshot(): Promise<unknown>;
-    page: typeof page | null;
-    heldButtons: Set<string>;
-    heldKeys: Map<string, { key: string; code: string }>;
-    screencastFrame: unknown;
+    cli: { invoke(args: string[]): Promise<unknown>; assertVersion(): Promise<void> };
+    capture: { captureScreenshot(): Promise<unknown>; screencastFrame: unknown };
+    attachment: { page: typeof page | null };
+    input: { heldButtons: Set<string>; heldKeys: Map<string, { key: string; code: string }> };
   };
-  Object.assign(runtime, {
+  Object.assign((runtime as unknown as { attachment: object }).attachment, {
     page,
     connection,
     emulationAppliedPage: page,
     viewport: { width: 1280, height: 800, deviceScaleFactor: 1, mobile: false, touch: false },
   });
-  control.invoke = vi.fn(async () => ({ cdpUrl: "ws://127.0.0.1:1/fixture" }));
-  control.assertVersion = vi.fn(async () => {});
+  control.cli.invoke = vi.fn(async () => ({ cdpUrl: "ws://127.0.0.1:1/fixture" }));
+  control.cli.assertVersion = vi.fn(async () => {});
   return { runtime, control, page, connection };
 }
 
@@ -78,7 +75,7 @@ it.each(["Page.enable", "Page.getNavigationHistory"])(
     expect(await result).toMatchObject({ message: "Browser runtime is shutting down" });
     expect(reconnect).not.toHaveBeenCalled();
     expect(page.send.mock.calls.some(([method]) => method === "Page.startScreencast")).toBe(false);
-    expect(control.invoke).toHaveBeenCalledTimes(1);
+    expect(control.cli.invoke).toHaveBeenCalledTimes(1);
   },
 );
 
@@ -93,7 +90,7 @@ it("optional frame startup rejects shutdown without attempting screenshot fallba
     }
     return {};
   });
-  const fallback = vi.spyOn(control, "captureScreenshot");
+  const fallback = vi.spyOn(control.capture, "captureScreenshot");
   const result = runtime.frame(1024, DEFAULT_JPEG_QUALITY, 0).catch((error: unknown) => error);
   await entered.promise;
   await runtime.shutdown();
@@ -120,7 +117,7 @@ it("a screenshot-only read cannot publish late pixels or capture after blocked m
   blocked.resolve();
   expect(await result).toMatchObject({ message: "Browser runtime is shutting down" });
   expect(page.send.mock.calls.some(([method]) => method === "Page.captureScreenshot")).toBe(false);
-  expect(control.screencastFrame).toBeNull();
+  expect(control.capture.screencastFrame).toBeNull();
 });
 
 it("an already dispatched screenshot cannot cache or return its late bytes after shutdown", async () => {
@@ -151,7 +148,7 @@ it("reconnect paused at version discovery cannot invoke native connection after 
   const { runtime, control } = fixture();
   const entered = Promise.withResolvers<void>();
   const blocked = Promise.withResolvers<void>();
-  control.assertVersion = vi.fn(async () => {
+  control.cli.assertVersion = vi.fn(async () => {
     entered.resolve();
     await blocked.promise;
   });
@@ -160,8 +157,8 @@ it("reconnect paused at version discovery cannot invoke native connection after 
   await runtime.shutdown();
   blocked.resolve();
   expect(await result).toMatchObject({ message: "Browser runtime is shutting down" });
-  expect(control.invoke).toHaveBeenCalledTimes(1);
-  expect(control.invoke).toHaveBeenCalledWith([
+  expect(control.cli.invoke).toHaveBeenCalledTimes(1);
+  expect(control.cli.invoke).toHaveBeenCalledWith([
     "--session",
     "jpeg-shutdown-test",
     "--json",
@@ -185,13 +182,13 @@ it("late opened CDP connection is closed without publication or target attachmen
   expect(await result).toMatchObject({ message: "Browser runtime is shutting down" });
   expect(late.close).toHaveBeenCalledTimes(1);
   expect(late.send).not.toHaveBeenCalled();
-  expect(control.page).toBeNull();
+  expect(control.attachment.page).toBeNull();
 });
 
 it("shutdown still releases original held input, then all fresh acquisition stays closed", async () => {
   const { runtime, page, control } = fixture();
-  control.heldButtons.add("left");
-  control.heldKeys.set("ControlLeft", { key: "Control", code: "ControlLeft" });
+  control.input.heldButtons.add("left");
+  control.input.heldKeys.set("ControlLeft", { key: "Control", code: "ControlLeft" });
   await runtime.shutdown();
   expect(page.send).toHaveBeenCalledWith(
     "Input.dispatchMouseEvent",
@@ -206,5 +203,5 @@ it("shutdown still releases original held input, then all fresh acquisition stay
   await expect(runtime.reconnect()).rejects.toThrow("shutting down");
   await expect(runtime.launch()).rejects.toThrow("shutting down");
   await expect(runtime.frame(1024, DEFAULT_JPEG_QUALITY, 0)).rejects.toThrow("closed");
-  expect(control.invoke).toHaveBeenCalledTimes(1);
+  expect(control.cli.invoke).toHaveBeenCalledTimes(1);
 });

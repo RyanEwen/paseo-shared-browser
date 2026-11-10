@@ -38,19 +38,23 @@ class ConnectionFixture extends EventEmitter {
 }
 
 interface RuntimeControl {
-  connection: CdpConnection;
-  page: CdpSession | null;
-  targetId: string | null;
-  viewport: DeviceEmulation;
-  emulationAppliedPage: CdpSession | null;
-  screencastActive: boolean;
-  screencastFrame: unknown;
-  attachmentGeneration: number;
-  assertVersion(): Promise<void>;
+  attachment: {
+    connection: CdpConnection;
+    page: CdpSession | null;
+    targetId: string | null;
+    viewport: DeviceEmulation;
+    emulationAppliedPage: CdpSession | null;
+    attachmentGeneration: number;
+  };
+  capture: {
+    screencastActive: boolean;
+    screencastFrame: unknown;
+    onScreencastFrame(page: CdpSession, event: unknown): void;
+  };
+  cli: { assertVersion(): Promise<void> };
   connectCdp(targetId?: string): Promise<void>;
   requirePage(): Promise<CdpSession>;
   reattachPageForScreencast(previous: CdpSession): Promise<CdpSession>;
-  onScreencastFrame(page: CdpSession, event: unknown): void;
 }
 
 const pixel: DeviceEmulation = {
@@ -66,10 +70,11 @@ const pixel: DeviceEmulation = {
 };
 
 const generation = (runtime: AgentBrowserRuntime) => {
-  const { attachmentGeneration, documentGeneration } = runtime as unknown as {
-    attachmentGeneration: number;
-    documentGeneration: number;
-  };
+  const { attachmentGeneration, documentGeneration } = (
+    runtime as unknown as {
+      attachment: { attachmentGeneration: number; documentGeneration: number };
+    }
+  ).attachment;
   return `${attachmentGeneration}:${documentGeneration}`;
 };
 
@@ -85,7 +90,7 @@ function fixture() {
   const typedConnection = connection as unknown as CdpConnection;
   const previous = new CdpSession(typedConnection, "previous", "a");
   const control = runtime as unknown as RuntimeControl;
-  Object.assign(control, {
+  Object.assign(control.attachment, {
     connection: typedConnection,
     page: previous,
     targetId: "a",
@@ -101,14 +106,14 @@ it("never releases input held on an older attachment onto a later one during scr
   await runtime.mouseDown(10, 20, "left", 1, "old-channel");
   // Real reconnect + target publication; only transport setup is replaced.
   const reconnected = new ConnectionFixture();
-  control.assertVersion = async () => {};
+  control.cli.assertVersion = async () => {};
   control.connectCdp = async () => {
-    control.connection = reconnected as unknown as CdpConnection;
+    control.attachment.connection = reconnected as unknown as CdpConnection;
     await runtime.selectTarget("b");
   };
   await runtime.reconnect();
   expect(connection.isOpen).toBe(false);
-  await control.reattachPageForScreencast(control.page!);
+  await control.reattachPageForScreencast(control.attachment.page!);
   expect(reconnected.calls.filter((call) => call.params.type === "mouseReleased")).toEqual([]);
   await runtime.endLiveInput("old-channel");
 });
@@ -131,13 +136,13 @@ it("does not retarget ungestured held input from a replaced attachment onto its 
   const { runtime, connection, control } = fixture();
   await runtime.mouseDown(10, 20, "left", 1);
   const reconnected = new ConnectionFixture();
-  control.assertVersion = async () => {};
+  control.cli.assertVersion = async () => {};
   control.connectCdp = async () => {
-    control.connection = reconnected as unknown as CdpConnection;
+    control.attachment.connection = reconnected as unknown as CdpConnection;
     await runtime.selectTarget("b");
   };
   await runtime.reconnect();
   expect(connection.isOpen).toBe(false);
-  await control.reattachPageForScreencast(control.page!);
+  await control.reattachPageForScreencast(control.attachment.page!);
   expect(reconnected.calls.filter((call) => call.params.type === "mouseReleased")).toEqual([]);
 });

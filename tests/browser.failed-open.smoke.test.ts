@@ -64,7 +64,7 @@ it.skipIf(process.platform !== "linux")(
       session: "failed-open",
       initialUrl: await refusedOrigin(),
     });
-    const nonce = (runtime as unknown as { ownerNonce: string }).ownerNonce;
+    const nonce = (runtime as unknown as { daemon: { ownerNonce: string } }).daemon.ownerNonce;
     await expect(runtime.launch()).rejects.toThrow();
     // Failed creation cleanup must observe, stop and confirm the owned daemon.
     await runtime.shutdown();

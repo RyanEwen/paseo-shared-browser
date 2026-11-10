@@ -66,20 +66,22 @@ function fixture() {
       return {};
     }),
   });
-  Object.assign(runtime, {
+  Object.assign((runtime as unknown as { attachment: object }).attachment, {
     page,
     connection,
     emulationAppliedPage: page,
-    screencastActive: true,
     viewport: { width: 1280, height: 800, deviceScaleFactor: 1, mobile: false, touch: false },
   });
+  Object.assign((runtime as unknown as { capture: object }).capture, { screencastActive: true });
   const internal = runtime as unknown as {
-    invalidateScreencastFrame(): void;
-    onScreencastFrame(page: unknown, event: unknown): void;
     bindPageEvents(page: unknown): Promise<void>;
+    capture: {
+      invalidateScreencastFrame(): void;
+      onScreencastFrame(page: unknown, event: unknown): void;
+    };
   };
   const emit = (sourceMs: number | undefined, tag = 1) =>
-    internal.onScreencastFrame(page, {
+    internal.capture.onScreencastFrame(page, {
       data: jpeg(tag),
       sessionId: 17,
       metadata: {
@@ -115,7 +117,7 @@ it.each([20, 10_000])(
   async (ageMs) => {
     const { runtime, internal, page, emit } = fixture();
     const sourceMs = Date.now() - ageMs;
-    internal.invalidateScreencastFrame();
+    internal.capture.invalidateScreencastFrame();
     emit(sourceMs);
     const frame = await readFrame(runtime);
     expect(frame.transport).toBe("screenshot");
@@ -128,7 +130,7 @@ it.each([0, 20, 50])(
   "post-input source offset +%sms cannot borrow clock tolerance to authorize old pixels",
   async (offsetMs) => {
     const { runtime, internal, page, emit } = fixture();
-    internal.invalidateScreencastFrame();
+    internal.capture.invalidateScreencastFrame();
     emit(Date.now() + offsetMs);
     const frame = await readFrame(runtime);
     expect(frame.transport).toBe("screenshot");
@@ -139,7 +141,7 @@ it.each([0, 20, 50])(
 
 it("a genuinely later swap beyond post-input uncertainty keeps its native timestamp", async () => {
   const { runtime, internal, emit } = fixture();
-  internal.invalidateScreencastFrame();
+  internal.capture.invalidateScreencastFrame();
   await vi.advanceTimersByTimeAsync(51);
   const sourceMs = Date.now();
   emit(sourceMs);

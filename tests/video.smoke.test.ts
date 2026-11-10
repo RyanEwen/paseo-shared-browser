@@ -16,8 +16,9 @@ import { attachToTarget, type CdpConnection, type CdpSession } from "../server/c
 import { createRuntimeOwner } from "../server/runtime-owner";
 import { resolveBrowserRuntimeRoot } from "../server/runtime-path";
 import { createRuntimeVideoSettings } from "../server/runtime-video-settings";
-import { resolveSupervisorPaths, startSupervisorServer } from "../server/supervisor";
 import { SupervisorClient } from "../server/supervisor-client";
+import { resolveSupervisorPaths } from "../server/supervisor-paths";
+import { startSupervisorServer } from "../server/supervisor-server";
 import type { BrowserState, DevicePresetId } from "../shared/browser";
 import {
   type BrowserVideoPacket,
@@ -291,9 +292,9 @@ async function proveNativeVideo(pointerKind: "mouse" | "touch") {
     // source pixels. All video bytes below traverse the authenticated public RPC.
     const runtime = (
       owned as unknown as {
-        runtime: { connection: CdpConnection; page: CdpSession };
+        runtime: { attachment: { connection: CdpConnection; page: CdpSession } };
       }
-    ).runtime;
+    ).runtime.attachment;
     const connection = runtime.connection;
     await runtime.page.send("Runtime.evaluate", {
       expression: `window.unsavedDraft={text:"preserve this draft",count:17};

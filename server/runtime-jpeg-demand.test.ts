@@ -51,30 +51,32 @@ function setup() {
   const page = { send: vi.fn(async (_method: string, _params?: unknown) => ({})) };
   let tag = 0;
   const internal = runtime as unknown as {
-    page: typeof page;
     requirePage(): Promise<typeof page>;
-    startScreencastSession(source: typeof page): Promise<void>;
-    onScreencastFrame(source: typeof page, event: unknown): void;
-    captureScreenshot(budget: number, quality: number, preserve?: boolean): Promise<RuntimeFrame>;
-    screencastActive: boolean;
-    invoke(args: string[]): Promise<unknown>;
+    attachment: { page: typeof page };
+    capture: {
+      startScreencastSession(source: typeof page): Promise<void>;
+      onScreencastFrame(source: typeof page, event: unknown): void;
+      captureScreenshot(budget: number, quality: number, preserve?: boolean): Promise<RuntimeFrame>;
+      screencastActive: boolean;
+    };
+    cli: { invoke(args: string[]): Promise<unknown> };
   };
-  Object.assign(runtime, {
+  Object.assign((runtime as unknown as { attachment: object }).attachment, {
     page,
     emulationAppliedPage: page,
     viewport: { width: 1280, height: 800, deviceScaleFactor: 1, mobile: false, touch: false },
   });
   internal.requirePage = vi.fn(async () => page);
   const emit = () =>
-    internal.onScreencastFrame(page, {
+    internal.capture.onScreencastFrame(page, {
       sessionId: 7,
       data: jpeg(++tag),
       metadata: { timestamp: (Date.now() + tag / 1000) / 1000 },
     });
-  internal.startScreencastSession = vi.fn(async () => {
+  internal.capture.startScreencastSession = vi.fn(async () => {
     emit();
   });
-  internal.captureScreenshot = vi.fn(
+  internal.capture.captureScreenshot = vi.fn(
     async (): Promise<RuntimeFrame> => ({
       width: 1280,
       height: 800,
@@ -96,27 +98,27 @@ async function readFrame(runtime: AgentBrowserRuntime, quality: number = DEFAULT
 
 it("lazy image/agent read starts shared JPEG once, idle video-only interval stops it, fresh read restarts", async () => {
   const { runtime, internal, page, emit } = setup();
-  expect(internal.startScreencastSession).not.toHaveBeenCalled();
+  expect(internal.capture.startScreencastSession).not.toHaveBeenCalled();
   const first = await readFrame(runtime);
   await vi.advanceTimersByTimeAsync(1500);
   emit();
   await readFrame(runtime);
-  expect(internal.startScreencastSession).toHaveBeenCalledTimes(1);
+  expect(internal.capture.startScreencastSession).toHaveBeenCalledTimes(1);
   await vi.advanceTimersByTimeAsync(JPEG_CAPTURE_IDLE_MS);
   expect(page.send).toHaveBeenCalledWith("Page.stopScreencast", {}, { mutation: true });
-  expect(internal.screencastActive).toBe(false);
+  expect(internal.capture.screencastActive).toBe(false);
   const renewed = await readFrame(runtime);
-  expect(internal.startScreencastSession).toHaveBeenCalledTimes(2);
+  expect(internal.capture.startScreencastSession).toHaveBeenCalledTimes(2);
   expect(renewed.dataBase64).not.toBe(first.dataBase64);
   await runtime.stopScreencast();
 });
 it("nonmatching viewer quality stays screenshot-only and cannot keep JPEG95 running", async () => {
   const { runtime, internal } = setup();
   for (const quality of [70, 90, 100]) await readFrame(runtime, quality);
-  expect(internal.startScreencastSession).not.toHaveBeenCalled();
-  expect(internal.captureScreenshot).toHaveBeenCalledTimes(3);
+  expect(internal.capture.startScreencastSession).not.toHaveBeenCalled();
+  expect(internal.capture.captureScreenshot).toHaveBeenCalledTimes(3);
   await vi.advanceTimersByTimeAsync(JPEG_CAPTURE_IDLE_MS);
-  expect(internal.screencastActive).toBe(false);
+  expect(internal.capture.screencastActive).toBe(false);
 });
 it("switching to screenshot-only quality does not renew the former shared stream", async () => {
   const { runtime, internal } = setup();
@@ -125,14 +127,14 @@ it("switching to screenshot-only quality does not renew the former shared stream
     await vi.advanceTimersByTimeAsync(500);
     await readFrame(runtime, 100);
   }
-  expect(internal.screencastActive).toBe(false);
-  expect(internal.startScreencastSession).toHaveBeenCalledTimes(1);
+  expect(internal.capture.screencastActive).toBe(false);
+  expect(internal.capture.startScreencastSession).toHaveBeenCalledTimes(1);
 });
 
 it("stream startup and screenshot completion both pin retirement beyond the idle deadline", async () => {
   const { runtime, internal, page, emit } = setup();
   const startup = Promise.withResolvers<void>();
-  internal.startScreencastSession = vi.fn(async () => {
+  internal.capture.startScreencastSession = vi.fn(async () => {
     await startup.promise;
     emit();
   });
@@ -142,10 +144,10 @@ it("stream startup and screenshot completion both pin retirement beyond the idle
   startup.resolve();
   await read;
   const screenshot = Promise.withResolvers<RuntimeFrame>();
-  internal.captureScreenshot = vi.fn(() => screenshot.promise);
+  internal.capture.captureScreenshot = vi.fn(() => screenshot.promise);
   const fallback = runtime.frame(100, 100, 0);
   await vi.advanceTimersByTimeAsync(10000);
-  expect(internal.screencastActive).toBe(true);
+  expect(internal.capture.screencastActive).toBe(true);
   screenshot.resolve({
     width: 1280,
     height: 800,
@@ -156,7 +158,7 @@ it("stream startup and screenshot completion both pin retirement beyond the idle
   });
   await fallback;
   await vi.advanceTimersByTimeAsync(JPEG_CAPTURE_IDLE_MS);
-  expect(internal.screencastActive).toBe(false);
+  expect(internal.capture.screencastActive).toBe(false);
 });
 it("renewed read waits for exact old stop acknowledgment before restarting", async () => {
   const { runtime, internal, page } = setup();
@@ -168,31 +170,31 @@ it("renewed read waits for exact old stop acknowledgment before restarting", asy
   await vi.advanceTimersByTimeAsync(JPEG_CAPTURE_IDLE_MS);
   const renewed = runtime.frame(100, DEFAULT_JPEG_QUALITY, 0);
   await vi.advanceTimersByTimeAsync(100);
-  expect(internal.startScreencastSession).toHaveBeenCalledTimes(1);
+  expect(internal.capture.startScreencastSession).toHaveBeenCalledTimes(1);
   stop.resolve({});
   await vi.advanceTimersByTimeAsync(0);
   await renewed;
-  expect(internal.startScreencastSession).toHaveBeenCalledTimes(2);
+  expect(internal.capture.startScreencastSession).toHaveBeenCalledTimes(2);
   await runtime.stopScreencast();
 });
 it("failed optional stream falls back without setup retry every image poll; idle renew permits new setup", async () => {
   const { runtime, internal } = setup();
-  internal.startScreencastSession = vi.fn(async () => {
+  internal.capture.startScreencastSession = vi.fn(async () => {
     throw new Error("unsupported stream");
   });
   await readFrame(runtime);
   await readFrame(runtime);
-  expect(internal.startScreencastSession).toHaveBeenCalledTimes(1);
-  expect(internal.captureScreenshot).toHaveBeenCalledTimes(2);
+  expect(internal.capture.startScreencastSession).toHaveBeenCalledTimes(1);
+  expect(internal.capture.captureScreenshot).toHaveBeenCalledTimes(2);
   await vi.advanceTimersByTimeAsync(JPEG_CAPTURE_IDLE_MS);
   await readFrame(runtime);
-  expect(internal.startScreencastSession).toHaveBeenCalledTimes(2);
+  expect(internal.capture.startScreencastSession).toHaveBeenCalledTimes(2);
   await runtime.stopScreencast();
 });
 it("shutdown cancels runtime-owned JPEG timer even without explicit viewer detach", async () => {
   const { runtime, internal, page } = setup();
   await readFrame(runtime);
-  internal.invoke = vi.fn(async () => ({}));
+  internal.cli.invoke = vi.fn(async () => ({}));
   await runtime.shutdown();
   await vi.advanceTimersByTimeAsync(10000);
   expect(page.send).not.toHaveBeenCalledWith("Page.stopScreencast", {}, { mutation: true });

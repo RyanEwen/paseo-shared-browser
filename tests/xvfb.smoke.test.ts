@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createRuntimeOwner } from "../server/runtime-owner";
 import { resolveBrowserRuntimeRoot } from "../server/runtime-path";
-import type { JsonValue } from "../server/runtime-protocol";
+import { type JsonValue, RUNTIME_PROTOCOL_VERSION } from "../server/runtime-protocol";
 import { RuntimeSupervisor } from "../server/supervisor";
 import type { BrowserState } from "../shared/browser";
 
@@ -83,7 +83,7 @@ async function harness(env: Record<string, string | undefined>, virtualDisplay?:
   const lease = supervisor.claimBridge("xvfb-smoke");
   const request = async <T>(operation: string, input: unknown): Promise<T> =>
     (await supervisor.dispatch({
-      version: 2,
+      version: RUNTIME_PROTOCOL_VERSION,
       id: "xvfb-smoke",
       token: "unused-by-direct-fixture",
       bridgeId: "xvfb-smoke",

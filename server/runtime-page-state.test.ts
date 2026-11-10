@@ -37,13 +37,15 @@ function fixture() {
     },
   };
   const control = runtime as unknown as {
-    page: typeof page;
-    attachmentGeneration: number;
-    documentGeneration: number;
-    stopping: boolean;
     requirePage(): Promise<typeof page>;
+    attachment: {
+      page: typeof page;
+      attachmentGeneration: number;
+      documentGeneration: number;
+      stopping: boolean;
+    };
   };
-  control.page = page;
+  control.attachment.page = page;
   control.requirePage = async () => page;
   return {
     runtime,
@@ -72,7 +74,7 @@ describe("fresh parallel native page metadata", () => {
     const f = fixture();
     const pending = f.runtime.state();
     await f.readsStarted;
-    f.control.documentGeneration++;
+    f.control.attachment.documentGeneration++;
     f.retryHistory.resolve({
       currentIndex: 0,
       entries: [{ url: "https://example.test/new", title: "New history" }],
@@ -132,10 +134,10 @@ describe("fresh parallel native page metadata", () => {
       const f = fixture();
       const pending = f.runtime.state();
       await f.readsStarted;
-      if (kind === "shutdown") f.control.stopping = true;
-      if (kind === "attachment") f.control.attachmentGeneration++;
+      if (kind === "shutdown") f.control.attachment.stopping = true;
+      if (kind === "attachment") f.control.attachment.attachmentGeneration++;
       if (kind === "page")
-        f.control.page = { send: () => Promise.resolve({}) } as unknown as typeof f.page;
+        f.control.attachment.page = { send: () => Promise.resolve({}) } as unknown as typeof f.page;
       f.history.resolve({ currentIndex: 1, entries });
       f.metadata.resolve({ result: { value: { title: "Obsolete document" } } });
       await expect(pending).rejects.toThrow(
@@ -147,11 +149,11 @@ describe("fresh parallel native page metadata", () => {
   it("refuses repeated document changes after exactly two read pairs", async () => {
     const f = fixture();
     f.intercept((method, attempt) => {
-      if (method === "Runtime.evaluate" && attempt === 1) f.control.documentGeneration++;
+      if (method === "Runtime.evaluate" && attempt === 1) f.control.attachment.documentGeneration++;
     });
     const pending = f.runtime.state();
     await f.readsStarted;
-    f.control.documentGeneration++;
+    f.control.attachment.documentGeneration++;
     f.history.resolve({ currentIndex: 1, entries });
     f.metadata.resolve({ result: {} });
     f.retryHistory.resolve({ currentIndex: 0, entries });
@@ -168,7 +170,7 @@ describe("fresh parallel native page metadata", () => {
       const pending = f.runtime.state({ timeoutMs: 1_000 });
       await f.readsStarted;
       clock += 700;
-      f.control.documentGeneration++;
+      f.control.attachment.documentGeneration++;
       f.history.resolve({ currentIndex: 1, entries });
       f.metadata.resolve({ result: {} });
       f.retryHistory.resolve({ currentIndex: 0, entries });
@@ -190,7 +192,7 @@ describe("fresh parallel native page metadata", () => {
       const pending = f.runtime.state({ timeoutMs: 1_000 });
       await f.readsStarted;
       clock += 1_000;
-      f.control.documentGeneration++;
+      f.control.attachment.documentGeneration++;
       f.history.resolve({ currentIndex: 1, entries });
       f.metadata.resolve({ result: {} });
       await expect(pending).rejects.toThrow("metadata observation timed out");
@@ -214,7 +216,7 @@ describe("fresh parallel native page metadata", () => {
         await f.readsStarted;
         if (phase === "second") {
           clock += 700;
-          f.control.documentGeneration++;
+          f.control.attachment.documentGeneration++;
           f.history.resolve({ currentIndex: 1, entries });
           f.metadata.resolve({ result: {} });
           await secondStarted.promise;
@@ -241,7 +243,7 @@ describe("fresh parallel native page metadata", () => {
       const pending = f.runtime.state();
       const refusal = expect(pending).rejects.toThrow("Read unavailable");
       await f.readsStarted;
-      f.control.documentGeneration++;
+      f.control.attachment.documentGeneration++;
       if (failed === "history") f.history.reject(new Error("Read unavailable"));
       else f.history.resolve({ currentIndex: 1, entries });
       if (failed === "metadata") f.metadata.reject(new Error("Read unavailable"));

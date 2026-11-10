@@ -110,7 +110,13 @@ const TextInput = React.forwardRef((props, ref) =>
     ref,
     "aria-label": props.accessibilityLabel,
     value: props.value ?? "",
-    readOnly: true,
+    readOnly: props.editable === false,
+    onInput: (event) => props.onChangeText?.(event.currentTarget.value),
+    onKeyDown: (event) => {
+      if (event.key === "Enter") props.onSubmitEditing?.();
+    },
+    onFocus: props.onFocus,
+    onBlur: props.onBlur,
     placeholder: props.placeholder,
   }),
 );

@@ -7,9 +7,9 @@ import { browserTabCloseScopeSchema, browserTabIdSchema } from "../shared/browse
 import { DEVICE_PRESET_IDS } from "../shared/device-presets";
 import { MAX_VIEWPORT, MIN_VIEWPORT } from "../shared/viewport-limits";
 import { registerDomTools } from "./agent-dom-tools";
-import type { JsonValue } from "./runtime-protocol";
-import { resolveSupervisorPaths } from "./supervisor";
+import { isJsonObject, type JsonValue, requireJsonObject } from "./runtime-protocol";
 import { AgentSupervisorClient } from "./supervisor-client";
+import { resolveSupervisorPaths } from "./supervisor-paths";
 
 const TICKET_ENV = "PASEO_SHARED_BROWSER_TICKET";
 
@@ -67,9 +67,10 @@ function paseoHome(): string {
 }
 
 function asObject(value: JsonValue): Record<string, JsonValue> {
-  if (!value || typeof value !== "object" || Array.isArray(value))
-    throw new Error("Shared Browser supervisor returned an invalid response");
-  return value;
+  return requireJsonObject(
+    value,
+    () => new Error("Shared Browser supervisor returned an invalid response"),
+  );
 }
 
 function textResult(value: JsonValue) {
@@ -112,7 +113,7 @@ async function main(): Promise<void> {
     "shared_browser_open",
     {
       description:
-        "Explicitly start or reopen this agent's workspace browser and reconnect. Reuses an already running profile and tabs without navigation or control takeover. A previously closed browser starts a new runtime; unsaved drafts from a stopped runtime cannot be recovered.",
+        "Explicitly open or reopen this agent's workspace and reconnect. An empty workspace stays empty until navigate or tab_open creates a page. Reuses existing tabs without navigation or control takeover. Saved site data is retained; drafts from a stopped runtime cannot be recovered.",
       inputSchema: z.object({}),
       annotations: {
         readOnlyHint: false,
@@ -127,7 +128,7 @@ async function main(): Promise<void> {
     "shared_browser_status",
     {
       description:
-        "Read the current shared browser state and effective agent timing policy. Agent screenshots last one minute; agent viewer/control idle budgets are five minutes, with immediate human takeover.",
+        "Read workspace browser state without creating a page or launching Chromium. Empty workspaces report status empty; use navigate with a URL or tab_open for the first page. Agent screenshots last one minute; viewer/control idle budgets are five minutes, with immediate human takeover.",
       inputSchema: z.object({}),
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
@@ -164,7 +165,7 @@ async function main(): Promise<void> {
           ),
         },
       ];
-      if (frame && typeof frame === "object" && !Array.isArray(frame)) {
+      if (isJsonObject(frame)) {
         const image = frame as Record<string, JsonValue>;
         if (typeof image.dataBase64 === "string" && typeof image.mimeType === "string")
           content.push({

@@ -8,8 +8,9 @@ import { expect, it } from "vitest";
 import type { BrowserFrame, BrowserState } from "../shared/browser";
 import type { BrowserVideoReadReply } from "../shared/browser-video";
 import { RuntimeProtocolError } from "./runtime-protocol";
-import { resolveSupervisorPaths, startSupervisorServer } from "./supervisor";
 import { SupervisorClient } from "./supervisor-client";
+import { resolveSupervisorPaths } from "./supervisor-paths";
+import { startSupervisorServer } from "./supervisor-server";
 
 it("keeps video past unrelated teardown and input past video on the authenticated socket", async () => {
   const home = await mkdtemp(join(tmpdir(), "owned-video-socket-"));

@@ -11,7 +11,8 @@ import type { CdpSession } from "../server/cdp";
 import { createRuntimeGraphicsSettings } from "../server/runtime-graphics-settings";
 import { createRuntimeOwner } from "../server/runtime-owner";
 import { RUNTIME_PROTOCOL_VERSION } from "../server/runtime-protocol";
-import { resolveSupervisorPaths, startSupervisorServer } from "../server/supervisor";
+import { resolveSupervisorPaths } from "../server/supervisor-paths";
+import { startSupervisorServer } from "../server/supervisor-server";
 import type { BrowserState, BrowserTab } from "../shared/browser";
 import { isPrintPreviewUrl } from "../shared/browser-page";
 
@@ -52,7 +53,10 @@ it.each(["human", "agent"] as const)(
         ...owner,
         create: async (workspaceId) => {
           const runtime = await owner.create(workspaceId);
-          pages.set(workspaceId, (runtime.runtime as unknown as { page: CdpSession }).page);
+          pages.set(
+            workspaceId,
+            (runtime.runtime as unknown as { attachment: { page: CdpSession } }).attachment.page,
+          );
           return runtime;
         },
         stop: async (runtime) => {

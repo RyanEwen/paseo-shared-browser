@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -26,5 +26,23 @@ test("private in-checkout staging excludes credentials and recovery archives", a
     await assert.rejects(stageDevelopmentPlugin(root, root), /overlaps/);
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("refuses an overlapping target reached through a linked path", async () => {
+  const real = await mkdtemp(join(tmpdir(), "browser-stage-real-"));
+  const links = await mkdtemp(join(tmpdir(), "browser-stage-link-"));
+  try {
+    await mkdir(join(real, "client"));
+    const linked = join(links, "checkout");
+    // A junction needs no extra privilege on Windows; other platforms ignore the type.
+    await symlink(real, linked, "junction");
+    await assert.rejects(
+      stageDevelopmentPlugin(real, join(linked, "client", "staged")),
+      /overlaps/,
+    );
+  } finally {
+    await rm(links, { recursive: true, force: true });
+    await rm(real, { recursive: true, force: true });
   }
 });

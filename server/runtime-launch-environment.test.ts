@@ -40,8 +40,7 @@ async function fixture(launchEnvironment?: Readonly<Record<string, string>>) {
     ...(launchEnvironment ? { launchEnvironment } : {}),
   });
   const native = runtime as unknown as {
-    assertVersion(): Promise<void>;
-    invoke(args: string[]): Promise<unknown>;
+    cli: { assertVersion(): Promise<void>; invoke(args: string[]): Promise<unknown> };
   };
   /** Environment the owned CLI child received for the call with these arguments. */
   const launched = (args: string[]) => {
@@ -66,7 +65,7 @@ describe("trusted private display launch environment", () => {
       WAYLAND_DISPLAY: "wayland-1",
       XDG_RUNTIME_DIR: "/tmp/owned-wayland",
     });
-    await f.native.invoke(["wayland-launch"]);
+    await f.native.cli.invoke(["wayland-launch"]);
     expect(f.launched(["wayland-launch"])).toMatchObject({
       display: null,
       authority: null,
@@ -87,9 +86,9 @@ describe("trusted private display launch environment", () => {
     const environment = { DISPLAY: ":24701", XAUTHORITY: "/tmp/owned-private-auth" };
     const f = await fixture(environment);
     environment.DISPLAY = ":24702";
-    await f.native.assertVersion();
+    await f.native.cli.assertVersion();
     for (const args of [["owned-request"], ["owned-reconnect"], ["--version"]]) {
-      if (args[0] !== "--version") await f.native.invoke(args);
+      if (args[0] !== "--version") await f.native.cli.invoke(args);
       expect(f.launched(args)).toEqual({
         display: ":24701",
         authority: "/tmp/owned-private-auth",
@@ -106,7 +105,7 @@ describe("trusted private display launch environment", () => {
   });
   it("preserves the ordinary host display path when no private environment is provided", async () => {
     const f = await fixture();
-    await f.native.invoke(["ordinary"]);
+    await f.native.cli.invoke(["ordinary"]);
     expect(f.launched(["ordinary"])).toMatchObject({
       display: process.env.DISPLAY ?? null,
       authority: process.env.XAUTHORITY ?? null,

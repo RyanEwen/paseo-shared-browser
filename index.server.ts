@@ -2,6 +2,10 @@ import { randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
+import {
+  ensureAgentAdapterLauncher,
+  resolveAgentAdapterPath,
+} from "./server/agent-adapter-launcher";
 import { readAgentAdapterRegistration } from "./server/agent-adapter-registration";
 import {
   bindAgentTicket,
@@ -36,7 +40,6 @@ import {
 import { createBrowserMediaBroker } from "./server/browser-media-broker";
 import { createRuntimeGraphicsSettings } from "./server/runtime-graphics-settings";
 import { readRuntimeMediaAssets } from "./server/runtime-media-assets";
-import { resolveBrowserRuntimeRoot } from "./server/runtime-path";
 import { createRuntimeVideoSettings } from "./server/runtime-video-settings";
 import {
   acquireControlRpc,
@@ -99,12 +102,12 @@ function paseoHome(): string {
   return process.env.PASEO_HOME ?? join(homedir(), ".paseo");
 }
 
-function mcpBundlePath(): string {
-  return join(resolveBrowserRuntimeRoot(paseoHome()), "shared-browser-mcp.cjs");
-}
-
 export default function contribute(server: PluginServerContext) {
   const settings = server.registerSettings(browserDisplayPreferences);
+  // Written once per plugin start; new agents save its fixed path instead of a runtime directory.
+  const adapterLauncher = ensureAgentAdapterLauncher(paseoHome());
+  // Each agent creation handles a failure through its fallback; this only marks it observed.
+  adapterLauncher.catch(() => {});
   const videoSettings = createRuntimeVideoSettings(paseoHome());
   const graphicsSettings = createRuntimeGraphicsSettings(paseoHome());
   let liveVideoEnabled = false;
@@ -174,6 +177,7 @@ export default function contribute(server: PluginServerContext) {
     await syncSettings();
     const ticket = randomBytes(32).toString("base64url");
     if (!(await issueTicketWithinDeadline(ticket))) return request;
+    const adapterPath = await resolveAgentAdapterPath(paseoHome(), adapterLauncher);
     return {
       ...request,
       env: { ...request.env, [TICKET_ENV]: ticket },
@@ -184,7 +188,7 @@ export default function contribute(server: PluginServerContext) {
           [MCP_SERVER_ID]: {
             type: "stdio",
             command: process.execPath,
-            args: [mcpBundlePath()],
+            args: [adapterPath],
             env: {
               PASEO_HOME: paseoHome(),
               [TICKET_ENV]: ticket,

@@ -50,11 +50,13 @@ it.skipIf(process.platform !== "linux")(
       const evaluate = (expression: string) =>
         (
           runtime as unknown as {
-            page: {
-              send(method: string, params: object): Promise<{ result: { value: string } }>;
+            attachment: {
+              page: {
+                send(method: string, params: object): Promise<{ result: { value: string } }>;
+              };
             };
           }
-        ).page.send("Runtime.evaluate", {
+        ).attachment.page.send("Runtime.evaluate", {
           expression,
           returnByValue: true,
         });

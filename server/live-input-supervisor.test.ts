@@ -1,6 +1,6 @@
 import { expect, it } from "vitest";
 import { browserStateSchema } from "../shared/browser";
-import type { JsonValue, RuntimeRequest } from "./runtime-protocol";
+import { type JsonValue, RUNTIME_PROTOCOL_VERSION, type RuntimeRequest } from "./runtime-protocol";
 import { RuntimeSupervisor } from "./supervisor";
 
 /** Exercise the immutable supervisor's human RPC path without a plugin or browser process. */
@@ -42,7 +42,7 @@ it("routes validated human gestures, fences replaced plugin bridges and never ex
     bridgeId = "bridge",
   ) =>
     supervisor.dispatch({
-      version: 2,
+      version: RUNTIME_PROTOCOL_VERSION,
       id: "request",
       token: "unused-by-direct-fixture",
       bridgeId,
@@ -133,7 +133,7 @@ it("routes validated human gestures, fences replaced plugin bridges and never ex
     expect(calls.filter((value) => value === "input.end")).toHaveLength(1);
     await expect(
       supervisor.dispatch({
-        version: 2,
+        version: RUNTIME_PROTOCOL_VERSION,
         id: "request",
         method: "agent.request",
         ticket: "invalid",

@@ -1,5 +1,28 @@
 # Changelog
 
+## 2.2.0 (2026-11-10)
+
+Published as a GitHub prerelease because the retained forced-screencast recovery smoke gate remains unresolved.
+
+### Features
+
+- Workspace browsers now start empty. Opening the panel, or an agent checking status or tabs, no longer launches Chromium or opens a default page; the first URL or New Tab opens the only page.
+- Supports Paseo++ 0.15, including its previews (verified against 0.15.3-preview.45), alongside the retained 0.11 and 0.12 allowances.
+- Agents keep Shared Browser access across future plugin updates. Agents created before this release keep working too.
+
+### Fixes
+
+- A first address that cannot load leaves an open page showing the error instead of making the workspace unusable, and agents follow that page.
+- Page actions are disabled while no page is open, and the empty panel says "No pages open" instead of connecting indefinitely.
+- At most 8 workspace browsers run at once; empty workspaces do not count toward that limit or appear as open browsers.
+- Agent Enter and Space key presses, and element actions on pages with slow handlers, no longer freeze or drop application work.
+
+### Validation and limits
+
+- Required repository checks pass. Real-Chromium DOM, tab and recovery suites pass.
+- The browser smoke suite still fails its documented forced-fallback recovery assertion, and the native video smoke fails on this WSL host for both this release and 2.1.0. Do not treat the full browser suite as passing.
+- Activating this release on an existing host replaces the browser supervisor, which closes open Shared Browser tabs. Saved site data and sign-ins are kept.
+
 ## 2.1.0 (2026-10-29)
 
 First standalone fork release. Original upstream history and attribution are retained below.

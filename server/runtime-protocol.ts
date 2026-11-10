@@ -1,4 +1,13 @@
-export const RUNTIME_PROTOCOL_VERSION = 2 as const;
+/** Empty workspace state requires matched bridge and supervisor semantics. */
+export const RUNTIME_PROTOCOL_VERSION = 3 as const;
+/**
+ * Agent adapters are pinned by absolute path into each agent's saved MCP configuration, so an
+ * agent created before a runtime upgrade keeps launching its original adapter. Wire 2 adapters
+ * forward every supervisor reply to the agent unchanged, so they remain correct under wire 3
+ * empty-workspace semantics. Only `agent.request` is accepted at this revision; bridge and
+ * admin requests always require the current revision.
+ */
+export const LEGACY_AGENT_PROTOCOL_VERSION = 2 as const;
 export const DEFAULT_ORPHAN_GRACE_MS = 120_000;
 export const DEFAULT_BRIDGE_HEARTBEAT_MS = 10_000;
 export const DEFAULT_BRIDGE_TIMEOUT_MS = 30_000;
@@ -103,6 +112,8 @@ export type RuntimeRequest =
       ticket: string;
       operation: AgentBrowserOperation;
       input: JsonValue;
+      /** Sent by a wire 2 adapter, whose tool descriptions predate empty workspaces. */
+      legacyAdapter?: true;
     });
 
 export type RuntimeResult = BridgeLease | RuntimeDescriptor | JsonValue | { archived: true };
@@ -161,13 +172,16 @@ export function parseRuntimeRequest(value: unknown): RuntimeRequest {
     throw new RuntimeProtocolError("INVALID_REQUEST", "Request must be an object");
   const id = requireString(value, "id");
   const method = requireString(value, "method");
-  if (value.version !== RUNTIME_PROTOCOL_VERSION) {
+  const legacyAgentRequest =
+    method === "agent.request" && value.version === LEGACY_AGENT_PROTOCOL_VERSION;
+  if (value.version !== RUNTIME_PROTOCOL_VERSION && !legacyAgentRequest) {
     throw new RuntimeProtocolError(
       "PROTOCOL_MISMATCH",
       `Expected protocol version ${RUNTIME_PROTOCOL_VERSION}`,
     );
   }
   if (method === "agent.request") {
+    // Legacy adapters are normalized to the current revision once admitted.
     return {
       id,
       version: RUNTIME_PROTOCOL_VERSION,
@@ -175,6 +189,7 @@ export function parseRuntimeRequest(value: unknown): RuntimeRequest {
       ticket: requireString(value, "ticket"),
       operation: requireAgentOperation(value.operation),
       input: requireJsonValue(value, "input"),
+      ...(legacyAgentRequest ? { legacyAdapter: true as const } : {}),
     };
   }
 
@@ -278,8 +293,71 @@ export function parseRuntimeRequest(value: unknown): RuntimeRequest {
   throw new RuntimeProtocolError("INVALID_REQUEST", `Unknown method: ${method}`);
 }
 
+/** Where a running supervisor listens, as published in its private endpoint file. */
+export interface SupervisorEndpoint {
+  socket: string;
+}
+
+/**
+ * Serialize the endpoint file. `version` stays at the legacy revision because wire 2 adapters
+ * compare it for equality before connecting; `protocols` lists every revision this supervisor
+ * serves, and current clients require their own revision in it. `adapter` names the agent
+ * adapter bundled with this supervisor, which the stable launcher loads so agents always match
+ * the running supervisor rather than a newer install that has not replaced it yet.
+ */
+export function formatSupervisorEndpoint(
+  socket: string,
+  adapter?: string,
+  pid: number = process.pid,
+): string {
+  return JSON.stringify({
+    version: LEGACY_AGENT_PROTOCOL_VERSION,
+    protocols: [LEGACY_AGENT_PROTOCOL_VERSION, RUNTIME_PROTOCOL_VERSION],
+    socket,
+    // The launcher trusts `adapter` only while this process is alive.
+    pid,
+    ...(adapter ? { adapter } : {}),
+  });
+}
+
+/**
+ * Parse an endpoint file for a current-revision client. A supervisor that predates `protocols`
+ * (or does not list the current revision) is refused, so mismatched peers never exchange requests.
+ */
+export function parseSupervisorEndpoint(text: string): SupervisorEndpoint {
+  const parsed: unknown = JSON.parse(text);
+  if (!isRecord(parsed) || typeof parsed.socket !== "string")
+    throw new Error("Invalid supervisor endpoint file");
+  const protocols = Array.isArray(parsed.protocols) ? parsed.protocols : [parsed.version];
+  if (!protocols.includes(RUNTIME_PROTOCOL_VERSION))
+    throw new Error("Supervisor endpoint protocol mismatch");
+  return { socket: parsed.socket };
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** True for a JSON object (not null and not an array). */
+export function isJsonObject(value: JsonValue | undefined): value is { [key: string]: JsonValue } {
+  return isRecord(value);
+}
+
+/** Read optional operation input as an object; anything else reads as no fields. */
+export function jsonObjectOrEmpty(value: JsonValue | undefined): { [key: string]: JsonValue } {
+  return isJsonObject(value) ? value : {};
+}
+
+/**
+ * Require a JSON object, raising the caller's own error otherwise so each boundary keeps its
+ * meaning (an invalid request versus an invalid runtime reply).
+ */
+export function requireJsonObject(
+  value: JsonValue,
+  invalid: () => Error,
+): { [key: string]: JsonValue } {
+  if (!isJsonObject(value)) throw invalid();
+  return value;
 }
 
 function requireString(value: Record<string, unknown>, key: string): string {

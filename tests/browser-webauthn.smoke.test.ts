@@ -63,7 +63,7 @@ it.each(["headless", "xvfb", "wayland"] as const)(
         mobile: false,
         touch: false,
       });
-      const page = (runtime as unknown as { page: CdpSession }).page;
+      const page = (runtime as unknown as { attachment: { page: CdpSession } }).attachment.page;
       const inspect = async (expression: string, session = page) => {
         const result = await session.send<{ result: { value: unknown } }>("Runtime.evaluate", {
           expression,
@@ -118,7 +118,8 @@ it.each(["headless", "xvfb", "wayland"] as const)(
       } catch (error) { return {name:error.name,message:error.message}; }
       finally {clearTimeout(timer);}
     })()`;
-      const secondPage = (attached as unknown as { page: CdpSession }).page;
+      const secondPage = (attached as unknown as { attachment: { page: CdpSession } }).attachment
+        .page;
       for (const session of [page, secondPage]) {
         const result = await inspect(admission, session);
         expect(result, JSON.stringify({ mode, ...(result as object) })).toMatchObject({

@@ -50,18 +50,20 @@ it.skipIf(process.platform !== "linux")(
       daemonExitWaitMs: 3_000,
     });
     const native = runtime as unknown as {
-      invoke(args: string[]): Promise<unknown>;
-      captureDaemon(): Promise<void>;
-      daemonLaunched: boolean;
-      daemon: { pid: number; identity: unknown } | null;
+      cli: { invoke(args: string[]): Promise<unknown> };
+      daemon: {
+        capture(): Promise<void>;
+        launched: boolean;
+        record: { pid: number; identity: unknown } | null;
+      };
     };
     const { mkdir } = await import("node:fs/promises");
     await mkdir(join(directory, "ipc"), { recursive: true });
-    await native.invoke(["--session", "chain", "--json", "open", "about:blank"]);
-    native.daemonLaunched = true;
-    await native.captureDaemon();
-    expect(native.daemon?.identity).toBeTruthy();
-    const pid = native.daemon?.pid as number;
+    await native.cli.invoke(["--session", "chain", "--json", "open", "about:blank"]);
+    native.daemon.launched = true;
+    await native.daemon.capture();
+    expect(native.daemon.record?.identity).toBeTruthy();
+    const pid = native.daemon.record?.pid as number;
     const kill = vi.spyOn(process, "kill");
     await runtime.shutdown();
     expect(kill).not.toHaveBeenCalledWith(pid, "SIGKILL");

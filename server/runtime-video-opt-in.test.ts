@@ -38,11 +38,11 @@ async function fixture(nativeVideo?: boolean, headed = false) {
     ...(nativeVideo === undefined ? {} : { nativeVideo }),
   });
   const internal = runtime as unknown as {
-    invoke(args: string[]): Promise<unknown>;
-    video: unknown;
+    cli: { invoke(args: string[]): Promise<unknown> };
+    capture: { video: unknown };
   };
   const launches: string[][] = [];
-  internal.invoke = async (args) => {
+  internal.cli.invoke = async (args) => {
     launches.push(args);
     throw new Error("Owned fixture stops before a browser exists");
   };
@@ -64,7 +64,7 @@ describe("encoded video opt-in", () => {
       expect(args?.join(" ")).toContain("allowlisted-extension-id");
       expect(args?.join(" ")).not.toContain("force-device-scale-factor");
       expect(await readdir(f.ipcDirectory)).toHaveLength(1);
-      expect(f.internal.video).toBeNull();
+      expect(f.internal.capture.video).toBeNull();
     }
   });
 
@@ -86,6 +86,6 @@ describe("encoded video opt-in", () => {
       streamId: null,
       packets: [],
     });
-    expect(f.internal.video).toBeNull();
+    expect(f.internal.capture.video).toBeNull();
   });
 });

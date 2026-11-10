@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { browserStateSchema } from "../shared/browser";
-import { type JsonValue, RuntimeLostError } from "./runtime-protocol";
+import { type JsonValue, RUNTIME_PROTOCOL_VERSION, RuntimeLostError } from "./runtime-protocol";
 import { RuntimeSupervisor } from "./supervisor";
 
 /** Only an explicit human attach replaces a runtime whose private display died, behind a new fence. */
@@ -57,7 +57,7 @@ function harness() {
   const lease = supervisor.claimBridge("bridge");
   const request = (operation: string, input: unknown) =>
     supervisor.dispatch({
-      version: 2,
+      version: RUNTIME_PROTOCOL_VERSION,
       id: "request",
       token: "unused-by-direct-fixture",
       bridgeId: "bridge",
@@ -165,7 +165,7 @@ describe("display loss recovery", () => {
     const agentRequest = (operation: "status" | "capture") =>
       h.supervisor.dispatch({
         id: "agent",
-        version: 2,
+        version: RUNTIME_PROTOCOL_VERSION,
         method: "agent.request",
         ticket,
         operation,
@@ -174,7 +174,7 @@ describe("display loss recovery", () => {
     try {
       const human = await h.attach();
       const base = {
-        version: 2 as const,
+        version: RUNTIME_PROTOCOL_VERSION,
         token: "unused",
         bridgeId: "bridge",
         epoch: h.lease.epoch,
@@ -209,7 +209,7 @@ describe("display loss recovery", () => {
       });
       const late = (await h.supervisor.dispatch({
         id: "agent-late",
-        version: 2,
+        version: RUNTIME_PROTOCOL_VERSION,
         method: "agent.request",
         ticket: lateTicket,
         operation: "status",
@@ -241,11 +241,16 @@ describe("display loss recovery", () => {
   it("keeps a lost runtime whose stop failed away from implicit agent paths until explicit recovery", async () => {
     const h = harness();
     const ticket = `agent_${"x".repeat(40)}`;
-    const base = { version: 2 as const, token: "unused", bridgeId: "bridge", epoch: h.lease.epoch };
+    const base = {
+      version: RUNTIME_PROTOCOL_VERSION,
+      token: "unused",
+      bridgeId: "bridge",
+      epoch: h.lease.epoch,
+    };
     const agentRequest = (operation: "status" | "capture") =>
       h.supervisor.dispatch({
         id: "agent",
-        version: 2,
+        version: RUNTIME_PROTOCOL_VERSION,
         method: "agent.request",
         ticket,
         operation,

@@ -10,14 +10,10 @@ import {
   type JsonValue,
   RUNTIME_PROTOCOL_VERSION,
 } from "../server/runtime-protocol";
-import {
-  type RuntimeInstance,
-  type RuntimeOwner,
-  RuntimeSupervisor,
-  resolveSupervisorPaths,
-  startSupervisorServer,
-} from "../server/supervisor";
+import { type RuntimeInstance, type RuntimeOwner, RuntimeSupervisor } from "../server/supervisor";
 import { AgentSupervisorClient, SupervisorClient } from "../server/supervisor-client";
+import { resolveSupervisorPaths } from "../server/supervisor-paths";
+import { startSupervisorServer } from "../server/supervisor-server";
 import type { BrowserState } from "../shared/browser";
 import { DEFAULT_CAPTURE_QUALITY, JPEG_QUALITY } from "../shared/capture-settings";
 
@@ -1246,9 +1242,9 @@ describe("explicit agent connection recovery", () => {
       );
       // Simulate loss of volatile registrations while Chromium still owns drafts.
       const internal = supervisor as unknown as {
-        agentBindings: Map<string, unknown>;
+        agents: { bindings: Map<string, unknown> };
       };
-      internal.agentBindings.delete(credential);
+      internal.agents.bindings.delete(credential);
       await expect(agentRequest(supervisor, credential, "status")).rejects.toThrow(
         "invalid or unbound",
       );
@@ -1331,8 +1327,10 @@ it("retains the durable tab when a trusted launch rebinds after supervisor repla
     ).rejects.toThrow("Agent ticket is already bound");
     await bindTicket(supervisor, bridge, credential, "agent-one", "workspace-one");
     expect(store.get(credential)?.tabId).toBe("saved-tab");
-    const internal = supervisor as unknown as { agentBindings: Map<string, { tabId: string }> };
-    expect(internal.agentBindings.get(credential)?.tabId).toBe("saved-tab");
+    const internal = supervisor as unknown as {
+      agents: { bindings: Map<string, { tabId: string }> };
+    };
+    expect(internal.agents.bindings.get(credential)?.tabId).toBe("saved-tab");
     expect(owner.states.size).toBe(0);
   } finally {
     await rm(root, { recursive: true, force: true });

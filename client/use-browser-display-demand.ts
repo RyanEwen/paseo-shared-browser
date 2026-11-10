@@ -1,22 +1,12 @@
 /** Bridge rendered viewer geometry and application visibility to the shared demand reporter. */
 import { useEffect, useLayoutEffect, useRef } from "react";
-import { AppState, Platform } from "react-native";
+import { AppState } from "react-native";
 import {
   type BrowserDisplayDemandOptions,
   createBrowserDisplayDemandReporter,
   isSameDisplayDemandSource,
 } from "./browser-display-demand";
-
-interface ViewerDocument {
-  hidden?: boolean;
-  addEventListener?(type: "visibilitychange", listener: () => void): void;
-  removeEventListener?(type: "visibilitychange", listener: () => void): void;
-}
-interface ViewerWindow {
-  document?: ViewerDocument;
-  addEventListener?(type: "pagehide" | "pageshow", listener: () => void): void;
-  removeEventListener?(type: "pagehide" | "pageshow", listener: () => void): void;
-}
+import { observeWebPageVisibility } from "./browser-page-web";
 
 /** Hidden clients retract demand immediately, while late results remain bound to their attachment. */
 export function useBrowserDisplayDemand(options: BrowserDisplayDemandOptions): void {
@@ -36,10 +26,11 @@ export function useBrowserDisplayDemand(options: BrowserDisplayDemandOptions): v
 
   useEffect(() => {
     const instance = reporter.current!;
-    const host = Platform.OS === "web" ? (globalThis as ViewerWindow) : null;
     let applicationActive = AppState.currentState == null || AppState.currentState === "active";
     let suspended = false;
-    const visible = () => applicationActive && !suspended && !host?.document?.hidden;
+    // Assigned below, before the first update; null on native platforms.
+    let page: ReturnType<typeof observeWebPageVisibility> = null;
+    const visible = () => applicationActive && !suspended && !page?.isHidden();
     const update = () => {
       const snapshot = latest.current;
       instance.update({
@@ -75,16 +66,12 @@ export function useBrowserDisplayDemand(options: BrowserDisplayDemandOptions): v
       applicationActive = state === "active";
       update();
     });
-    host?.document?.addEventListener?.("visibilitychange", update);
-    host?.addEventListener?.("pagehide", hide);
-    host?.addEventListener?.("pageshow", show);
+    page = observeWebPageVisibility({ visibilityChanged: update, hidden: hide, shown: show });
     update();
     return () => {
       publish.current = null;
       subscription.remove();
-      host?.document?.removeEventListener?.("visibilitychange", update);
-      host?.removeEventListener?.("pagehide", hide);
-      host?.removeEventListener?.("pageshow", show);
+      page?.stop();
       instance.stop();
     };
   }, []);

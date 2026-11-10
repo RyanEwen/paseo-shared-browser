@@ -120,7 +120,8 @@ it("refuses an expired quiet-video press and recovers through fresh JPEG pixels"
         event: { kind: "down", point, button: "left", clickCount: 1 },
       }),
     ).rejects.toThrow(/stage=admission; reason=expired/);
-    const page = (runtime.runtime as unknown as { page: CdpSession }).page;
+    const page = (runtime.runtime as unknown as { attachment: { page: CdpSession } }).attachment
+      .page;
     const inspect = async () => {
       const reply = await page.send<{ result: { value: { clicks: number; draft: string } } }>(
         "Runtime.evaluate",

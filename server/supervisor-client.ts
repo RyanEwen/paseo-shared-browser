@@ -6,6 +6,7 @@ import {
   type BridgeLease,
   isRuntimeResponse,
   type JsonValue,
+  parseSupervisorEndpoint,
   RUNTIME_PROTOCOL_VERSION,
   type RuntimeDescriptor,
   RuntimeProtocolError,
@@ -13,17 +14,13 @@ import {
   type RuntimeResponse,
   type RuntimeResult,
 } from "./runtime-protocol";
-import { resolveSupervisorPaths, type SupervisorPaths } from "./supervisor";
+import { resolveSupervisorPaths, type SupervisorPaths } from "./supervisor-paths";
 
 interface PendingRequest {
   resolve(value: RuntimeResult): void;
   reject(error: Error): void;
 }
 
-interface EndpointFile {
-  version: number;
-  socket: string;
-}
 type ClientRuntimeRequest<Request extends RuntimeRequest = RuntimeRequest> =
   Request extends RuntimeRequest ? Omit<Request, "id" | "token" | "version"> : never;
 
@@ -78,18 +75,7 @@ export class SupervisorClient {
       readPrivateFile(this.paths.endpoint),
       readPrivateFile(this.paths.token),
     ]);
-    const parsed: unknown = JSON.parse(endpointText);
-    if (
-      typeof parsed !== "object" ||
-      parsed === null ||
-      !("version" in parsed) ||
-      !("socket" in parsed)
-    ) {
-      throw new Error("Invalid supervisor endpoint file");
-    }
-    const endpoint = parsed as EndpointFile;
-    if (endpoint.version !== RUNTIME_PROTOCOL_VERSION || typeof endpoint.socket !== "string")
-      throw new Error("Supervisor endpoint protocol mismatch");
+    const endpoint = parseSupervisorEndpoint(endpointText);
     this.token = token.trim();
     this.socket = await new Promise<Socket>((resolve, reject) => {
       const socket = createConnection(endpoint.socket);
@@ -338,17 +324,7 @@ export class AgentSupervisorClient {
     this.closed = false;
     this.receiveBuffer = "";
     const endpointText = await readPrivateFile(this.paths.endpoint);
-    const parsed: unknown = JSON.parse(endpointText);
-    if (
-      typeof parsed !== "object" ||
-      parsed === null ||
-      !("version" in parsed) ||
-      !("socket" in parsed)
-    )
-      throw new Error("Invalid supervisor endpoint file");
-    const endpoint = parsed as EndpointFile;
-    if (endpoint.version !== RUNTIME_PROTOCOL_VERSION || typeof endpoint.socket !== "string")
-      throw new Error("Supervisor endpoint protocol mismatch");
+    const endpoint = parseSupervisorEndpoint(endpointText);
     this.socket = await new Promise<Socket>((resolve, reject) => {
       const socket = createConnection(endpoint.socket);
       socket.once("connect", () => resolve(socket));

@@ -34,6 +34,8 @@ if (
     "errors",
     "quiet-video",
     "view-size",
+    "empty-url",
+    "empty-tab",
   ].includes(values.fixture)
 )
   throw new Error("Unsupported panel fixture");
@@ -46,7 +48,6 @@ const tooling = createRequire(join(toolingRoot, "package.json"));
 globalThis.panelFixtureToolingRoot = toolingRoot;
 const { build } = tooling("esbuild"),
   React = tooling("react"),
-  { createRoot } = tooling("react-dom/client"),
   { JSDOM } = tooling("jsdom"),
   { QueryClient, QueryClientProvider } = tooling("@tanstack/react-query");
 const out = await mkdtemp(join(tmpdir(), "panel-video-mounted-"));
@@ -59,6 +60,9 @@ Object.assign(globalThis, {
   document: dom.window.document,
   IS_REACT_ACT_ENVIRONMENT: true,
 });
+// React DOM detects native input support at import time. Install the owned DOM
+// first so address-field events use its normal input path, not the IE polyfill.
+const { createRoot } = tooling("react-dom/client");
 const state = {
   sessionId: "s".repeat(32),
   tabId: "t".repeat(32),
@@ -79,6 +83,15 @@ const state = {
   canGoBack: false,
   canGoForward: false,
 };
+const emptyFixture = values.fixture.startsWith("empty-");
+if (emptyFixture)
+  Object.assign(state, {
+    status: "empty",
+    tabId: undefined,
+    url: "",
+    title: "",
+    navigationGeneration: 0,
+  });
 const f = {
   state,
   reads: [],
@@ -110,6 +123,14 @@ f.rpc = (contract) => {
     rpcCache.set(contract.name, async (input) => {
       f.calls.push({ name: contract.name, input });
       if (contract.name === "shared-browser.attach") {
+        if (emptyFixture && input.tabId)
+          f.state = {
+            ...f.state,
+            status: "ready",
+            tabId: input.tabId,
+            sessionId: input.tabId,
+            url: "about:blank",
+          };
         if (["tab-focus", "tab-close"].includes(values.fixture) && input.tabId) {
           f.state = { ...f.state, tabId: input.tabId, sessionId: input.tabId };
         }
@@ -125,6 +146,20 @@ f.rpc = (contract) => {
         return { closed: true, browserClosed: input.scope === "last-tab" };
       }
       if (contract.name === "shared-browser.tabs.list") {
+        if (emptyFixture)
+          return {
+            tabs: f.state.tabId
+              ? [
+                  {
+                    id: f.state.tabId,
+                    title: f.state.title,
+                    url: f.state.url,
+                    viewerCount: 1,
+                    controllerLabel: null,
+                  },
+                ]
+              : [],
+          };
         const result = {
           tabs: [
             {
@@ -158,6 +193,17 @@ f.rpc = (contract) => {
         return new Promise((resolve) => f.captures.push({ input, resolve }));
       if (contract.name === "shared-browser.navigate" && f.deferNavigation)
         return new Promise((resolve, reject) => f.deferredNavigations.push({ resolve, reject }));
+      if (emptyFixture && contract.name === "shared-browser.navigate") {
+        f.state = {
+          ...f.state,
+          status: "ready",
+          tabId: "n".repeat(32),
+          url: input.action.url,
+          title: "Requested page",
+          navigationGeneration: 1,
+        };
+        return { state: { ...f.state } };
+      }
       if (contract.name === "shared-browser.control.acquire") {
         if (f.deferAcquire) return new Promise((resolve) => f.acquireReplies.push(resolve));
         f.state = { ...f.state, controller: "self" };
@@ -191,7 +237,9 @@ const native = await readFile(
 await writeFile(
   join(out, "sdk.cjs"),
   native +
-    `\nmodule.exports.useRpc=c=>globalThis.panelFixture.rpc(c);module.exports.useSettings=()=>(${["errors", "quiet-video"].includes(values.fixture) ? "{status:'ready',saving:false,values:{favoritePresetIds:[],captureQuality:'high',liveVideoEnabled:true,videoBitrate:12000000,videoFps:30,graphicsPreference:'host-default'},revision:'fixture',saveError:null,save:async()=>true,reload:async()=>{},reset:async()=>true}" : "{status:'loading',saving:false}"});\nmodule.exports.Image=props=>{React.useEffect(()=>{globalThis.panelFixture.imageLoads.push(()=>props.onLoad?.())},[props.source?.uri]);return React.createElement('img',{'data-image':'yes',style:rnStyle(props.style),src:props.source?.uri})};\nmodule.exports.AppState.currentState='active';`,
+    // Video fixtures must explicitly select Video. Empty cases use that same
+    // setting to prove page readiness, rather than disabled video, keeps reads idle.
+    `\nmodule.exports.useRpc=c=>globalThis.panelFixture.rpc(c);module.exports.useSettings=()=>({status:'ready',saving:false,values:{favoritePresetIds:[],captureQuality:'high',liveVideoEnabled:true,videoBitrate:12000000,videoFps:30,graphicsPreference:'host-default'},revision:'fixture',saveError:null,save:async()=>true,reload:async()=>{},reset:async()=>true});\nmodule.exports.Image=props=>{React.useEffect(()=>{globalThis.panelFixture.imageLoads.push(()=>props.onLoad?.())},[props.source?.uri]);return React.createElement('img',{'data-image':'yes',style:rnStyle(props.style),src:props.source?.uri})};\nmodule.exports.AppState.currentState='active';`,
 );
 await writeFile(
   join(out, "web.ts"),
@@ -290,22 +338,25 @@ async function renderWorkspace(
 }
 try {
   await renderWorkspace("workspace");
-  await React.act(async () =>
-    f.captures[0].resolve({
-      state: { ...f.state },
-      frame: {
-        ...frame(0).frame,
-        mimeType: "image/jpeg",
-        transport: "cdp-screencast",
-        dataBase64: "AA==",
-        byteLength: 1,
-      },
-    }),
-  );
-  await flush(10);
-  await React.act(async () => f.imageLoads.pop()());
+  if (!emptyFixture) {
+    await React.act(async () =>
+      f.captures[0].resolve({
+        state: { ...f.state },
+        frame: {
+          ...frame(0).frame,
+          mimeType: "image/jpeg",
+          transport: "cdp-screencast",
+          dataBase64: "AA==",
+          byteLength: 1,
+        },
+      }),
+    );
+    await flush(10);
+    await React.act(async () => f.imageLoads.pop()());
+  }
   if (
     !["tab-layout", "view-size"].includes(values.fixture) &&
+    !emptyFixture &&
     !values.fixture.startsWith("tab-close")
   ) {
     assert(f.reads.length > 0, "first video request");
@@ -319,12 +370,66 @@ try {
     );
     await React.act(async () => f.paint());
     await flush(20);
-    if (["errors", "quiet-video"].includes(values.fixture))
-      assert.equal(f.draws, 1, "production video presentation painted");
-    else assert(document.body.textContent.includes("Video"), "video displayed");
+    assert.equal(f.draws, 1, "production video presentation painted");
+    assert(document.body.textContent.includes("VP8"), "active codec is displayed");
     console.log("PASS full panel painted Video");
   }
-  if (values.fixture === "view-size") {
+  if (emptyFixture) {
+    assert(
+      document.body.textContent.includes("No pages open"),
+      "empty workspace has a specific placeholder",
+    );
+    assert(!document.body.textContent.includes("Waiting for frame"));
+    assert.equal(document.querySelectorAll('button[role="tab"]').length, 0);
+    assert.equal(f.captures.length, 0, "empty viewer does not request page pixels");
+    assert.equal(f.reads.length, 0, "empty viewer does not start video");
+    const create = document.querySelector('button[aria-label="New browser tab"]');
+    assert(create && !create.disabled);
+    assert(
+      document.querySelector('button[aria-label="Reload"]').disabled,
+      "page-only actions are disabled",
+    );
+    if (values.fixture === "empty-url") {
+      const address = document.querySelector('input[aria-label="Browser address"]');
+      assert(address && !address.readOnly, "empty viewer can enter its first URL");
+      await React.act(async () => {
+        address.value = "https://requested.example/";
+        address.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
+      });
+      await React.act(async () =>
+        address.dispatchEvent(
+          new dom.window.KeyboardEvent("keydown", { key: "Enter", bubbles: true }),
+        ),
+      );
+      await flush(20);
+      const confirm = document.querySelector(
+        'section[aria-label$="control?"] button[aria-label^="Take "]',
+      );
+      assert(confirm, "first navigation retains explicit control acquisition");
+      await React.act(async () => confirm.click());
+      await flush(30);
+      const navigation = f.calls.filter((call) => call.name === "shared-browser.navigate");
+      assert.equal(navigation.length, 1);
+      assert.equal(navigation[0].input.action.url, "https://requested.example/");
+      assert.equal(f.calls.filter((call) => call.name === "shared-browser.tabs.create").length, 0);
+    } else {
+      await React.act(async () => create.click());
+      await flush(30);
+      assert.equal(f.calls.filter((call) => call.name === "shared-browser.tabs.create").length, 1);
+      assert.equal(
+        f.calls.filter((call) => call.name === "shared-browser.control.acquire").length,
+        0,
+      );
+    }
+    assert.equal(f.state.status, "ready");
+    assert(
+      !document.body.textContent.includes("No pages open"),
+      "first explicit action leaves the empty state",
+    );
+    console.log(
+      `PASS mounted ${values.fixture}: empty observation and one explicit first-page action`,
+    );
+  } else if (values.fixture === "view-size") {
     const toggleDisplay = async () => {
       const button = document.querySelector('button[aria-label="Display options"]');
       assert(button && !button.disabled);
@@ -1191,7 +1296,7 @@ try {
           f.calls.some((c) => c.name === "shared-browser.gesture.update"),
           "actual gesture update",
         );
-        assert(document.body.textContent.includes("Video"));
+        assert(document.body.textContent.includes("VP8"), "active codec is displayed");
         assert(!document.body.textContent.includes("Waiting for frame"));
         console.log("PASS full panel ordinary click immediate video hold");
         await flush(2800);
@@ -1294,7 +1399,7 @@ try {
         await flush(60);
         assert.equal(f.host.style.opacity, "1");
         assert(!document.body.textContent.includes("Waiting for frame"));
-        assert(document.body.textContent.includes("Video"));
+        assert(document.body.textContent.includes("VP8"), "active codec is displayed");
         assert.equal(f.captures.length, beforeNavCaptures, "timely SPA reset never starts JPEG");
         const navPacket = frame(6);
         navPacket.frame.navigationGeneration = 2;

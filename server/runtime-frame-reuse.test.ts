@@ -83,8 +83,10 @@ async function fixture() {
     },
     session: () =>
       (
-        manager as unknown as { sessions: Map<string, { runtimeId: string; bridgeEpoch: number }> }
-      ).sessions.get("owned-perf-fixture")!,
+        manager as unknown as {
+          context: { sessions: Map<string, { runtimeId: string; bridgeEpoch: number }> };
+        }
+      ).context.sessions.get("owned-perf-fixture")!,
   };
 }
 const target = (frame: BrowserFrame) => ({

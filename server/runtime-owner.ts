@@ -20,7 +20,7 @@ import { createPrivateWaylandDisplay } from "./private-wayland-display";
 import { readBrowserGraphicsPreference } from "./runtime-graphics-settings";
 import { readRuntimeMediaAssets } from "./runtime-media-assets";
 import { resolveBrowserRuntimeRoot } from "./runtime-path";
-import type { JsonValue } from "./runtime-protocol";
+import { type JsonValue, jsonObjectOrEmpty } from "./runtime-protocol";
 import { readLiveVideoEnabled } from "./runtime-video-settings";
 import type { RuntimeOwner } from "./supervisor";
 import {
@@ -29,8 +29,6 @@ import {
   type PrivateVirtualDisplay,
 } from "./virtual-display";
 import { readRuntimeWaylandAssets } from "./wayland-assets";
-
-const DEFAULT_BROWSER_URL = "https://example.com/";
 
 interface OwnedRuntime {
   runtimeId: string;
@@ -46,6 +44,11 @@ interface OwnedRuntime {
   graphicsPreference: BrowserGraphicsPreference;
 }
 interface RuntimeOwnerOptions {
+  /**
+   * The runtime directory whose binaries and assets this owner launches. The detached supervisor
+   * passes its own directory; otherwise the current runtime pointer is read once at creation.
+   */
+  runtimeRoot?: string;
   /** Trusted embedded prototype assets; no public request can supply native executable paths. */
   pyrowave?: NativePyrowaveAssets;
   initialUrl?: string;
@@ -116,15 +119,23 @@ async function tabRuntime(owned: OwnedRuntime, targetId: string): Promise<AgentB
   }
 }
 
+/** Protocol touch phases mapped to the CDP touch event types they dispatch. */
+const NATIVE_TOUCH_TYPES = {
+  start: "touchStart",
+  move: "touchMove",
+  end: "touchEnd",
+  cancel: "touchCancel",
+} as const;
+
 export async function createRuntimeOwner(
   options: RuntimeOwnerOptions = {},
 ): Promise<RuntimeOwner<OwnedRuntime>> {
   const home = paseoHome();
-  const mediaAssets = options.pyrowave ? null : await readRuntimeMediaAssets(home);
+  const runtimeRoot = options.runtimeRoot ?? resolveBrowserRuntimeRoot(home);
+  const mediaAssets = options.pyrowave ? null : await readRuntimeMediaAssets(home, runtimeRoot);
   const pyrowave = options.pyrowave ?? mediaAssets?.pyrowave;
   const liveVideoEnabled = () => options.nativeVideo ?? readLiveVideoEnabled(home);
   const root = join(home, "plugin-data", "shared-browser");
-  const runtimeRoot = resolveBrowserRuntimeRoot(home);
   const ipcDirectory =
     process.platform === "win32"
       ? join(root, "ipc")
@@ -144,7 +155,7 @@ export async function createRuntimeOwner(
     process.env.PASEO_SHARED_BROWSER_CHROMIUM_EXECUTABLE ??
     join(runtimeRoot, "chromium", process.platform === "win32" ? "chrome.exe" : "chrome");
   return {
-    async create(workspaceId) {
+    async create(workspaceId, launch) {
       const hash = createHash("sha256").update(workspaceId).digest("hex");
       const graphicsPreference = readBrowserGraphicsPreference(home);
       let graphicsMode: BrowserGraphicsMode;
@@ -166,7 +177,7 @@ export async function createRuntimeOwner(
         throw new PrivateDisplayError("Private desktop requires Linux and Xvfb");
       }
       if (graphicsMode === "wayland") {
-        const assets = await readRuntimeWaylandAssets(home);
+        const assets = await readRuntimeWaylandAssets(home, runtimeRoot);
         if (!assets)
           throw new PrivateDisplayError("Wayland GPU assets are not prepared on this host");
         display = await createPrivateWaylandDisplay(assets);
@@ -192,6 +203,8 @@ export async function createRuntimeOwner(
       }
       let runtime: AgentBrowserRuntime | null = null;
       try {
+        // Shared by every tab controller of this browser, so it must not carry the
+        // first opener's launch fence; that is passed to the root runtime only.
         const runtimeOptions: AgentBrowserRuntimeOptions = {
           graphicsMode,
           binaryPath,
@@ -199,14 +212,17 @@ export async function createRuntimeOwner(
           profilePath: join(root, "profiles", hash),
           ipcDirectory,
           session: `ws-${hash.slice(0, 16)}`,
-          initialUrl: options.initialUrl ?? DEFAULT_BROWSER_URL,
+          initialUrl: options.initialUrl ?? "about:blank",
           headed: display ? true : (options.headed ?? false),
           nativeVideo: videoReady,
           nativeVideoAllowed: liveVideoEnabled,
           ...(pyrowave ? { pyrowave } : {}),
           ...(display ? { launchEnvironment: display.launchEnvironment } : {}),
         };
-        runtime = new AgentBrowserRuntime(runtimeOptions);
+        runtime = new AgentBrowserRuntime({
+          ...runtimeOptions,
+          ...(launch?.beforeLaunch ? { beforeLaunch: launch.beforeLaunch } : {}),
+        });
         await runtime.launch();
         display?.assertAvailable();
         const identity = await runtime.identity();
@@ -222,29 +238,49 @@ export async function createRuntimeOwner(
           graphicsPreference,
         };
       } catch (error) {
-        let cleanupFailure: unknown = null;
+        const cleanupFailures: unknown[] = [];
         try {
           await runtime?.shutdown();
         } catch (failure) {
-          cleanupFailure = failure;
-        } finally {
-          await display?.stop();
+          cleanupFailures.push(failure);
         }
-        // An unconfirmed cleanup must not hide why creation failed.
-        if (cleanupFailure)
-          throw new AggregateError(
-            [error, cleanupFailure],
+        try {
+          await display?.stop();
+        } catch (failure) {
+          cleanupFailures.push(failure);
+        }
+        // Preserve every failure so the lazy owner refuses replacement while
+        // either Chromium or its private display may still be running, and give
+        // it a handle to retry this exact cleanup later.
+        if (cleanupFailures.length) {
+          const unconfirmed = new AggregateError(
+            [error, ...cleanupFailures],
             `Runtime creation failed (${error instanceof Error ? error.message : String(error)}) and its cleanup was not confirmed`,
           );
+          const failedRuntime = runtime;
+          Object.assign(unconfirmed, {
+            // Attempt every step, like the original cleanup, and fail if any still fails.
+            retryCleanup: async () => {
+              const results = await Promise.allSettled([
+                failedRuntime?.shutdown(),
+                display?.stop(),
+              ]);
+              const failures = results.filter((result) => result.status === "rejected");
+              if (failures.length)
+                throw new AggregateError(
+                  failures.map((failure) => failure.reason),
+                  "Runtime cleanup retry was not confirmed",
+                );
+            },
+          });
+          throw unconfirmed;
+        }
         throw error;
       }
     },
     async request(owned, operation, input, beforeMutation) {
       owned.display?.assertAvailable();
-      const data =
-        input && typeof input === "object" && !Array.isArray(input)
-          ? (input as Record<string, JsonValue>)
-          : {};
+      const data = jsonObjectOrEmpty(input);
       if (operation === "tabs.list") {
         return (await orderedTargets(owned)).map(({ targetId, title, url }) => ({
           targetId,
@@ -252,12 +288,16 @@ export async function createRuntimeOwner(
           url,
         }));
       }
-      if (operation === "tabs.create") {
+      if (operation === "tabs.create" || operation === "tabs.open") {
         const pages = (await orderedTargets(owned)).filter(
           (target) => !isPrintPreviewUrl(target.url),
         );
         if (pages.length >= MAX_BROWSER_TABS) throw new Error("Browser tab limit reached");
-        const targetId = await owned.runtime.createTarget();
+        beforeMutation?.();
+        const targetId = await owned.runtime.createTarget(
+          operation === "tabs.open" ? String(data.url) : "about:blank",
+          beforeMutation,
+        );
         owned.tabOrder.push(targetId);
         return { targetId };
       }
@@ -526,15 +566,7 @@ export async function createRuntimeOwner(
             throw new Error("Invalid touch phase");
           if ((type === "end" || type === "cancel") !== (points.length === 0))
             throw new Error("Invalid touch phase points");
-          const nativeType =
-            type === "start"
-              ? "touchStart"
-              : type === "move"
-                ? "touchMove"
-                : type === "end"
-                  ? "touchEnd"
-                  : "touchCancel";
-          await runtime.touch(nativeType, points, gestureId);
+          await runtime.touch(NATIVE_TOUCH_TYPES[type], points, gestureId);
           return null;
         }
         case "input.key":

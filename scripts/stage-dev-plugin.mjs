@@ -1,6 +1,6 @@
 /** Snapshot only development source, including when its private target is inside .dev. */
 import { cp, mkdir, readdir, realpath } from "node:fs/promises";
-import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const excluded = new Set([
@@ -16,12 +16,32 @@ const excluded = new Set([
 ]);
 const allowed = (path) => !excluded.has(basename(path)) && !basename(path).startsWith(".env");
 
+/**
+ * Resolve a possibly missing path through its nearest existing ancestor, so it compares with a
+ * realpath'd source. Temporary directories are often reached through links (macOS /var) or
+ * short names (Windows RUNNER~1), which a plain resolve() would leave unmatched.
+ */
+async function canonicalPath(path) {
+  const missing = [];
+  let current = resolve(path);
+  for (;;) {
+    try {
+      return join(await realpath(current), ...missing.reverse());
+    } catch (error) {
+      const parent = dirname(current);
+      if (error?.code !== "ENOENT" || parent === current) throw error;
+      missing.push(basename(current));
+      current = parent;
+    }
+  }
+}
+
 /** Copy allowed top-level entries individually: Node rejects a root-to-descendant
  * cp before applying its filter. Only an excluded subtree may contain the target,
  * preventing recursive copies while keeping archives and private credentials out. */
 export async function stageDevelopmentPlugin(source, destination) {
   source = await realpath(source);
-  destination = resolve(destination);
+  destination = await canonicalPath(destination);
   const within = relative(source, destination);
   if (
     !within ||

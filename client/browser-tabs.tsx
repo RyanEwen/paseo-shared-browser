@@ -5,6 +5,7 @@ import { Pressable, ScrollView, Text, View } from "react-native";
 import type { BrowserState, BrowserTab } from "../shared/browser";
 import { ChromeIconButton } from "./browser-chrome";
 import type { createStyles } from "./browser-panel-styles";
+import { emptyTabListLabel } from "./browser-tab-labels";
 
 /** Use the live selected-tab state when available, and the tab snapshot otherwise. */
 function controllerSummary(tab: BrowserTab, selectedState: BrowserState | null): string {
@@ -58,7 +59,9 @@ export function BrowserTabs({
         style={styles.tabList}
         contentContainerStyle={[styles.tabListContent, bottom ? styles.tabListContentFill : null]}
       >
-        {tabs.length === 0 ? <Text style={styles.tabMeta}>Connecting browser…</Text> : null}
+        {tabs.length === 0 ? (
+          <Text style={styles.tabMeta}>{emptyTabListLabel(selectedState)}</Text>
+        ) : null}
         {tabs.map((tab) => {
           const selected = tab.id === selectedId;
           const currentState = selected && selectedState?.tabId === tab.id ? selectedState : null;

@@ -49,11 +49,19 @@ const manifestSchema = z.object({
     .max(128),
 });
 
-/** Missing or corrupt optional assets are unavailable, never an executable fallback. */
-export async function readRuntimeWaylandAssets(home: string): Promise<string | null> {
+/**
+ * Missing or corrupt optional assets are unavailable, never an executable fallback.
+ *
+ * @param runtimeRoot The runtime whose assets to use; defaults to the current pointer. A running
+ * supervisor passes its own runtime so a later install cannot change what it launches.
+ */
+export async function readRuntimeWaylandAssets(
+  home: string,
+  runtimeRoot: string = resolveBrowserRuntimeRoot(home),
+): Promise<string | null> {
   if (process.platform !== "linux" || process.arch !== "x64") return null;
   try {
-    const directory = join(resolveBrowserRuntimeRoot(home), "wayland");
+    const directory = join(runtimeRoot, "wayland");
     const info = await lstat(directory);
     if (!info.isDirectory() || info.isSymbolicLink()) return null;
     const root = await realpath(directory);
