@@ -109,6 +109,11 @@ export class SessionRegistry {
     });
   }
 
+  /** Allow new sessions for a workspace whose archive Paseo has since undone. */
+  restoreWorkspace(workspaceId: string): void {
+    this.context.archived.delete(workspaceId);
+  }
+
   async archiveWorkspace(workspaceId: string): Promise<void> {
     this.context.assertOpen();
     this.context.archived.add(workspaceId);

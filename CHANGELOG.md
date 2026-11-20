@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.2.3 (2026-11-20)
+
+### Fixes
+
+- Shared Browser works again in a workspace that was archived and then restored. Previously the browser kept refusing to connect there until its background process restarted. Agents in a restored workspace regain browser access when their session next opens.
+
 ## 2.2.2 (2026-11-20)
 
 ### Compatibility

@@ -31,9 +31,10 @@ import type { browserDisplayDemandRpc } from "../shared/browser-display-demand";
 import type { BrowserVideoReadInput, BrowserVideoReadReply } from "../shared/browser-video";
 import { createBrowserOperationDiagnostics } from "./browser-operation-diagnostics";
 import { resolveBrowserRuntimeRoot } from "./runtime-path";
-import type { JsonValue } from "./runtime-protocol";
+import { type JsonValue, RuntimeProtocolError } from "./runtime-protocol";
 import { SupervisorClient } from "./supervisor-client";
 import { resolveSupervisorPaths } from "./supervisor-paths";
+import { runWithRestoredWorkspace, type WorkspaceLookup } from "./workspace-restore";
 
 export type {
   BrowserRuntimeClient,
@@ -230,6 +231,20 @@ class RemoteBrowserManager {
     await this.requestBrowser("archive", { workspaceId });
   }
 
+  /** Clear a stale archive mark; callers must first confirm with Paseo that it is active. */
+  async restoreWorkspace(workspaceId: string): Promise<void> {
+    try {
+      await this.requestBrowser("restore", { workspaceId });
+    } catch (error) {
+      // A supervisor from before restore support rejects the operation by name.
+      if (error instanceof RuntimeProtocolError && error.code === "INVALID_REQUEST")
+        throw new Error(
+          "The running Shared Browser supervisor predates workspace restore; replace it to use this restored workspace",
+        );
+      throw error;
+    }
+  }
+
   issueAgentTicket(ticket: string): Promise<void> {
     return this.client.issueAgentTicket(ticket);
   }
@@ -314,16 +329,41 @@ export async function issueAgentTicket(ticket: string): Promise<void> {
   await (await getProductionManager()).issueAgentTicket(ticket);
 }
 
+/**
+ * Bind an agent's ticket to its workspace. A workspace restored in Paseo after an archive is
+ * confirmed with `paseo` and restored first, so resumed agents regain browser access.
+ */
 export async function bindAgentTicket(
   ticket: string,
   agentId: string,
   workspaceId: string,
+  paseo: WorkspaceLookup,
 ): Promise<void> {
-  await (await getProductionManager()).bindAgentTicket(ticket, agentId, workspaceId);
+  await withRestoredWorkspace(workspaceId, paseo, (manager) =>
+    manager.bindAgentTicket(ticket, agentId, workspaceId),
+  );
 }
 
 export async function revokeAgentBrowserAccess(agentId: string): Promise<void> {
   await (await getProductionManager()).revokeAgent(agentId);
+}
+
+/**
+ * Run a workspace operation on the production manager, recovering once from an archive that
+ * Paseo has since undone. See runWithRestoredWorkspace for the policy.
+ */
+export async function withRestoredWorkspace<Result>(
+  workspaceId: string,
+  paseo: WorkspaceLookup,
+  run: (manager: RemoteBrowserManager) => Promise<Result>,
+): Promise<Result> {
+  const manager = await getProductionManager();
+  return runWithRestoredWorkspace({
+    workspaceId,
+    paseo,
+    run: () => run(manager),
+    restore: (id) => manager.restoreWorkspace(id),
+  });
 }
 
 export async function handleAttachBrowser(
@@ -332,7 +372,9 @@ export async function handleAttachBrowser(
 ): Promise<AttachOutput> {
   const workspace = await context.paseo.workspaces.ref(input.workspaceId).refresh();
   if (!workspace) throw new Error("Workspace not found");
-  return (await getProductionManager()).attach(input.workspaceId, input.viewerLabel, input.tabId);
+  return withRestoredWorkspace(input.workspaceId, context.paseo, (manager) =>
+    manager.attach(input.workspaceId, input.viewerLabel, input.tabId),
+  );
 }
 
 export async function handleListBrowserTabs({
@@ -369,7 +411,9 @@ export async function handleReopenBrowser(
 ): Promise<ReopenOutput> {
   const workspace = await context.paseo.workspaces.ref(input.workspaceId).refresh();
   if (!workspace) throw new Error("Workspace not found");
-  return (await getProductionManager()).reopen(input.workspaceId);
+  return withRestoredWorkspace(input.workspaceId, context.paseo, (manager) =>
+    manager.reopen(input.workspaceId),
+  );
 }
 
 export async function handleWorkspaceArchived(workspaceId: string): Promise<void> {

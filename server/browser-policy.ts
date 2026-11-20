@@ -124,6 +124,12 @@ export class SessionManager {
     return this.context.registry.archiveWorkspace(...args);
   }
 
+  restoreWorkspace(
+    ...args: Parameters<SessionRegistry["restoreWorkspace"]>
+  ): ReturnType<SessionRegistry["restoreWorkspace"]> {
+    return this.context.registry.restoreWorkspace(...args);
+  }
+
   /** List retained browser sessions even after their last viewer leaves or expires. */
   listOpenWorkspaceIds(
     ...args: Parameters<SessionRegistry["listOpenWorkspaceIds"]>

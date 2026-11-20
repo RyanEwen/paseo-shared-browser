@@ -99,6 +99,8 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
   private readonly creations = new Map<string, Promise<WorkspaceEntry<Runtime>>>();
   private readonly workspaceOperations = new Map<string, Promise<void>>();
   private readonly archived = new Set<string>();
+  /** Archives still stopping runtimes and retiring sessions; a restore waits for them. */
+  private readonly archiving = new Map<string, Promise<unknown>>();
   private readonly browserPolicy: SessionManager;
   private readonly agents: AgentAuthority;
   private activeBridge: ActiveBridge | null = null;
@@ -120,7 +122,10 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
     this.schedule = options.schedule ?? setTimeout;
     this.cancel = options.cancel ?? clearTimeout;
     this.browserPolicy = new SessionManager({
-      validateWorkspace: async (workspaceId) => !this.archived.has(workspaceId),
+      // A distinct code lets the bridge tell a stale archive from a missing workspace.
+      validateWorkspace: async (workspaceId) => {
+        if (this.archived.has(workspaceId)) this.workspaceArchived(workspaceId);
+      },
       client: {
         connect: async () => ({ epoch: this.nextEpoch }),
         ensureWorkspace: (workspaceId, options) =>
@@ -241,8 +246,14 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
   ): Promise<{ archived: true }> {
     const bridge = this.assertActiveBridge(bridgeId, epoch);
     this.archived.add(workspaceId);
-    await bridge.ready;
-    const result = await this.archiveWorkspaceLocal(workspaceId);
+    const archive = this.trackArchive(
+      workspaceId,
+      (async () => {
+        await bridge.ready;
+        return this.archiveWorkspaceLocal(workspaceId);
+      })(),
+    );
+    const result = await archive;
     this.assertActiveBridge(bridgeId, epoch);
     return result;
   }
@@ -386,6 +397,41 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
         await this.owner.stop(entry.runtime);
       }
       return { archived: true };
+    });
+  }
+
+  /**
+   * Record an archive in progress so a restore cannot overtake it.
+   *
+   * @returns the archive itself, so the caller still observes its outcome.
+   */
+  private trackArchive<Result>(workspaceId: string, archive: Promise<Result>): Promise<Result> {
+    this.archiving.set(workspaceId, archive);
+    void archive
+      .catch(() => undefined)
+      .finally(() => {
+        if (this.archiving.get(workspaceId) === archive) this.archiving.delete(workspaceId);
+      });
+    return archive;
+  }
+
+  /**
+   * Forget an archive after the bridge confirmed with Paseo that the workspace is active again.
+   *
+   * Paseo++ can restore an archived workspace without notifying plugins, so only the bridge can
+   * make this call, and only after its own Paseo lookup. The archive already stopped the runtime
+   * and retired its sessions, so the next attach starts empty. Agent tickets revoked by the
+   * archive stay revoked: only a trusted agent session open binds them again.
+   *
+   * @returns whether an archive mark was actually cleared.
+   */
+  private async restoreWorkspaceLocal(workspaceId: string): Promise<{ restored: boolean }> {
+    const archive = this.archiving.get(workspaceId);
+    if (archive) await archive.catch(() => undefined);
+    return this.runWorkspaceOperation(workspaceId, async () => {
+      const restored = this.archived.delete(workspaceId);
+      this.browserPolicy.restoreWorkspace(workspaceId);
+      return { restored };
     });
   }
 
@@ -540,11 +586,19 @@ export class RuntimeSupervisor<Runtime extends RuntimeInstance = RuntimeInstance
         break;
       case "archive": {
         const workspaceId = requireText(data, "workspaceId");
-        await this.agents.revokeWorkspace(workspaceId);
-        await this.browserPolicy.archiveWorkspace(workspaceId);
+        await this.trackArchive(
+          workspaceId,
+          (async () => {
+            await this.agents.revokeWorkspace(workspaceId);
+            await this.browserPolicy.archiveWorkspace(workspaceId);
+          })(),
+        );
         result = { archived: true };
         break;
       }
+      case "restore":
+        result = await this.restoreWorkspaceLocal(requireText(data, "workspaceId"));
+        break;
       default:
         throw new RuntimeProtocolError(
           "INVALID_REQUEST",

@@ -334,8 +334,16 @@ describe("runtime installation compatibility", () => {
 });
 
 describe("agent binding renewal on session open", () => {
+  /** Paseo passes every hook its API; the restore recovery uses it to look up the workspace. */
+  const hookContext = { paseo: { workspaces: {} }, signal: new AbortController().signal };
+
   function captureSessionHook() {
-    let hook: ((input: { request: Record<string, unknown> }) => Promise<unknown>) | undefined;
+    let hook:
+      | ((
+          input: { request: Record<string, unknown> },
+          context: typeof hookContext,
+        ) => Promise<unknown>)
+      | undefined;
     contribute({
       registerSettings,
       handle: vi.fn(),
@@ -359,11 +367,12 @@ describe("agent binding renewal on session open", () => {
         workspaceId: "workspace-one",
         env: { PASEO_SHARED_BROWSER_TICKET: "private-credential" },
       };
-      await expect(captureSessionHook()({ request })).resolves.toBe(request);
+      await expect(captureSessionHook()({ request }, hookContext)).resolves.toBe(request);
       expect(browserMocks.bindAgentTicket).toHaveBeenCalledWith(
         "private-credential",
         "agent-one",
         "workspace-one",
+        hookContext.paseo,
       );
     });
   }
@@ -378,7 +387,7 @@ describe("agent binding renewal on session open", () => {
       workspaceId: "workspace-one",
       env: { PASEO_SHARED_BROWSER_TICKET: "private-credential" },
     };
-    await captureSessionHook()({ request });
+    await captureSessionHook()({ request }, hookContext);
     expect(browserMocks.issueAgentTicket).toHaveBeenCalledWith("private-credential");
   });
 
@@ -391,7 +400,7 @@ describe("agent binding renewal on session open", () => {
       workspaceId: "workspace-one",
       env: { PASEO_SHARED_BROWSER_TICKET: "private-credential" },
     };
-    await captureSessionHook()({ request });
+    await captureSessionHook()({ request }, hookContext);
     expect(browserMocks.bindAgentTicket).not.toHaveBeenCalled();
   });
 });

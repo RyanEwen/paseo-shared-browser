@@ -26,6 +26,8 @@ Each workspace gets a private profile under `$PASEO_HOME/plugin-data/shared-brow
 
 When Paseo emits `workspace.archived` while the plugin server is active, the plugin fences that workspace, expires its viewers and controller, and closes its browser runtime, including a runtime whose creation raced the archive. The profile directory is retained. Archive events missed while the plugin bridge is disconnected are not replayed or reconciled by the plugin; the orphan grace still closes the runtime, but retained profile data must be removed manually if it is no longer wanted.
 
+Paseo++ can restore an archived workspace without notifying plugins, so the supervisor keeps refusing it with `WORKSPACE_ARCHIVED`. On that refusal the plugin asks Paseo whether the workspace is active again. Only if Paseo finds it does the plugin clear the archive, after any archive still in progress finishes, and retry once. Viewer attach, explicit reopen and trusted agent session opens recover this way, starting from an empty browser. Agent tickets revoked by the archive stay revoked until the agent's next trusted session open binds them again.
+
 ## Install
 
 Enable trusted plugins on the target Paseo daemon, then install this standalone fork from Git:

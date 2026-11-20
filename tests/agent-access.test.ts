@@ -1336,3 +1336,138 @@ it("retains the durable tab when a trusted launch rebinds after supervisor repla
     await rm(root, { recursive: true, force: true });
   }
 });
+
+describe("workspace restore after archive", () => {
+  /** Archive through the bridge's browser request, as the plugin does on workspace.archived. */
+  function archive(supervisor: RuntimeSupervisor<AgentRuntime>, bridge: BridgeLease) {
+    return browserRequest(supervisor, bridge, "archive", { workspaceId: "workspace-one" });
+  }
+
+  function restore(supervisor: RuntimeSupervisor<AgentRuntime>, bridge: BridgeLease) {
+    return browserRequest<{ restored: boolean }>(supervisor, bridge, "restore", {
+      workspaceId: "workspace-one",
+    });
+  }
+
+  function attach(supervisor: RuntimeSupervisor<AgentRuntime>, bridge: BridgeLease) {
+    return browserRequest<{ state: BrowserState }>(supervisor, bridge, "attach", {
+      workspaceId: "workspace-one",
+      viewerLabel: "Human",
+    });
+  }
+
+  it("refuses an archived workspace with a distinct code, then attaches a fresh runtime after restore", async () => {
+    const { owner, supervisor, bridge } = createHarness();
+    const created: string[] = [];
+    const originalCreate = owner.create.bind(owner);
+    owner.create = async (workspaceId) => {
+      created.push(workspaceId);
+      return originalCreate(workspaceId);
+    };
+    await supervisor.ensureWorkspace(bridge.bridgeId, bridge.epoch, "workspace-one");
+    await archive(supervisor, bridge);
+    expect(owner.stopped.map((runtime) => runtime.workspaceId)).toEqual(["workspace-one"]);
+
+    await expect(attach(supervisor, bridge)).rejects.toMatchObject({
+      code: "WORKSPACE_ARCHIVED",
+    });
+
+    await expect(restore(supervisor, bridge)).resolves.toEqual({ restored: true });
+    const attached = await attach(supervisor, bridge);
+    expect(attached.state.viewerCount).toBe(1);
+    // The archive stopped the old runtime, so serving this viewer created a new one.
+    expect(created).toEqual(["workspace-one", "workspace-one"]);
+    expect(owner.stopped).toHaveLength(1);
+  });
+
+  it("lets an explicit reopen recover through the same archive code and restore", async () => {
+    const { supervisor, bridge } = createHarness();
+    const reopen = () =>
+      browserRequest(supervisor, bridge, "reopen", { workspaceId: "workspace-one" });
+    await archive(supervisor, bridge);
+    await expect(reopen()).rejects.toMatchObject({ code: "WORKSPACE_ARCHIVED" });
+    await restore(supervisor, bridge);
+    await expect(reopen()).resolves.toEqual({ opened: true });
+  });
+
+  it("treats restoring a workspace that was never archived as a no-op", async () => {
+    const { supervisor, bridge } = createHarness();
+    await expect(restore(supervisor, bridge)).resolves.toEqual({ restored: false });
+    expect((await attach(supervisor, bridge)).state.viewerCount).toBe(1);
+  });
+
+  it("still archives a workspace again after a restore", async () => {
+    const { supervisor, bridge } = createHarness();
+    await archive(supervisor, bridge);
+    await restore(supervisor, bridge);
+    await archive(supervisor, bridge);
+    await expect(attach(supervisor, bridge)).rejects.toMatchObject({
+      code: "WORKSPACE_ARCHIVED",
+    });
+  });
+
+  it("waits for an archive still stopping its runtime before restoring", async () => {
+    const { owner, supervisor, bridge } = createHarness();
+    await supervisor.ensureWorkspace(bridge.bridgeId, bridge.epoch, "workspace-one");
+    const stopping = Promise.withResolvers<void>();
+    const stopEntered = Promise.withResolvers<void>();
+    const originalStop = owner.stop.bind(owner);
+    owner.stop = async (runtime) => {
+      stopEntered.resolve();
+      await stopping.promise;
+      await originalStop(runtime);
+    };
+    const order: string[] = [];
+
+    const archiving = archive(supervisor, bridge).then(() => order.push("archived"));
+    await stopEntered.promise;
+    const restoring = restore(supervisor, bridge).then((result) => {
+      order.push("restored");
+      return result;
+    });
+    await Promise.resolve();
+    expect(order).toEqual([]);
+
+    stopping.resolve();
+    await archiving;
+    await expect(restoring).resolves.toEqual({ restored: true });
+    expect(order).toEqual(["archived", "restored"]);
+    expect((await attach(supervisor, bridge)).state.viewerCount).toBe(1);
+  });
+
+  it("keeps an archived agent ticket revoked after restore until a fresh trusted bind", async () => {
+    const { supervisor, bridge } = createHarness();
+    const original = ticket("archived-agent");
+    await issueTicket(supervisor, bridge, original);
+    await bindTicket(supervisor, bridge, original, "agent-one", "workspace-one");
+    await agentRequest(supervisor, original, "status");
+
+    await archive(supervisor, bridge);
+    await expect(
+      bindTicket(supervisor, bridge, ticket("while-archived"), "agent-one", "workspace-one"),
+    ).rejects.toMatchObject({ code: "AUTHENTICATION_FAILED" });
+    await restore(supervisor, bridge);
+
+    await expect(agentRequest(supervisor, original, "status")).rejects.toMatchObject({
+      code: "AUTHENTICATION_FAILED",
+    });
+    await expect(
+      bindTicket(supervisor, bridge, original, "agent-one", "workspace-one"),
+    ).rejects.toThrow("Unknown agent ticket");
+
+    // The session-open hook reissues the same ticket and binds it again.
+    await issueTicket(supervisor, bridge, original);
+    await bindTicket(supervisor, bridge, original, "agent-one", "workspace-one");
+    await expect(agentRequest(supervisor, original, "status")).resolves.toBeTruthy();
+  });
+
+  it("refuses binding an issued ticket while the workspace is archived", async () => {
+    const { supervisor, bridge } = createHarness();
+    const pending = ticket("issued-before-archive");
+    await issueTicket(supervisor, bridge, pending);
+    await archive(supervisor, bridge);
+    await expect(
+      bindTicket(supervisor, bridge, pending, "agent-one", "workspace-one"),
+    ).rejects.toMatchObject({ code: "WORKSPACE_ARCHIVED" });
+  });
+});
