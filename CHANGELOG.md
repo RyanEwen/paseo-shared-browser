@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.2.2 (2026-11-20)
+
+### Compatibility
+
+- Supports Paseo++ 0.16, including its previews (verified against 0.16.0-preview.52), alongside the retained 0.11, 0.12 and 0.15 allowances. Earlier releases refused to load on 0.16 daemons.
+
 ## 2.2.1 (2026-11-10)
 
 ### Fixes
